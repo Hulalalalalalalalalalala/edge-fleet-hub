@@ -3,8 +3,12 @@ package fleet
 import (
 	"encoding/json"
 	"errors"
+	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type handler struct{ store *Store }
@@ -17,6 +21,8 @@ func NewHandler(store *Store) http.Handler {
 	})
 	mux.HandleFunc("POST /v1/devices", h.register)
 	mux.HandleFunc("POST /v1/devices/{id}/telemetry", h.telemetry)
+	mux.HandleFunc("POST /v1/devices/{id}/replay", h.replay)
+	mux.HandleFunc("GET /v1/devices/{id}/history", h.history)
 	mux.HandleFunc("GET /v1/fleet", h.snapshot)
 	return mux
 }
@@ -44,6 +50,10 @@ func (h *handler) telemetry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "telemetry values are required"})
 		return
 	}
+	if !finiteValues(values) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "telemetry values must be finite"})
+		return
+	}
 	device, err := h.store.RecordTelemetry(r.PathValue("id"), values)
 	if errors.Is(err, ErrDeviceNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -52,14 +62,202 @@ func (h *handler) telemetry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, device)
 }
 
+type replayRequest struct {
+	BatchID string `json:"batchId"`
+	Samples []struct {
+		EventID    string             `json:"eventId"`
+		ObservedAt string             `json:"observedAt"`
+		Values     map[string]float64 `json:"values"`
+	} `json:"samples"`
+}
+
+func (h *handler) replay(w http.ResponseWriter, r *http.Request) {
+	var request replayRequest
+	if err := decodeSingleJSON(r, &request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must be a single valid JSON object"})
+		return
+	}
+	if strings.TrimSpace(request.BatchID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "batchId is required"})
+		return
+	}
+	if len(request.Samples) < 1 || len(request.Samples) > 100 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "samples must contain between 1 and 100 entries"})
+		return
+	}
+	samples := make([]Sample, len(request.Samples))
+	seenEventIDs := make(map[string]struct{}, len(request.Samples))
+	for i, entry := range request.Samples {
+		eventID := strings.TrimSpace(entry.EventID)
+		if eventID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "each sample requires a non-blank eventId"})
+			return
+		}
+		if _, dup := seenEventIDs[eventID]; dup {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "eventId values must be unique within a batch"})
+			return
+		}
+		seenEventIDs[eventID] = struct{}{}
+		observedAt, err := time.Parse(time.RFC3339, entry.ObservedAt)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "observedAt must be RFC3339 formatted"})
+			return
+		}
+		if len(entry.Values) == 0 || hasBlankKey(entry.Values) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "values must be a non-empty map with non-blank metric names"})
+			return
+		}
+		if !finiteValues(entry.Values) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "values must be finite numbers"})
+			return
+		}
+		samples[i] = Sample{
+			EventID:    eventID,
+			ObservedAt: observedAt.UTC(),
+			Values:     cloneTelemetry(entry.Values),
+		}
+	}
+
+	receipt, repeat, err := h.store.Replay(r.PathValue("id"), strings.TrimSpace(request.BatchID), samples)
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrBatchConflict) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	status := http.StatusAccepted
+	if repeat {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, receipt)
+}
+
+func (h *handler) history(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	query := r.URL.Query()
+
+	filter := HistoryFilter{}
+	if raw := strings.TrimSpace(query.Get("from")); raw != "" {
+		from, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "from must be RFC3339 formatted"})
+			return
+		}
+		filter.From = from.UTC()
+	}
+	if raw := strings.TrimSpace(query.Get("to")); raw != "" {
+		to, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to must be RFC3339 formatted"})
+			return
+		}
+		filter.To = to.UTC()
+	}
+	if !filter.From.IsZero() && !filter.To.IsZero() && filter.From.After(filter.To) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "from must not be after to"})
+		return
+	}
+
+	limit := 20
+	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 100 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 100"})
+			return
+		}
+		limit = value
+	}
+
+	var afterIndex, highWater int64
+	rawCursor := strings.TrimSpace(query.Get("cursor"))
+	if rawCursor != "" {
+		// An unknown device is always 404, even with a malformed or foreign
+		// cursor; cursor problems on a registered device are 400.
+		if !h.store.Exists(id) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": ErrDeviceNotFound.Error()})
+			return
+		}
+		cursor, err := decodeCursor(rawCursor)
+		if err != nil || cursor.DeviceID != id ||
+			!cursor.From.Equal(filter.From) || !cursor.To.Equal(filter.To) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+			return
+		}
+		afterIndex, highWater = cursor.ScanPos, cursor.HighWater
+	}
+
+	events, appliedBound, nextIndex, hasMore, err := h.store.History(id, filter, afterIndex, highWater, limit)
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	highWater = appliedBound
+
+	var nextCursor any
+	if hasMore {
+		nextCursor = encodeCursor(pageCursor{
+			DeviceID:  id,
+			From:      filter.From,
+			To:        filter.To,
+			HighWater: highWater,
+			ScanPos:   nextIndex,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deviceId":   id,
+		"events":     events,
+		"nextCursor": nextCursor,
+	})
+}
+
 func (h *handler) snapshot(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"devices": h.store.Snapshot()})
+}
+
+func hasBlankKey(values map[string]float64) bool {
+	for key := range values {
+		if strings.TrimSpace(key) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func finiteValues(values map[string]float64) bool {
+	for _, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeJSON(r *http.Request, target any) error {
 	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(target)
+}
+
+// decodeSingleJSON requires the body to be exactly one JSON value, rejecting
+// trailing data such as a second JSON object or concatenated documents.
+func decodeSingleJSON(r *http.Request, target any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("body must contain a single JSON value")
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
