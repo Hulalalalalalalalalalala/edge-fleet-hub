@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -36,7 +37,15 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
 		return
 	}
-	device, created := h.store.Register(strings.TrimSpace(request.ID), strings.TrimSpace(request.Site))
+	device, created, err := h.store.Register(strings.TrimSpace(request.ID), strings.TrimSpace(request.Site))
+	if errors.Is(err, ErrStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
@@ -57,6 +66,14 @@ func (h *handler) telemetry(w http.ResponseWriter, r *http.Request) {
 	device, err := h.store.RecordTelemetry(r.PathValue("id"), values)
 	if errors.Is(err, ErrDeviceNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, device)
@@ -127,6 +144,14 @@ func (h *handler) replay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
+	if errors.Is(err, ErrStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 	status := http.StatusAccepted
 	if repeat {
 		status = http.StatusOK
@@ -181,6 +206,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 		}
 		cursor, err := decodeCursor(rawCursor)
 		if err != nil || cursor.DeviceID != id ||
+			!bytes.Equal(cursor.IID, h.store.instanceID()) ||
 			!cursor.From.Equal(filter.From) || !cursor.To.Equal(filter.To) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 			return
@@ -207,6 +233,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 			To:        filter.To,
 			HighWater: highWater,
 			ScanPos:   nextIndex,
+			IID:       h.store.instanceID(),
 		})
 	}
 

@@ -18,7 +18,8 @@ type pageCursor struct {
 	From      time.Time `json:"f,omitempty"`
 	To        time.Time `json:"t,omitempty"`
 	HighWater int64     `json:"h"`
-	ScanPos   int64     `json:"p"` // 0-based event slot the next page starts at
+	ScanPos   int64     `json:"p"`           // 0-based event slot the next page starts at
+	IID       []byte    `json:"i,omitempty"` // data-directory instance scope
 }
 
 var cursorSecret = []byte("edge-fleet-hub-history-cursor-v1")

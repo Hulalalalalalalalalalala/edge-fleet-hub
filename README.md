@@ -2,7 +2,7 @@
 
 Edge Fleet Hub is a local-first simulator for managing edge devices without requiring physical hardware or an external broker. The service provides device registration, heartbeat updates, live telemetry ingestion, fleet snapshots, telemetry history with bounded pagination, and offline batch replay with per-device deduplication. It is intended to grow into a complete device operations platform with rules and alerts, configuration delivery, messaging, and auditable remote maintenance.
 
-All state is held in local memory: no hardware, database, or external service is required.
+All state is held in local memory by default: no hardware, database, or external service is required.
 
 ## Run
 
@@ -11,6 +11,53 @@ go run ./cmd/edge-fleet
 ```
 
 The service listens on `127.0.0.1:8080` by default. Override it with `EDGE_FLEET_ADDR`.
+
+### Optional local persistence
+
+Set `EDGE_FLEET_DATA_DIR` to a directory for durable storage; leave it unset to
+keep the original in-memory behaviour. The listening configuration, HTTP
+endpoints and response formats are unchanged.
+
+```bash
+EDGE_FLEET_DATA_DIR=./fleet-data go run ./cmd/edge-fleet
+```
+
+- The directory is created if missing; an empty directory simply starts fresh.
+- If the directory cannot be created, read or written, startup fails with an
+  explanatory error — the service never silently falls back to memory mode.
+- All successful writes are flushed to a local write-ahead log before the
+  response is returned. Each write request is one commit unit, in particular a
+  replay batch (its samples, sequences, device state and receipt commit or
+  roll back together). If a write cannot be persisted at runtime the request
+  fails with `503`: no sequence is consumed, no receipt is kept and previously
+  queryable state is untouched; the same request can be retried once storage is
+  healthy again.
+- After a normal exit, a crash or a forced kill, reopening the same directory
+  restores devices, registration and last-active times, last telemetry, the
+  complete histories with their receive sequences, per-device event
+  deduplication records and batch receipts. Recovery never refreshes device
+  timestamps; new samples continue the previous sequence. Re-submitting a
+  batch that had already succeeded returns the first receipt (`200`); changing
+  its content still returns `409`.
+- History continuation tokens issued before a restart remain valid afterwards
+  and keep their pinned sequence high-water mark. Using a cursor against a
+  different data directory (even one with the same device ids) returns `400`;
+  unknown devices still return `404`.
+- Only one server process may open a given data directory at a time; a second
+  process fails before accepting requests and never modifies existing data.
+  The lock is released automatically on exit or kill — no manual cleanup is
+  needed before restarting.
+- If committed data is corrupt, uses an unsupported format, or contains
+  inconsistent records, startup fails with an explanatory error and leaves the
+  files untouched rather than discarding records.
+- Persistence depends only on local files; no database or external service is
+  involved.
+
+The data directory holds three files: `wal.log` (checksummed record log),
+`commit.log` (fixed-width commit journal marking which WAL bytes are
+acknowledged) and `lock` (the inter-process lock). They are managed entirely by
+the server; copying a directory offline while no process holds it is a valid
+backup, but the files should not be hand-edited.
 
 Register a device and send live telemetry:
 
@@ -92,9 +139,13 @@ different filter, or after tampering returns `400`; an unknown device returns
 
 ## Persistence and restart
 
-Everything (devices, events, sequences, batch receipts) lives in process
-memory. **Restarting the process clears all data**; sequence counters restart
-from 1 for each freshly registered device.
+Without `EDGE_FLEET_DATA_DIR`, everything (devices, events, sequences, batch
+receipts) lives in process memory and **restarting the process clears all
+data**; sequence counters restart from 1 for each freshly registered device.
+
+With `EDGE_FLEET_DATA_DIR` set, the same state survives process restarts via
+the local write-ahead log described under [Optional local
+persistence](#optional-local-persistence) above.
 
 ## Test
 

@@ -75,10 +75,23 @@ type Store struct {
 	mu      sync.RWMutex
 	devices map[string]*deviceState
 	now     func() time.Time
+
+	// wal is nil in memory mode. When set, every mutation is appended and
+	// synced here before in-memory state changes or success is returned.
+	wal walSink
+	iid []byte // data-directory instance id bound into history cursors
 }
 
 func NewStore() *Store {
 	return &Store{devices: make(map[string]*deviceState), now: time.Now}
+}
+
+// instanceID identifies the backing data directory; cursors are scoped to it.
+// It is nil in memory mode.
+func (s *Store) instanceID() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.iid
 }
 
 // Exists reports whether a device is registered.
@@ -89,20 +102,27 @@ func (s *Store) Exists(id string) bool {
 	return ok
 }
 
-func (s *Store) Register(id, site string) (Device, bool) {
+func (s *Store) Register(id, site string) (Device, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if state, ok := s.devices[id]; ok {
-		return cloneDevice(state.device), false
+		return cloneDevice(state.device), false, nil
 	}
 	now := s.now().UTC()
 	device := Device{ID: id, Site: site, RegisteredAt: now, LastSeenAt: now}
+	if s.wal != nil {
+		if err := s.wal.appendRecord(recRegister, walRegister{
+			ID: id, Site: site, RegisteredAt: now, LastSeenAt: now,
+		}); err != nil {
+			return Device{}, false, storageUnavailable(err)
+		}
+	}
 	s.devices[id] = &deviceState{
 		device:  device,
 		byEvent: make(map[string]int64),
 		batches: make(map[string]storedBatch),
 	}
-	return cloneDevice(device), true
+	return cloneDevice(device), true, nil
 }
 
 // RecordTelemetry stores a live telemetry sample in the device history. The
@@ -116,8 +136,19 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 		return Device{}, ErrDeviceNotFound
 	}
 	now := s.now().UTC()
+	sequence := int64(len(state.events)) + 1
+	if s.wal != nil {
+		if err := s.wal.appendRecord(recTelemetry, walTelemetry{
+			DeviceID:   id,
+			Sequence:   sequence,
+			ObservedAt: now,
+			Values:     values,
+		}); err != nil {
+			return Device{}, storageUnavailable(err)
+		}
+	}
 	state.events = append(state.events, Event{
-		Sequence:   int64(len(state.events)) + 1,
+		Sequence:   sequence,
 		ObservedAt: now,
 		Values:     cloneTelemetry(values),
 	})
@@ -186,9 +217,42 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		}
 	}
 
-	// Commit: append new samples in array order.
+	// Durable commit point: the whole batch is one record, synced before any
+	// in-memory state changes and before success is reported. A failure here
+	// leaves sequences, history, receipts and device state untouched.
 	lastNew := -1
 	for i, entry := range planned {
+		if !entry.dup {
+			lastNew = i
+		}
+	}
+	var committedAt time.Time
+	if s.wal != nil {
+		record := walReplay{
+			DeviceID: id,
+			BatchID:  batchID,
+			Samples:  make([]walSample, len(samples)),
+			Receipt:  receipt,
+		}
+		for i, sample := range samples {
+			record.Samples[i] = walSample{
+				EventID:    sample.EventID,
+				ObservedAt: sample.ObservedAt,
+				Values:     sample.Values,
+			}
+		}
+		if lastNew >= 0 {
+			committedAt = s.now().UTC()
+			record.LastSeenAt = &committedAt
+			record.LastTelemetry = cloneTelemetry(samples[lastNew].Values)
+		}
+		if err := s.wal.appendRecord(recReplay, record); err != nil {
+			return ReplayReceipt{}, false, storageUnavailable(err)
+		}
+	}
+
+	// Commit: append new samples in array order.
+	for _, entry := range planned {
 		if entry.dup {
 			continue
 		}
@@ -198,7 +262,6 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 			Values:     cloneTelemetry(entry.sample.Values),
 		})
 		state.byEvent[entry.sample.EventID] = entry.sequence
-		lastNew = i
 	}
 
 	committed := make([]Sample, len(samples))
@@ -209,8 +272,10 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 	state.batches[batchID] = storedBatch{samples: committed, receipt: cloneReceipt(receipt)}
 
 	if lastNew >= 0 {
-		now := s.now().UTC()
-		state.device.LastSeenAt = now
+		if s.wal == nil {
+			committedAt = s.now().UTC()
+		}
+		state.device.LastSeenAt = committedAt
 		state.device.LastTelemetry = cloneTelemetry(samples[lastNew].Values)
 	}
 	return receipt, false, nil
