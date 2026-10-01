@@ -35,10 +35,11 @@ EDGE_FLEET_DATA_DIR=./fleet-data go run ./cmd/edge-fleet
 - After a normal exit, a crash or a forced kill, reopening the same directory
   restores devices, registration and last-active times, last telemetry, the
   complete histories with their receive sequences, per-device event
-  deduplication records and batch receipts. Recovery never refreshes device
-  timestamps; new samples continue the previous sequence. Re-submitting a
-  batch that had already succeeded returns the first receipt (`200`); changing
-  its content still returns `409`.
+  deduplication records and batch receipts, and configuration versions with
+  their target/applied state, receipts and per-device deduplication records.
+  Recovery never refreshes device timestamps; new samples continue the
+  previous sequence. Re-submitting a batch that had already succeeded returns
+  the first receipt (`200`); changing its content still returns `409`.
 - History continuation tokens issued before a restart remain valid afterwards
   and keep their pinned sequence high-water mark. Using a cursor against a
   different data directory (even one with the same device ids) returns `400`;
@@ -109,6 +110,98 @@ curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/replay \
 Duplicate detection compares times as UTC instants (`2024-01-02T18:00:00+08:00`
 equals `2024-01-02T10:00:00Z`) and values by key/value.
 
+## Configuration delivery
+
+A device can be sent a complete configuration as a nested JSON object. The
+service tracks a per-device target version and the latest version the device
+has reported applied. There is no hardware or external broker: the device
+polls for its pending configuration and posts an application receipt.
+
+### Publish a configuration
+
+`POST /v1/devices/{id}/config` publishes a new full configuration. The body
+needs a non-blank `requestId`, a non-negative integer `baseVersion`, and a
+non-empty JSON object `config`:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/config \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "requestId": "req-2024-01-02-001",
+        "baseVersion": 0,
+        "config": {"mode":"safe","threshold":25,"zones":["a","b"]}
+      }'
+# 201 -> {"version":1,"config":{...},"publishedAt":"..."}
+```
+
+- With no configuration published yet, both target and applied versions are
+  `0`; the first publish must use `baseVersion: 0`.
+- A publish whose `baseVersion` matches the current target creates the next
+  integer version and returns `201` with the version, the full content, and the
+  first publish time.
+- Concurrent publishes on the same base can only create one version: the
+  winner gets `201`, the rest get `409` and no version is consumed.
+- Historical versions are immutable; restoring an old configuration means
+  republishing the old content as a new version.
+- The `requestId` is deduplicated within the device. Retrying the same
+  `requestId` with the same base and equal content returns `200` with the first
+  publish result without creating a version or changing the target; the same
+  `requestId` with a different base or different content returns `409`. Object
+  key order and whitespace do not affect equality, numbers compare by value,
+  and array order matters.
+
+### Read the pending configuration
+
+`GET /v1/devices/{id}/config` returns only the latest target to apply — old
+versions are never re-delivered one by one. When no configuration exists or the
+latest version is already applied, it returns `204`. Repeated reads do not
+change state.
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/config
+# 200 -> {"version":1,"config":{...},"publishedAt":"..."}
+# 204 when nothing is pending
+```
+
+### Report an application result
+
+`POST /v1/devices/{id}/config/receipt` posts the device's result. The body
+needs a non-blank `receiptId`, a positive integer `version`, a `result` of
+`success` or `failed`, and a non-blank `reason` when failed:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/config/receipt \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"rcpt-001","version":1,"result":"success"}'
+# 201 -> {"receiptId":"rcpt-001","version":1,"result":"success","receivedAt":"..."}
+```
+
+- A success advances the applied version; a failure does not, and the latest
+  configuration remains readable for retry.
+- A success for a version behind the target is recorded, but the new target
+  still shows as pending.
+- A receipt for an unknown configuration version returns `404`. A new receipt
+  below the applied version returns `409`, as does reporting failure on a
+  version that already succeeded.
+- The `receiptId` is deduplicated: a new receipt returns `201`; the same
+  `receiptId` with identical content returns `200` with the first result and
+  receive time; the same `receiptId` with different content returns `409`.
+
+### Query versions, receipts and status
+
+- `GET /v1/devices/{id}/config/status` returns `targetVersion`,
+  `appliedVersion`, and the most recent `failureReason` (empty when no failure
+  has been reported).
+- `GET /v1/devices/{id}/config/versions` returns all published configurations in
+  ascending version order, each with its full content and first publish time.
+- `GET /v1/devices/{id}/config/receipts` returns all receipts in receive order,
+  each with its first receive time.
+
+Missing fields, type errors, or multiple JSON bodies return `400`; an unknown
+device returns `404`. Rejected requests never change configuration state, and
+configuration operations never touch telemetry history, device activity time,
+or rule alerts.
+
 ## Telemetry history
 
 Live telemetry and accepted replay samples all enter the device history.
@@ -145,7 +238,9 @@ data**; sequence counters restart from 1 for each freshly registered device.
 
 With `EDGE_FLEET_DATA_DIR` set, the same state survives process restarts via
 the local write-ahead log described under [Optional local
-persistence](#optional-local-persistence) above.
+persistence](#optional-local-persistence) above — devices, events, sequences,
+batch receipts, configuration versions and target/applied state, configuration
+receipts, and all per-device deduplication records.
 
 ## Test
 

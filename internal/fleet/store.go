@@ -127,6 +127,7 @@ type deviceState struct {
 	batches map[string]storedBatch
 	rules   map[string]*ruleState
 	alerts  []*Alert // per-device, ordered by alert id (id = index + 1)
+	config  *configState
 }
 
 type Store struct {
@@ -180,6 +181,7 @@ func (s *Store) Register(id, site string) (Device, bool, error) {
 		byEvent: make(map[string]int64),
 		batches: make(map[string]storedBatch),
 		rules:   make(map[string]*ruleState),
+		config:  newConfigState(),
 	}
 	return cloneDevice(device), true, nil
 }
