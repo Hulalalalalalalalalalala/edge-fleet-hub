@@ -8,13 +8,13 @@ import (
 )
 
 var (
-	ErrDeviceNotFound    = errors.New("device not found")
-	ErrBatchConflict     = errors.New("batch conflicts with stored events")
-	ErrRuleNotFound      = errors.New("rule not found")
-	ErrAlertNotFound     = errors.New("alert not found")
-	ErrRuleConflict      = errors.New("rule already exists")
-	ErrVersionConflict   = errors.New("rule version conflict")
-	ErrInvalidRule       = errors.New("invalid rule")
+	ErrDeviceNotFound  = errors.New("device not found")
+	ErrBatchConflict   = errors.New("batch conflicts with stored events")
+	ErrRuleNotFound    = errors.New("rule not found")
+	ErrAlertNotFound   = errors.New("alert not found")
+	ErrRuleConflict    = errors.New("rule already exists")
+	ErrVersionConflict = errors.New("rule version conflict")
+	ErrInvalidRule     = errors.New("invalid rule")
 )
 
 // Rule is a per-device threshold rule. It judges only samples accepted while
@@ -55,9 +55,9 @@ type Alert struct {
 }
 
 const (
-	alertStatusActive = "active"
-	alertStatusEnded  = "ended"
-	endReasonRecovered = "recovered"
+	alertStatusActive    = "active"
+	alertStatusEnded     = "ended"
+	endReasonRecovered   = "recovered"
 	endReasonRuleChanged = "rule_changed"
 )
 
@@ -127,6 +127,7 @@ type deviceState struct {
 	batches map[string]storedBatch
 	rules   map[string]*ruleState
 	alerts  []*Alert // per-device, ordered by alert id (id = index + 1)
+	config  *configState
 }
 
 type Store struct {

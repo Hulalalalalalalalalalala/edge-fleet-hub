@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -55,6 +56,8 @@ const (
 	recReplay
 	recRule
 	recAlertAck
+	recConfigPublish
+	recConfigReceipt
 )
 
 // ErrStorageUnavailable wraps a durable-write failure at runtime. A request
@@ -116,8 +119,8 @@ type walReplay struct {
 // walRule is one committed rule create or update. Ended holds the alerts the
 // update terminated with reason rule_changed, in the same commit unit.
 type walRule struct {
-	DeviceID string  `json:"deviceId"`
-	Rule     Rule    `json:"rule"`
+	DeviceID string   `json:"deviceId"`
+	Rule     Rule     `json:"rule"`
 	Ended    []*Alert `json:"ended,omitempty"`
 }
 
@@ -126,6 +129,27 @@ type walAlertAck struct {
 	DeviceID       string    `json:"deviceId"`
 	AlertID        int64     `json:"alertId"`
 	AcknowledgedAt time.Time `json:"acknowledgedAt"`
+}
+
+// walConfigPublish is one committed configuration version together with the
+// requestId dedup record of its first publish.
+type walConfigPublish struct {
+	DeviceID    string          `json:"deviceId"`
+	RequestID   string          `json:"requestId"`
+	BaseVersion int64           `json:"baseVersion"`
+	Version     int64           `json:"version"`
+	Content     json.RawMessage `json:"content"`
+	PublishedAt time.Time       `json:"publishedAt"`
+}
+
+// walConfigReceipt is one committed device application receipt.
+type walConfigReceipt struct {
+	DeviceID   string    `json:"deviceId"`
+	ReceiptID  string    `json:"receiptId"`
+	Version    int64     `json:"version"`
+	Success    bool      `json:"success"`
+	Reason     string    `json:"reason,omitempty"`
+	ReceivedAt time.Time `json:"receivedAt"`
 }
 
 // walFile is the durable backend. walDurable is the committed WAL length (also
@@ -341,7 +365,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 		if crc32.Checksum(walData[pos:pos+5+length], crcTable) != wantCRC {
 			return nil, fmt.Errorf("write-ahead log %s is corrupt at byte %d: frame failed its integrity check (file left untouched)", walPath, pos)
 		}
-		if recType < recInstance || recType > recAlertAck {
+		if recType < recInstance || recType > recConfigReceipt {
 			return nil, fmt.Errorf("write-ahead log %s uses unsupported record type %d at byte %d", walPath, recType, pos)
 		}
 		frames = append(frames, parsedFrame{recType: recType, payload: payload})
@@ -367,7 +391,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 			}
 			instanceID = rec.InstanceID
 			sawInstance = true
-		case recRegister, recTelemetry, recReplay, recRule, recAlertAck:
+		case recRegister, recTelemetry, recReplay, recRule, recAlertAck, recConfigPublish, recConfigReceipt:
 			if !sawInstance {
 				return nil, fmt.Errorf("write-ahead log %s is corrupt: data record precedes instance marker", walPath)
 			}
@@ -701,6 +725,103 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		if alert.AcknowledgedAt == nil {
 			t := rec.AcknowledgedAt.UTC()
 			alert.AcknowledgedAt = &t
+		}
+		return nil
+
+	case recConfigPublish:
+		var rec walConfigPublish
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid config publish record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("config publish for unknown device %q", rec.DeviceID)
+		}
+		if rec.RequestID == "" || rec.PublishedAt.IsZero() {
+			return fmt.Errorf("device %q config publish record is incomplete", rec.DeviceID)
+		}
+		if !isNonEmptyJSONObject(rec.Content) {
+			return fmt.Errorf("device %q config v%d content is not a non-empty JSON object", rec.DeviceID, rec.Version)
+		}
+		if state.config == nil {
+			state.config = newConfigState()
+		}
+		cfg := state.config
+		if rec.Version != int64(len(cfg.versions))+1 {
+			return fmt.Errorf("device %q config version gap: got %d, want %d",
+				rec.DeviceID, rec.Version, len(cfg.versions)+1)
+		}
+		if rec.BaseVersion != rec.Version-1 {
+			return fmt.Errorf("device %q config v%d base %d does not precede version",
+				rec.DeviceID, rec.Version, rec.BaseVersion)
+		}
+		if _, dup := cfg.publishes[rec.RequestID]; dup {
+			return fmt.Errorf("device %q duplicate config publish request %q", rec.DeviceID, rec.RequestID)
+		}
+		if rec.Version <= cfg.applied {
+			return fmt.Errorf("device %q config v%d published after applied %d", rec.DeviceID, rec.Version, cfg.applied)
+		}
+		content := cloneJSON(rec.Content)
+		cfg.versions = append(cfg.versions, publishedConfig{
+			content:     content,
+			publishedAt: rec.PublishedAt.UTC(),
+		})
+		cfg.publishes[rec.RequestID] = storedPublish{
+			baseVersion: rec.BaseVersion,
+			content:     cloneJSON(content),
+			result: ConfigPublishResult{
+				RequestID:   rec.RequestID,
+				Version:     rec.Version,
+				Content:     cloneJSON(content),
+				PublishedAt: rec.PublishedAt.UTC(),
+			},
+		}
+		return nil
+
+	case recConfigReceipt:
+		var rec walConfigReceipt
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid config receipt record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("config receipt for unknown device %q", rec.DeviceID)
+		}
+		if rec.ReceiptID == "" || rec.ReceivedAt.IsZero() {
+			return fmt.Errorf("device %q config receipt record is incomplete", rec.DeviceID)
+		}
+		if !rec.Success && strings.TrimSpace(rec.Reason) == "" {
+			return fmt.Errorf("device %q config receipt %q fails without a reason", rec.DeviceID, rec.ReceiptID)
+		}
+		if state.config == nil {
+			state.config = newConfigState()
+		}
+		cfg := state.config
+		if rec.Version < 1 || rec.Version > int64(len(cfg.versions)) {
+			return fmt.Errorf("device %q config receipt %q for unknown version %d", rec.DeviceID, rec.ReceiptID, rec.Version)
+		}
+		if _, dup := cfg.byReceipt[rec.ReceiptID]; dup {
+			return fmt.Errorf("device %q duplicate config receipt %q", rec.DeviceID, rec.ReceiptID)
+		}
+		if rec.Version < cfg.applied {
+			return fmt.Errorf("device %q config receipt %q version %d is below applied %d",
+				rec.DeviceID, rec.ReceiptID, rec.Version, cfg.applied)
+		}
+		if !rec.Success && rec.Version <= cfg.applied {
+			return fmt.Errorf("device %q config receipt %q fails an already applied version %d",
+				rec.DeviceID, rec.ReceiptID, rec.Version)
+		}
+		receipt := ConfigReceipt{
+			ReceiptID:  rec.ReceiptID,
+			Version:    rec.Version,
+			Success:    rec.Success,
+			Reason:     rec.Reason,
+			ReceivedAt: rec.ReceivedAt.UTC(),
+		}
+		cfg.receipts = append(cfg.receipts, receipt)
+		cfg.byReceipt[rec.ReceiptID] = receipt
+		if rec.Success && rec.Version > cfg.applied {
+			cfg.applied = rec.Version
 		}
 		return nil
 
