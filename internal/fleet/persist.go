@@ -58,6 +58,11 @@ const (
 	recAlertAck
 	recConfigPublish
 	recConfigReceipt
+	recTaskCreate
+	recTaskClaim
+	recTaskReport
+	recTaskCancel
+	recTaskTransitions
 )
 
 // ErrStorageUnavailable wraps a durable-write failure at runtime. A request
@@ -150,6 +155,86 @@ type walConfigReceipt struct {
 	Success    bool      `json:"success"`
 	Reason     string    `json:"reason,omitempty"`
 	ReceivedAt time.Time `json:"receivedAt"`
+}
+
+// --- diagnostic tasks -------------------------------------------------------
+
+// walTaskCreate is one committed task creation.
+type walTaskCreate struct {
+	DeviceID  string    `json:"deviceId"`
+	Number    int64     `json:"number"`
+	RequestID string    `json:"requestId"`
+	Seconds   int       `json:"seconds"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// walTaskTransition is one lifecycle audit transition.
+type walTaskTransition struct {
+	Number  int64     `json:"number"`
+	Action  string    `json:"action"`
+	From    string    `json:"from"`
+	To      string    `json:"to"`
+	Attempt int       `json:"attempt"`
+	At      time.Time `json:"at"`
+	Reason  string    `json:"reason,omitempty"`
+}
+
+func walTransition(tr *plannedTransition) walTaskTransition {
+	return walTaskTransition{
+		Number: tr.task.number, Action: tr.action, From: tr.from, To: tr.to,
+		Attempt: tr.attempt, At: tr.at, Reason: tr.reason,
+	}
+}
+
+func walTransitions(trs []*plannedTransition) []walTaskTransition {
+	out := make([]walTaskTransition, 0, len(trs))
+	for _, tr := range trs {
+		out = append(out, walTransition(tr))
+	}
+	return out
+}
+
+// walTaskClaim is one committed claim. Settles carries timeout transitions
+// that were derived and committed in the same unit (normally empty).
+type walTaskClaim struct {
+	DeviceID  string              `json:"deviceId"`
+	Number    int64               `json:"number"`
+	Attempt   int                 `json:"attempt"`
+	Token     string              `json:"token"`
+	ClaimedAt time.Time           `json:"claimedAt"`
+	Deadline  time.Time           `json:"deadline"`
+	Settles   []walTaskTransition `json:"settles,omitempty"`
+}
+
+// walTaskReport is one committed device report (success or failure).
+type walTaskReport struct {
+	DeviceID  string          `json:"deviceId"`
+	Number    int64           `json:"number"`
+	Attempt   int             `json:"attempt"`
+	Token     string          `json:"token"`
+	ReceiptID string          `json:"receiptId"`
+	Success   bool            `json:"success"`
+	Reason    string          `json:"reason,omitempty"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	At        time.Time       `json:"at"`
+}
+
+// walTaskCancel is one committed cancellation.
+type walTaskCancel struct {
+	DeviceID    string              `json:"deviceId"`
+	Number      int64               `json:"number"`
+	Attempt     int                 `json:"attempt"`
+	FromStatus  string              `json:"fromStatus"`
+	CancelledAt time.Time           `json:"cancelledAt"`
+	Settles     []walTaskTransition `json:"settles,omitempty"`
+}
+
+// walTaskTransitions is a standalone batch of lazy timeout transitions
+// committed without an accompanying claim/cancel/report (e.g. produced by a
+// read or an empty claim).
+type walTaskTransitions struct {
+	DeviceID    string              `json:"deviceId"`
+	Transitions []walTaskTransition `json:"transitions"`
 }
 
 // walFile is the durable backend. walDurable is the committed WAL length (also
@@ -365,7 +450,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 		if crc32.Checksum(walData[pos:pos+5+length], crcTable) != wantCRC {
 			return nil, fmt.Errorf("write-ahead log %s is corrupt at byte %d: frame failed its integrity check (file left untouched)", walPath, pos)
 		}
-		if recType < recInstance || recType > recConfigReceipt {
+		if recType < recInstance || recType > recTaskTransitions {
 			return nil, fmt.Errorf("write-ahead log %s uses unsupported record type %d at byte %d", walPath, recType, pos)
 		}
 		frames = append(frames, parsedFrame{recType: recType, payload: payload})
@@ -391,7 +476,8 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 			}
 			instanceID = rec.InstanceID
 			sawInstance = true
-		case recRegister, recTelemetry, recReplay, recRule, recAlertAck, recConfigPublish, recConfigReceipt:
+		case recRegister, recTelemetry, recReplay, recRule, recAlertAck, recConfigPublish, recConfigReceipt,
+			recTaskCreate, recTaskClaim, recTaskReport, recTaskCancel, recTaskTransitions:
 			if !sawInstance {
 				return nil, fmt.Errorf("write-ahead log %s is corrupt: data record precedes instance marker", walPath)
 			}
@@ -824,6 +910,17 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			cfg.applied = rec.Version
 		}
 		return nil
+
+	case recTaskCreate:
+		return applyTaskCreateRecord(s, payload)
+	case recTaskClaim:
+		return applyTaskClaimRecord(s, payload)
+	case recTaskReport:
+		return applyTaskReportRecord(s, payload)
+	case recTaskCancel:
+		return applyTaskCancelRecord(s, payload)
+	case recTaskTransitions:
+		return applyTaskTransitionsRecord(s, payload)
 
 	default:
 		return fmt.Errorf("unknown record type %d", recType)

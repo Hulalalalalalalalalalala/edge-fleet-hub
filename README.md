@@ -1,6 +1,6 @@
 # Edge Fleet Hub
 
-Edge Fleet Hub is a local-first simulator for managing edge devices without requiring physical hardware or an external broker. The service provides device registration, heartbeat updates, live telemetry ingestion, fleet snapshots, telemetry history with bounded pagination, offline batch replay with per-device deduplication, threshold rules with alerts, and per-device configuration publishing and application receipts. It is intended to grow into a complete device operations platform with messaging and auditable remote maintenance.
+Edge Fleet Hub is a local-first simulator for managing edge devices without requiring physical hardware or an external broker. The service provides device registration, heartbeat updates, live telemetry ingestion, fleet snapshots, telemetry history with bounded pagination, offline batch replay with per-device deduplication, threshold rules with alerts, per-device configuration publishing and application receipts, and remote diagnostic tasks with claim/report flow, retries and an audited lifecycle. It is intended to grow into a complete device operations platform with messaging and auditable remote maintenance.
 
 All state is held in local memory by default: no hardware, database, or external service is required.
 
@@ -35,13 +35,16 @@ EDGE_FLEET_DATA_DIR=./fleet-data go run ./cmd/edge-fleet
 - After a normal exit, a crash or a forced kill, reopening the same directory
   restores devices, registration and last-active times, last telemetry, the
   complete histories with their receive sequences, per-device event
-  deduplication records and batch receipts, rules and alerts, and the complete
+  deduplication records and batch receipts, rules and alerts, the complete
   configuration delivery state (published versions, target/applied versions,
-  application receipts and publish/receipt deduplication records). Recovery
-  never refreshes device timestamps; new samples continue the previous
+  application receipts and publish/receipt deduplication records), and all
+  diagnostic task state (tasks, claim tokens and deadlines, request/receipt
+  deduplication records, retry wait times and the complete audit trail).
+  Recovery never refreshes device timestamps; new samples continue the previous
   sequence. Re-submitting a batch that had already succeeded returns the first
   receipt (`200`); changing its content still returns `409`. The same applies
-  to configuration publish requests and application receipts.
+  to configuration publish requests and application receipts, and to
+  diagnostic-task creation requests and reports.
 - History continuation tokens issued before a restart remain valid afterwards
   and keep their pinned sequence high-water mark. Using a cursor against a
   different data directory (even one with the same device ids) returns `400`;
@@ -220,6 +223,104 @@ Queries:
 Missing fields, wrong types and bodies containing more than one JSON document
 return `400`; an unknown device returns `404`. Configuration operations never
 modify telemetry history, device activity times, rules or alerts.
+
+## Remote diagnostic tasks
+
+A fleet operator can ask a registered device to run a diagnostic without any
+real hardware: the built-in simulated device claims and reports the tasks.
+
+Create a task with a non-blank, device-unique `requestId` and an execution
+time of `seconds` between 1 and 60:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/diagnostic-tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"diag-2024-01-02-1","seconds":10}'
+# 201 -> {"number":1,"requestId":"...","seconds":10,"status":"pending",
+#         "attempts":0,"createdAt":"..."}
+```
+
+- A new task returns `201` with its number, creation time and `pending`
+  status. Re-submitting the same `requestId` with the same `seconds` returns
+  `200` with the first result; changing `seconds` returns `409`.
+- Missing fields, wrong types or out-of-range values return `400`; unknown
+  devices return `404`, unknown task numbers return `404`.
+
+The simulated device polls for work:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/diagnostic-tasks/claim
+# 200 -> {"task":1,"attempt":1,
+#         "token":"5f8d…","deadline":"2024-01-02T10:00:10Z"}
+# 204    -> nothing claimable right now
+```
+
+- Each claim hands out the oldest created task whose claim time has come.
+  Attempt numbers start at 1 and increase per task. The deadline is
+  `claim time + seconds`.
+- A device runs at most one task at a time; even concurrent claims produce
+  exactly one success, the rest get `204`.
+
+The device reports the outcome with its token and a non-blank `receiptId`:
+
+```bash
+curl -sS -X POST .../diagnostic-tasks/reports \
+  -d '{"token":"5f8d…","receiptId":"dev-rc-1","success":true,
+       "result":{"latencyMs":42,"checks":{"dns":true,"ping":true}}}'
+# 201 -> {"task":1,"attempt":1,"status":"succeeded","attempts":1,...}
+
+# on failure:
+curl -sS -X POST .../diagnostic-tasks/reports \
+  -d '{"token":"…","receiptId":"dev-rc-2","success":false,"reason":"sensor busy"}'
+# 201 -> {"task":1,"attempt":1,"status":"waiting","attempts":1,
+#         "nextClaimableAt":"...+1s", ...}
+```
+
+- A success needs a JSON object `result` and ends the task. A failure needs a
+  non-blank `reason`, invalidates the token and frees the device slot; the
+  task may be claimed again after 1 second (first failure) or 2 seconds
+  (second failure). The third failure ends the task as `failed`.
+- `receiptId` deduplicates **within the task**: re-posting the same id with
+  identical content returns `200` with the first ack — even after the task
+  has ended and its token is invalid. The same id with different content is
+  `409`. Result equality ignores object key order, compares numbers by value
+  and keeps array order significant.
+- A report using an unknown, expired or another attempt's token, or
+  submitted at/after the deadline, returns `409`. An attempt with no report
+  by its deadline is counted as a timeout failure (reason
+  `execution deadline exceeded`); the backoff wait runs from the deadline
+  itself and is reflected by list/detail/claim calls.
+
+Cancellation works on pending, waiting or running tasks and ends them
+immediately, invalidating any outstanding token:
+
+```bash
+curl -sS -X POST .../diagnostic-tasks/1/cancel
+# 200 -> {"task":1,"status":"cancelled","cancelledAt":"..."}
+```
+
+Repeating a cancellation returns the original result (`200`); cancelling a
+task that already succeeded or failed returns `409`.
+
+Queries:
+
+- `GET /v1/devices/{id}/diagnostic-tasks` — all tasks in number order with
+  status, attempt count, deadline, `nextClaimableAt` (while waiting) and the
+  result or failure reason.
+- `GET /v1/devices/{id}/diagnostic-tasks/{number}` — one task.
+- `GET /v1/devices/{id}/diagnostic-tasks/audit` — audit entries in
+  occurrence order. Create, claim, failure, timeout, success and cancel each
+  record the from/to status, attempt number, server time and reason.
+  Idempotent retries and rejected requests never add entries.
+
+Diagnostic task operations never modify telemetry history, device activity
+times, rules, alerts or configuration. With `EDGE_FLEET_DATA_DIR` set,
+tasks, claim tokens, dedup records and audit entries survive restarts, and
+deadlines/backoff instants are not reset; a directory written by an older
+version still opens. A task write that cannot be persisted returns `503`
+with task state and audit rolled back together, and the same request can be
+retried afterwards. In memory mode everything is cleared on restart as
+before.
 
 ## Persistence and restart
 

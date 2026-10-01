@@ -128,6 +128,7 @@ type deviceState struct {
 	rules   map[string]*ruleState
 	alerts  []*Alert // per-device, ordered by alert id (id = index + 1)
 	config  *configState
+	diag    *diagState
 }
 
 type Store struct {
