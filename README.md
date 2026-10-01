@@ -35,8 +35,10 @@ EDGE_FLEET_DATA_DIR=./fleet-data go run ./cmd/edge-fleet
 - After a normal exit, a crash or a forced kill, reopening the same directory
   restores devices, registration and last-active times, last telemetry, the
   complete histories with their receive sequences, per-device event
-  deduplication records and batch receipts. Recovery never refreshes device
-  timestamps; new samples continue the previous sequence. Re-submitting a
+  deduplication records and batch receipts, plus alerting rules with their
+  versions and all alerts with their acknowledgement times. Recovery never
+  refreshes device timestamps; new samples continue the previous sequence and
+  recovery never re-triggers alerts. Re-submitting a
   batch that had already succeeded returns the first receipt (`200`); changing
   its content still returns `409`.
 - History continuation tokens issued before a restart remain valid afterwards
@@ -108,6 +110,74 @@ curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/replay \
 
 Duplicate detection compares times as UTC instants (`2024-01-02T18:00:00+08:00`
 equals `2024-01-02T10:00:00Z`) and values by key/value.
+
+## Alerting rules
+
+Each device can carry any number of alerting rules. A rule compares one metric
+of every newly accepted sample against a trigger and a recovery threshold:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"ruleId":"high-temp","metric":"temperature","trigger":30,"recover":25}'
+# 201 -> {"ruleId":"high-temp","metric":"temperature","trigger":30,"recover":25,
+#         "enabled":true,"version":1,"createdAt":"...","updatedAt":"..."}
+```
+
+- `ruleId` is unique within the device (`409` on duplicates); the device and
+  the identifier are fixed at creation. A blank `ruleId` or `metric`, a
+  non-finite threshold, or a `recover` that is not strictly below `trigger` is
+  a `400`; an unknown device is a `404`.
+- Rules start **enabled** at **version 1**. `GET /v1/devices/{id}/rules` lists
+  them and `GET /v1/devices/{id}/rules/{ruleId}` returns one.
+- `PUT /v1/devices/{id}/rules/{ruleId}` replaces the metric and thresholds and
+  must carry the current `version`:
+
+  ```bash
+  curl -sS -X PUT http://127.0.0.1:8080/v1/devices/gateway-01/rules/high-temp \
+    -H 'Content-Type: application/json' \
+    -d '{"metric":"temperature","trigger":32,"recover":26,"version":1}'
+  ```
+
+  A stale version returns `409` and changes nothing (so of concurrent updates
+  on the same version exactly one succeeds); a successful update returns the
+  rule at `version + 1`.
+- `POST /v1/devices/{id}/rules/{ruleId}/disable` and `.../enable` take
+  `{"version":N}` the same way. While a rule is disabled, telemetry is still
+  accepted but never judged against it.
+- Every successful update, disable or re-enable immediately closes the rule's
+  active alert with reason `rule-changed` (recording the server time), and
+  evaluation restarts with no active alert.
+
+Rules only judge samples accepted while they are enabled — history is never
+re-evaluated. Live telemetry and replayed batches both participate, in receive
+sequence order (replays are not re-sorted by observation time, and duplicate
+samples or batches have no alert effect). A value at or above `trigger` opens
+an alert; sustained high values keep the same one; a value at or below
+`recover` ends it (`recovered`), and reaching the trigger again opens a new
+alert with a new `alertId`. Values between the thresholds, or samples without
+the metric, change nothing. A batch that first triggers and then recovers
+records both transitions in one commit.
+
+```bash
+curl -sS 'http://127.0.0.1:8080/v1/devices/gateway-01/alerts'
+curl -sS 'http://127.0.0.1:8080/v1/devices/gateway-01/alerts?ruleId=high-temp&closed=false&acknowledged=false'
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/alerts/1/ack
+```
+
+Alerts pin the rule version, metric and thresholds in effect when they
+triggered, and show the triggering sample's sequence, value and observed time
+(`triggeredBy`). A naturally recovered alert shows the recovery sample
+(`recoveredBy`); an alert closed by a rule change shows the server time and
+reason instead. `POST .../alerts/{alertId}/ack` acknowledges an alert: the
+first acknowledgement records the server time, repeats return the original
+time, and acknowledging never closes the alert nor blocks recovery. Unknown
+devices, rules or alerts are `404`.
+
+In persistent mode, rule changes and acknowledgements are durable commit
+points like any other write: a storage failure returns `503` and changes
+nothing, and a restart restores rule versions, all alerts and acknowledgement
+times without re-triggering anything.
 
 ## Telemetry history
 

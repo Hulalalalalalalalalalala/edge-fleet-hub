@@ -24,6 +24,15 @@ func NewHandler(store *Store) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{id}/telemetry", h.telemetry)
 	mux.HandleFunc("POST /v1/devices/{id}/replay", h.replay)
 	mux.HandleFunc("GET /v1/devices/{id}/history", h.history)
+	mux.HandleFunc("POST /v1/devices/{id}/rules", h.createRule)
+	mux.HandleFunc("GET /v1/devices/{id}/rules", h.listRules)
+	mux.HandleFunc("GET /v1/devices/{id}/rules/{ruleId}", h.getRule)
+	mux.HandleFunc("PUT /v1/devices/{id}/rules/{ruleId}", h.updateRule)
+	mux.HandleFunc("POST /v1/devices/{id}/rules/{ruleId}/disable", h.setRuleEnabled(false))
+	mux.HandleFunc("POST /v1/devices/{id}/rules/{ruleId}/enable", h.setRuleEnabled(true))
+	mux.HandleFunc("GET /v1/devices/{id}/alerts", h.listAlerts)
+	mux.HandleFunc("GET /v1/devices/{id}/alerts/{alertId}", h.getAlert)
+	mux.HandleFunc("POST /v1/devices/{id}/alerts/{alertId}/ack", h.ackAlert)
 	mux.HandleFunc("GET /v1/fleet", h.snapshot)
 	return mux
 }

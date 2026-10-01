@@ -53,6 +53,8 @@ const (
 	recRegister
 	recTelemetry
 	recReplay
+	recRule
+	recAck
 )
 
 // ErrStorageUnavailable wraps a durable-write failure at runtime. A request
@@ -82,6 +84,10 @@ type walTelemetry struct {
 	Sequence   int64              `json:"sequence"`
 	ObservedAt time.Time          `json:"observedAt"`
 	Values     map[string]float64 `json:"values"`
+	// Alert transitions caused by this sample, committed in the same record so
+	// a sample and its alert changes always survive or vanish together.
+	AlertsOpened []Alert      `json:"alertsOpened,omitempty"`
+	AlertsClosed []AlertClose `json:"alertsClosed,omitempty"`
 }
 
 type walSample struct {
@@ -100,6 +106,27 @@ type walReplay struct {
 	Receipt       ReplayReceipt      `json:"receipt"`
 	LastSeenAt    *time.Time         `json:"lastSeenAt,omitempty"`
 	LastTelemetry map[string]float64 `json:"lastTelemetry,omitempty"`
+	// Alert transitions caused by the batch's new samples, committed in the
+	// same record so samples, receipt and alert changes are one commit unit.
+	AlertsOpened []Alert      `json:"alertsOpened,omitempty"`
+	AlertsClosed []AlertClose `json:"alertsClosed,omitempty"`
+}
+
+// walRule is one committed rule mutation: creation, update, disable or
+// re-enable. Rule carries the full post-mutation snapshot; Closed holds the
+// administrative close of the old version's active alert, if there was one.
+type walRule struct {
+	DeviceID string      `json:"deviceId"`
+	Rule     Rule        `json:"rule"`
+	Closed   *AlertClose `json:"closed,omitempty"`
+}
+
+// walAck is the first acknowledgement of an alert. Repeat acknowledgements
+// change nothing and are not recorded.
+type walAck struct {
+	DeviceID string    `json:"deviceId"`
+	AlertID  int64     `json:"alertId"`
+	AckedAt  time.Time `json:"ackedAt"`
 }
 
 // walFile is the durable backend. walDurable is the committed WAL length (also
@@ -315,7 +342,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 		if crc32.Checksum(walData[pos:pos+5+length], crcTable) != wantCRC {
 			return nil, fmt.Errorf("write-ahead log %s is corrupt at byte %d: frame failed its integrity check (file left untouched)", walPath, pos)
 		}
-		if recType < recInstance || recType > recReplay {
+		if recType < recInstance || recType > recAck {
 			return nil, fmt.Errorf("write-ahead log %s uses unsupported record type %d at byte %d", walPath, recType, pos)
 		}
 		frames = append(frames, parsedFrame{recType: recType, payload: payload})
@@ -341,7 +368,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 			}
 			instanceID = rec.InstanceID
 			sawInstance = true
-		case recRegister, recTelemetry, recReplay:
+		case recRegister, recTelemetry, recReplay, recRule, recAck:
 			if !sawInstance {
 				return nil, fmt.Errorf("write-ahead log %s is corrupt: data record precedes instance marker", walPath)
 			}
@@ -463,8 +490,11 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 				RegisteredAt: rec.RegisteredAt.UTC(),
 				LastSeenAt:   rec.LastSeenAt.UTC(),
 			},
-			byEvent: make(map[string]int64),
-			batches: make(map[string]storedBatch),
+			byEvent:   make(map[string]int64),
+			batches:   make(map[string]storedBatch),
+			rules:     make(map[string]*Rule),
+			active:    make(map[string]int64),
+			nextAlert: 1,
 		}
 		return nil
 
@@ -488,6 +518,9 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			ObservedAt: rec.ObservedAt.UTC(),
 			Values:     cloneTelemetry(rec.Values),
 		})
+		if err := applyAlertTransitions(state, rec.AlertsOpened, rec.AlertsClosed); err != nil {
+			return fmt.Errorf("device %q telemetry record: %w", rec.DeviceID, err)
+		}
 		state.device.LastSeenAt = rec.ObservedAt.UTC()
 		state.device.LastTelemetry = cloneTelemetry(rec.Values)
 		return nil
@@ -566,13 +599,90 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			if !sameValues(rec.LastTelemetry, samples[lastNew].Values) {
 				return fmt.Errorf("device %q batch %q last telemetry disagrees with last new sample", rec.DeviceID, rec.BatchID)
 			}
+			if err := applyAlertTransitions(state, rec.AlertsOpened, rec.AlertsClosed); err != nil {
+				return fmt.Errorf("device %q batch %q: %w", rec.DeviceID, rec.BatchID, err)
+			}
 			state.device.LastSeenAt = rec.LastSeenAt.UTC()
 			state.device.LastTelemetry = cloneTelemetry(rec.LastTelemetry)
 		} else if rec.LastSeenAt != nil || len(rec.LastTelemetry) != 0 {
 			return fmt.Errorf("device %q all-duplicate batch %q unexpectedly refreshed device state", rec.DeviceID, rec.BatchID)
+		} else if len(rec.AlertsOpened) != 0 || len(rec.AlertsClosed) != 0 {
+			return fmt.Errorf("device %q all-duplicate batch %q unexpectedly carries alert changes", rec.DeviceID, rec.BatchID)
 		}
 
 		state.batches[rec.BatchID] = storedBatch{samples: samples, receipt: cloneReceipt(rec.Receipt)}
+		return nil
+
+	case recRule:
+		var rec walRule
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid rule record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("rule record for unknown device %q", rec.DeviceID)
+		}
+		rule := rec.Rule
+		if rule.RuleID == "" || rule.Metric == "" || rule.Version < 1 ||
+			rule.CreatedAt.IsZero() || rule.UpdatedAt.IsZero() {
+			return fmt.Errorf("device %q rule record is incomplete", rec.DeviceID)
+		}
+		if !finiteValue(rule.Trigger) || !finiteValue(rule.Recover) || rule.Recover >= rule.Trigger {
+			return fmt.Errorf("device %q rule %q has invalid thresholds", rec.DeviceID, rule.RuleID)
+		}
+		existing, exists := state.rules[rule.RuleID]
+		if !exists {
+			if rule.Version != 1 || !rule.Enabled {
+				return fmt.Errorf("device %q rule %q must first appear enabled at version 1", rec.DeviceID, rule.RuleID)
+			}
+			if rec.Closed != nil {
+				return fmt.Errorf("device %q rule %q creation cannot close an alert", rec.DeviceID, rule.RuleID)
+			}
+			created := rule
+			state.rules[rule.RuleID] = &created
+			return nil
+		}
+		if rule.Version != existing.Version+1 {
+			return fmt.Errorf("device %q rule %q version gap: got %d, want %d", rec.DeviceID, rule.RuleID, rule.Version, existing.Version+1)
+		}
+		if !rule.CreatedAt.UTC().Equal(existing.CreatedAt) {
+			return fmt.Errorf("device %q rule %q changed its creation time", rec.DeviceID, rule.RuleID)
+		}
+		*existing = rule
+		if rec.Closed != nil {
+			if rec.Closed.AlertID < 1 || rec.Closed.AlertID > int64(len(state.alerts)) {
+				return fmt.Errorf("device %q rule %q record closes unknown alert %d", rec.DeviceID, rule.RuleID, rec.Closed.AlertID)
+			}
+			if state.alerts[rec.Closed.AlertID-1].RuleID != rule.RuleID {
+				return fmt.Errorf("device %q rule %q record closes another rule's alert", rec.DeviceID, rule.RuleID)
+			}
+			if err := applyClosedAlert(state, *rec.Closed); err != nil {
+				return fmt.Errorf("device %q rule %q record: %w", rec.DeviceID, rule.RuleID, err)
+			}
+		}
+		return nil
+
+	case recAck:
+		var rec walAck
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid acknowledgement record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("acknowledgement for unknown device %q", rec.DeviceID)
+		}
+		if rec.AlertID < 1 || rec.AlertID > int64(len(state.alerts)) {
+			return fmt.Errorf("device %q acknowledgement references unknown alert %d", rec.DeviceID, rec.AlertID)
+		}
+		if rec.AckedAt.IsZero() {
+			return fmt.Errorf("device %q acknowledgement of alert %d is missing its server time", rec.DeviceID, rec.AlertID)
+		}
+		alert := &state.alerts[rec.AlertID-1]
+		if alert.AcknowledgedAt != nil {
+			return fmt.Errorf("device %q alert %d acknowledged twice", rec.DeviceID, rec.AlertID)
+		}
+		ackedAt := rec.AckedAt.UTC()
+		alert.AcknowledgedAt = &ackedAt
 		return nil
 
 	default:

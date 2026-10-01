@@ -69,6 +69,11 @@ type deviceState struct {
 	events  []Event          // history ordered by sequence (sequence = index + 1)
 	byEvent map[string]int64 // eventId -> sequence
 	batches map[string]storedBatch
+
+	rules     map[string]*Rule
+	alerts    []Alert          // ordered by alertId (alertId = index + 1)
+	active    map[string]int64 // ruleID -> alertID of the open alert, if any
+	nextAlert int64            // next alert id to assign, starts at 1
 }
 
 type Store struct {
@@ -118,9 +123,12 @@ func (s *Store) Register(id, site string) (Device, bool, error) {
 		}
 	}
 	s.devices[id] = &deviceState{
-		device:  device,
-		byEvent: make(map[string]int64),
-		batches: make(map[string]storedBatch),
+		device:    device,
+		byEvent:   make(map[string]int64),
+		batches:   make(map[string]storedBatch),
+		rules:     make(map[string]*Rule),
+		active:    make(map[string]int64),
+		nextAlert: 1,
 	}
 	return cloneDevice(device), true, nil
 }
@@ -137,12 +145,18 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 	}
 	now := s.now().UTC()
 	sequence := int64(len(state.events)) + 1
+	// Plan alert transitions for this sample before the commit point; the plan
+	// rides along in the same WAL record and is applied only after it.
+	plan := state.newAlertPlan()
+	plan.observe(state, sequence, values, now, now)
 	if s.wal != nil {
 		if err := s.wal.appendRecord(recTelemetry, walTelemetry{
-			DeviceID:   id,
-			Sequence:   sequence,
-			ObservedAt: now,
-			Values:     values,
+			DeviceID:     id,
+			Sequence:     sequence,
+			ObservedAt:   now,
+			Values:       values,
+			AlertsOpened: plan.opened,
+			AlertsClosed: plan.closed,
 		}); err != nil {
 			return Device{}, storageUnavailable(err)
 		}
@@ -152,6 +166,7 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 		ObservedAt: now,
 		Values:     cloneTelemetry(values),
 	})
+	state.applyAlertPlan(plan)
 	state.device.LastSeenAt = now
 	state.device.LastTelemetry = cloneTelemetry(values)
 	return cloneDevice(state.device), nil
@@ -219,7 +234,7 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 
 	// Durable commit point: the whole batch is one record, synced before any
 	// in-memory state changes and before success is reported. A failure here
-	// leaves sequences, history, receipts and device state untouched.
+	// leaves sequences, history, receipts, alerts and device state untouched.
 	lastNew := -1
 	for i, entry := range planned {
 		if !entry.dup {
@@ -227,6 +242,19 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		}
 	}
 	var committedAt time.Time
+	alerts := state.newAlertPlan()
+	if lastNew >= 0 {
+		committedAt = s.now().UTC()
+		// Only new samples are evaluated, in receive order; duplicates carry no
+		// alert effect. A batch that triggers and then recovers records both
+		// transitions in the same commit unit.
+		for _, entry := range planned {
+			if entry.dup {
+				continue
+			}
+			alerts.observe(state, entry.sequence, entry.sample.Values, entry.sample.ObservedAt, committedAt)
+		}
+	}
 	if s.wal != nil {
 		record := walReplay{
 			DeviceID: id,
@@ -242,9 +270,10 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 			}
 		}
 		if lastNew >= 0 {
-			committedAt = s.now().UTC()
 			record.LastSeenAt = &committedAt
 			record.LastTelemetry = cloneTelemetry(samples[lastNew].Values)
+			record.AlertsOpened = alerts.opened
+			record.AlertsClosed = alerts.closed
 		}
 		if err := s.wal.appendRecord(recReplay, record); err != nil {
 			return ReplayReceipt{}, false, storageUnavailable(err)
@@ -263,6 +292,7 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		})
 		state.byEvent[entry.sample.EventID] = entry.sequence
 	}
+	state.applyAlertPlan(alerts)
 
 	committed := make([]Sample, len(samples))
 	copy(committed, samples)
@@ -272,9 +302,6 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 	state.batches[batchID] = storedBatch{samples: committed, receipt: cloneReceipt(receipt)}
 
 	if lastNew >= 0 {
-		if s.wal == nil {
-			committedAt = s.now().UTC()
-		}
 		state.device.LastSeenAt = committedAt
 		state.device.LastTelemetry = cloneTelemetry(samples[lastNew].Values)
 	}
