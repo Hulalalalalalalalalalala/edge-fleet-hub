@@ -36,7 +36,11 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
 		return
 	}
-	device, created := h.store.Register(strings.TrimSpace(request.ID), strings.TrimSpace(request.Site))
+	device, created, err := h.store.Register(strings.TrimSpace(request.ID), strings.TrimSpace(request.Site))
+	if errors.Is(err, ErrPersist) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "data could not be saved; retry later"})
+		return
+	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
@@ -57,6 +61,10 @@ func (h *handler) telemetry(w http.ResponseWriter, r *http.Request) {
 	device, err := h.store.RecordTelemetry(r.PathValue("id"), values)
 	if errors.Is(err, ErrDeviceNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrPersist) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "data could not be saved; retry later"})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, device)
@@ -127,6 +135,10 @@ func (h *handler) replay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
+	if errors.Is(err, ErrPersist) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "data could not be saved; retry later"})
+		return
+	}
 	status := http.StatusAccepted
 	if repeat {
 		status = http.StatusOK
@@ -179,7 +191,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": ErrDeviceNotFound.Error()})
 			return
 		}
-		cursor, err := decodeCursor(rawCursor)
+		cursor, err := h.store.decodeCursor(rawCursor)
 		if err != nil || cursor.DeviceID != id ||
 			!cursor.From.Equal(filter.From) || !cursor.To.Equal(filter.To) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
@@ -201,7 +213,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 
 	var nextCursor any
 	if hasMore {
-		nextCursor = encodeCursor(pageCursor{
+		nextCursor = h.store.encodeCursor(pageCursor{
 			DeviceID:  id,
 			From:      filter.From,
 			To:        filter.To,

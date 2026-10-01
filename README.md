@@ -92,9 +92,38 @@ different filter, or after tampering returns `400`; an unknown device returns
 
 ## Persistence and restart
 
-Everything (devices, events, sequences, batch receipts) lives in process
-memory. **Restarting the process clears all data**; sequence counters restart
-from 1 for each freshly registered device.
+By default everything (devices, events, sequences, batch receipts) lives in
+process memory: **restarting the process clears all data** and sequence
+counters restart from 1.
+
+Set `EDGE_FLEET_DATA_DIR` to a local directory to enable persistent mode. The
+directory is created if missing; an empty directory starts fresh. The service
+holds an exclusive lock on the directory, so a second process using the same
+directory fails before accepting requests. The lock is released automatically
+on normal exit or forced termination — no manual cleanup is needed.
+
+```bash
+EDGE_FLEET_DATA_DIR=/var/lib/edge-fleet-hub go run ./cmd/edge-fleet
+```
+
+In persistent mode every write (registration, telemetry, replay) is made
+durable before success is returned: a write is either fully committed or not
+present at all, so a crash mid-write never leaves partial data. Device
+information, registration and last-active times, last telemetry, full history,
+receive sequences, event dedup records and batch receipts all survive restart;
+recovery itself does not refresh device times, and new samples continue the
+original sequence. Re-submitting a committed batch returns the first receipt;
+changed content still returns `409`. History continuation cursors remain valid
+across restart and stay pinned to the first-query sequence bound; a cursor
+minted in another data directory is rejected with `400`.
+
+If the directory cannot be created, read, or written, if it is already in use,
+or if committed data is corrupt or uses an unsupported format, the service
+fails at startup with a reason and keeps the original files. A write that
+cannot be saved during runtime returns `503` without changing queryable state,
+consuming a sequence, or leaving a receipt; queries keep working and the write
+can be retried once storage recovers. No database or external messaging
+service is used.
 
 ## Test
 

@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -72,13 +74,40 @@ type deviceState struct {
 }
 
 type Store struct {
-	mu      sync.RWMutex
-	devices map[string]*deviceState
-	now     func() time.Time
+	mu        sync.RWMutex
+	devices   map[string]*deviceState
+	now       func() time.Time
+	persister persister // nil in the default in-memory mode
+	instance  string    // data-directory instance identifier; empty in memory mode
+	lockFile  *os.File  // held exclusively in persistent mode
 }
 
 func NewStore() *Store {
 	return &Store{devices: make(map[string]*deviceState), now: time.Now}
+}
+
+// persistLocked makes the current state durable. Callers must hold s.mu. A
+// nil persister (memory mode) is a no-op.
+func (s *Store) persistLocked() error {
+	if s.persister == nil {
+		return nil
+	}
+	if err := s.persister.save(s.snapshotLocked()); err != nil {
+		return fmt.Errorf("%w: %v", ErrPersist, err)
+	}
+	return nil
+}
+
+// encodeCursor signs a cursor scoped to this store's data directory instance,
+// so a cursor minted in another directory fails validation.
+func (s *Store) encodeCursor(c pageCursor) string {
+	c.Instance = s.instance
+	return encodeCursor(c)
+}
+
+// decodeCursor verifies a cursor against this store's data directory instance.
+func (s *Store) decodeCursor(raw string) (pageCursor, error) {
+	return decodeCursor(raw, s.instance)
 }
 
 // Exists reports whether a device is registered.
@@ -89,11 +118,11 @@ func (s *Store) Exists(id string) bool {
 	return ok
 }
 
-func (s *Store) Register(id, site string) (Device, bool) {
+func (s *Store) Register(id, site string) (Device, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if state, ok := s.devices[id]; ok {
-		return cloneDevice(state.device), false
+		return cloneDevice(state.device), false, nil
 	}
 	now := s.now().UTC()
 	device := Device{ID: id, Site: site, RegisteredAt: now, LastSeenAt: now}
@@ -102,7 +131,13 @@ func (s *Store) Register(id, site string) (Device, bool) {
 		byEvent: make(map[string]int64),
 		batches: make(map[string]storedBatch),
 	}
-	return cloneDevice(device), true
+	if err := s.persistLocked(); err != nil {
+		// Nothing was committed: drop the provisional registration so a
+		// failed write leaves no state behind.
+		delete(s.devices, id)
+		return Device{}, false, err
+	}
+	return cloneDevice(device), true, nil
 }
 
 // RecordTelemetry stores a live telemetry sample in the device history. The
@@ -115,6 +150,7 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 	if !ok {
 		return Device{}, ErrDeviceNotFound
 	}
+	saved := cloneDeviceState(state)
 	now := s.now().UTC()
 	state.events = append(state.events, Event{
 		Sequence:   int64(len(state.events)) + 1,
@@ -123,6 +159,11 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 	})
 	state.device.LastSeenAt = now
 	state.device.LastTelemetry = cloneTelemetry(values)
+	if err := s.persistLocked(); err != nil {
+		// Roll back: the failed write must not change queryable state.
+		s.devices[id] = saved
+		return Device{}, err
+	}
 	return cloneDevice(state.device), nil
 }
 
@@ -146,6 +187,11 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		}
 		return cloneReceipt(previous.receipt), true, nil
 	}
+
+	// Snapshot for rollback: validation and commit mutate events, the dedup
+	// index, receipts and device state together, and a persistence failure
+	// must leave all of them untouched.
+	saved := cloneDeviceState(state)
 
 	// Validate every sample against committed history before appending so a
 	// conflict rolls back without leaving sequences, events or receipts.
@@ -212,6 +258,12 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		now := s.now().UTC()
 		state.device.LastSeenAt = now
 		state.device.LastTelemetry = cloneTelemetry(samples[lastNew].Values)
+	}
+	if err := s.persistLocked(); err != nil {
+		// Roll back the whole batch: no samples, sequences, receipts or
+		// device-state changes may survive a failed write.
+		s.devices[id] = saved
+		return ReplayReceipt{}, false, err
 	}
 	return receipt, false, nil
 }
