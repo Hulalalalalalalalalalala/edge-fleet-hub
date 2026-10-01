@@ -8,9 +8,65 @@ import (
 )
 
 var (
-	ErrDeviceNotFound = errors.New("device not found")
-	ErrBatchConflict  = errors.New("batch conflicts with stored events")
+	ErrDeviceNotFound    = errors.New("device not found")
+	ErrBatchConflict     = errors.New("batch conflicts with stored events")
+	ErrRuleNotFound      = errors.New("rule not found")
+	ErrAlertNotFound     = errors.New("alert not found")
+	ErrRuleConflict      = errors.New("rule already exists")
+	ErrVersionConflict   = errors.New("rule version conflict")
+	ErrInvalidRule       = errors.New("invalid rule")
 )
+
+// Rule is a per-device threshold rule. It judges only samples accepted while
+// enabled; it never backfills history. Device and ID are immutable after
+// creation. Version starts at 1 and bumps on every successful update.
+type Rule struct {
+	ID        string    `json:"id"`
+	Metric    string    `json:"metric"`
+	Trigger   float64   `json:"trigger"`
+	Recover   float64   `json:"recover"`
+	Enabled   bool      `json:"enabled"`
+	Version   int64     `json:"version"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// Alert is one threshold crossing. It retains the rule version and the
+// metric/thresholds in force when it fired. A natural recovery records the
+// recovery sample's sequence, value and observed time; an end caused by a rule
+// update records the server time and reason instead.
+type Alert struct {
+	ID                int64      `json:"id"`
+	RuleID            string     `json:"ruleId"`
+	RuleVersion       int64      `json:"ruleVersion"`
+	Metric            string     `json:"metric"`
+	Trigger           float64    `json:"trigger"`
+	Recover           float64    `json:"recover"`
+	Status            string     `json:"status"` // "active" | "ended"
+	TriggerSequence   int64      `json:"triggerSequence"`
+	TriggerValue      float64    `json:"triggerValue"`
+	TriggerObservedAt time.Time  `json:"triggerObservedAt"`
+	RecoverSequence   *int64     `json:"recoverSequence,omitempty"`
+	RecoverValue      *float64   `json:"recoverValue,omitempty"`
+	RecoverObservedAt *time.Time `json:"recoverObservedAt,omitempty"`
+	EndedAt           *time.Time `json:"endedAt,omitempty"`
+	EndReason         string     `json:"endReason,omitempty"` // "recovered" | "rule_changed"
+	AcknowledgedAt    *time.Time `json:"acknowledgedAt,omitempty"`
+}
+
+const (
+	alertStatusActive = "active"
+	alertStatusEnded  = "ended"
+	endReasonRecovered = "recovered"
+	endReasonRuleChanged = "rule_changed"
+)
+
+// ruleState pairs a rule with the id of its currently active alert (0 when
+// none).
+type ruleState struct {
+	rule          Rule
+	activeAlertID int64
+}
 
 type Device struct {
 	ID            string             `json:"id"`
@@ -69,6 +125,8 @@ type deviceState struct {
 	events  []Event          // history ordered by sequence (sequence = index + 1)
 	byEvent map[string]int64 // eventId -> sequence
 	batches map[string]storedBatch
+	rules   map[string]*ruleState
+	alerts  []*Alert // per-device, ordered by alert id (id = index + 1)
 }
 
 type Store struct {
@@ -121,6 +179,7 @@ func (s *Store) Register(id, site string) (Device, bool, error) {
 		device:  device,
 		byEvent: make(map[string]int64),
 		batches: make(map[string]storedBatch),
+		rules:   make(map[string]*ruleState),
 	}
 	return cloneDevice(device), true, nil
 }
@@ -137,12 +196,16 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 	}
 	now := s.now().UTC()
 	sequence := int64(len(state.events)) + 1
+	eval := newAlertEvaluator(state)
+	eval.evaluate(sequence, now, values)
 	if s.wal != nil {
 		if err := s.wal.appendRecord(recTelemetry, walTelemetry{
 			DeviceID:   id,
 			Sequence:   sequence,
 			ObservedAt: now,
 			Values:     values,
+			Alerts:     eval.created,
+			Ended:      eval.ended,
 		}); err != nil {
 			return Device{}, storageUnavailable(err)
 		}
@@ -154,6 +217,7 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 	})
 	state.device.LastSeenAt = now
 	state.device.LastTelemetry = cloneTelemetry(values)
+	eval.commit()
 	return cloneDevice(state.device), nil
 }
 
@@ -217,9 +281,22 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		}
 	}
 
+	// Evaluate the batch's new samples against the device's enabled rules, in
+	// array order (which is receive-sequence order). Duplicates never judge,
+	// create, end or refresh alerts. A trigger and a recovery inside one batch
+	// both produce alert changes, all committed together with the batch.
+	eval := newAlertEvaluator(state)
+	for _, entry := range planned {
+		if entry.dup {
+			continue
+		}
+		eval.evaluate(entry.sequence, entry.sample.ObservedAt, entry.sample.Values)
+	}
+
 	// Durable commit point: the whole batch is one record, synced before any
 	// in-memory state changes and before success is reported. A failure here
-	// leaves sequences, history, receipts and device state untouched.
+	// leaves sequences, history, receipts, device state and alert changes
+	// untouched.
 	lastNew := -1
 	for i, entry := range planned {
 		if !entry.dup {
@@ -233,6 +310,8 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 			BatchID:  batchID,
 			Samples:  make([]walSample, len(samples)),
 			Receipt:  receipt,
+			Alerts:   eval.created,
+			Ended:    eval.ended,
 		}
 		for i, sample := range samples {
 			record.Samples[i] = walSample{
@@ -278,12 +357,352 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		state.device.LastSeenAt = committedAt
 		state.device.LastTelemetry = cloneTelemetry(samples[lastNew].Values)
 	}
+	eval.commit()
 	return receipt, false, nil
 }
 
 func cloneReceipt(receipt ReplayReceipt) ReplayReceipt {
 	receipt.SampleStatus = append([]SampleStatus(nil), receipt.SampleStatus...)
 	return receipt
+}
+
+// --- rules and alerts -------------------------------------------------------
+
+// ruleUpdate carries the mutable fields of a rule update. A nil pointer leaves
+// the field unchanged.
+type ruleUpdate struct {
+	Metric  *string
+	Trigger *float64
+	Recover *float64
+	Enabled *bool
+}
+
+// AlertFilter narrows an alert listing. An empty string or nil pointer leaves
+// that dimension unfiltered.
+type AlertFilter struct {
+	RuleID       string
+	Status       string
+	Acknowledged *bool
+}
+
+// CreateRule registers a new enabled rule on a device. Version starts at 1.
+// It returns ErrDeviceNotFound for an unknown device and ErrRuleConflict when
+// the device already has a rule with that id.
+func (s *Store) CreateRule(id, ruleID, metric string, trigger, recover float64) (Rule, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return Rule{}, ErrDeviceNotFound
+	}
+	if _, exists := state.rules[ruleID]; exists {
+		return Rule{}, ErrRuleConflict
+	}
+	now := s.now().UTC()
+	rule := Rule{
+		ID: ruleID, Metric: metric, Trigger: trigger, Recover: recover,
+		Enabled: true, Version: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if s.wal != nil {
+		if err := s.wal.appendRecord(recRule, walRule{DeviceID: id, Rule: rule}); err != nil {
+			return Rule{}, storageUnavailable(err)
+		}
+	}
+	state.rules[ruleID] = &ruleState{rule: rule}
+	return cloneRule(rule), nil
+}
+
+// UpdateRule applies a version-checked optimistic update. A version mismatch
+// returns ErrVersionConflict with state unchanged. Every successful update
+// bumps the version by one and immediately ends the rule's active alert (if
+// any) with reason rule_changed; the rule starts again with no active alert.
+func (s *Store) UpdateRule(id, ruleID string, update ruleUpdate, version int64) (Rule, []*Alert, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return Rule{}, nil, ErrDeviceNotFound
+	}
+	rs, ok := state.rules[ruleID]
+	if !ok {
+		return Rule{}, nil, ErrRuleNotFound
+	}
+	if rs.rule.Version != version {
+		return Rule{}, nil, ErrVersionConflict
+	}
+
+	updated := rs.rule
+	if update.Metric != nil {
+		updated.Metric = *update.Metric
+	}
+	if update.Trigger != nil {
+		updated.Trigger = *update.Trigger
+	}
+	if update.Recover != nil {
+		updated.Recover = *update.Recover
+	}
+	if update.Enabled != nil {
+		updated.Enabled = *update.Enabled
+	}
+	if updated.Recover >= updated.Trigger {
+		return Rule{}, nil, ErrInvalidRule
+	}
+
+	// End the active alert of the old version before publishing the new one.
+	var ended []*Alert
+	if rs.activeAlertID != 0 {
+		alert := cloneAlert(*state.alerts[rs.activeAlertID-1])
+		alert.Status = alertStatusEnded
+		alert.EndReason = endReasonRuleChanged
+		now := s.now().UTC()
+		alert.EndedAt = &now
+		ended = append(ended, &alert)
+		rs.activeAlertID = 0
+	}
+
+	updated.Version++
+	updated.UpdatedAt = s.now().UTC()
+
+	if s.wal != nil {
+		if err := s.wal.appendRecord(recRule, walRule{DeviceID: id, Rule: updated, Ended: ended}); err != nil {
+			return Rule{}, nil, storageUnavailable(err)
+		}
+	}
+	rs.rule = updated
+	for _, alert := range ended {
+		state.alerts[alert.ID-1] = alert
+	}
+	return cloneRule(updated), cloneAlerts(ended), nil
+}
+
+// GetRule returns one rule.
+func (s *Store) GetRule(id, ruleID string) (Rule, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return Rule{}, ErrDeviceNotFound
+	}
+	rs, ok := state.rules[ruleID]
+	if !ok {
+		return Rule{}, ErrRuleNotFound
+	}
+	return cloneRule(rs.rule), nil
+}
+
+// ListRules returns a device's rules, ordered by rule id.
+func (s *Store) ListRules(id string) ([]Rule, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return nil, ErrDeviceNotFound
+	}
+	rules := make([]Rule, 0, len(state.rules))
+	for _, rs := range state.rules {
+		rules = append(rules, cloneRule(rs.rule))
+	}
+	sort.Slice(rules, func(i, j int) bool { return rules[i].ID < rules[j].ID })
+	return rules, nil
+}
+
+// AckAlert records the server time of the first acknowledgment. Repeated
+// acknowledgments keep the original time and write nothing. It returns
+// ErrDeviceNotFound for an unknown device and ErrAlertNotFound for an unknown
+// alert id.
+func (s *Store) AckAlert(id string, alertID int64) (Alert, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return Alert{}, ErrDeviceNotFound
+	}
+	if alertID < 1 || int(alertID) > len(state.alerts) {
+		return Alert{}, ErrAlertNotFound
+	}
+	alert := state.alerts[alertID-1]
+	if alert.AcknowledgedAt != nil {
+		return cloneAlert(*alert), nil
+	}
+	now := s.now().UTC()
+	if s.wal != nil {
+		if err := s.wal.appendRecord(recAlertAck, walAlertAck{
+			DeviceID: id, AlertID: alertID, AcknowledgedAt: now,
+		}); err != nil {
+			return Alert{}, storageUnavailable(err)
+		}
+	}
+	alert.AcknowledgedAt = &now
+	return cloneAlert(*alert), nil
+}
+
+// ListAlerts returns a device's alerts with the given filters, ordered by
+// alert id.
+func (s *Store) ListAlerts(id string, filter AlertFilter) ([]Alert, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return nil, ErrDeviceNotFound
+	}
+	if filter.RuleID != "" {
+		if _, ok := state.rules[filter.RuleID]; !ok {
+			return nil, ErrRuleNotFound
+		}
+	}
+	alerts := make([]Alert, 0, len(state.alerts))
+	for _, alert := range state.alerts {
+		if filter.RuleID != "" && alert.RuleID != filter.RuleID {
+			continue
+		}
+		if filter.Status != "" && alert.Status != filter.Status {
+			continue
+		}
+		if filter.Acknowledged != nil {
+			acknowledged := alert.AcknowledgedAt != nil
+			if *filter.Acknowledged != acknowledged {
+				continue
+			}
+		}
+		alerts = append(alerts, cloneAlert(*alert))
+	}
+	return alerts, nil
+}
+
+// alertEvaluator applies accepted samples to a device's enabled rules without
+// mutating state until commit. It tracks which rule currently has an active
+// alert so a trigger and a recovery inside the same batch are both handled in
+// order.
+type alertEvaluator struct {
+	state        *deviceState
+	activeByRule map[string]int64 // ruleID -> active alert id (0 when none)
+	created      []*Alert
+	ended        []*Alert
+	nextID       int64
+}
+
+func newAlertEvaluator(state *deviceState) *alertEvaluator {
+	eval := &alertEvaluator{
+		state:        state,
+		activeByRule: make(map[string]int64, len(state.rules)),
+		nextID:       int64(len(state.alerts)) + 1,
+	}
+	for id, rs := range state.rules {
+		eval.activeByRule[id] = rs.activeAlertID
+	}
+	return eval
+}
+
+// evaluate judges one accepted sample. A value at or above the trigger opens
+// an alert (or keeps the existing one); a value at or below the recovery
+// threshold ends the active alert; anything in between or a missing metric
+// leaves state unchanged.
+func (eval *alertEvaluator) evaluate(seq int64, observedAt time.Time, values map[string]float64) {
+	for _, rs := range eval.state.rules {
+		if !rs.rule.Enabled {
+			continue
+		}
+		value, ok := values[rs.rule.Metric]
+		if !ok {
+			continue
+		}
+		activeID := eval.activeByRule[rs.rule.ID]
+		if value >= rs.rule.Trigger && activeID == 0 {
+			alert := &Alert{
+				ID:                eval.nextID,
+				RuleID:            rs.rule.ID,
+				RuleVersion:       rs.rule.Version,
+				Metric:            rs.rule.Metric,
+				Trigger:           rs.rule.Trigger,
+				Recover:           rs.rule.Recover,
+				Status:            alertStatusActive,
+				TriggerSequence:   seq,
+				TriggerValue:      value,
+				TriggerObservedAt: observedAt,
+			}
+			eval.nextID++
+			eval.created = append(eval.created, alert)
+			eval.activeByRule[rs.rule.ID] = alert.ID
+		} else if value <= rs.rule.Recover && activeID != 0 {
+			var source *Alert
+			if activeID <= int64(len(eval.state.alerts)) {
+				source = eval.state.alerts[activeID-1]
+			} else {
+				source = eval.created[activeID-int64(len(eval.state.alerts))-1]
+			}
+			alert := cloneAlert(*source)
+			alert.Status = alertStatusEnded
+			alert.EndReason = endReasonRecovered
+			alert.RecoverSequence = &seq
+			alert.RecoverValue = &value
+			alert.RecoverObservedAt = &observedAt
+			eval.ended = append(eval.ended, &alert)
+			eval.activeByRule[rs.rule.ID] = 0
+		}
+	}
+}
+
+// commit publishes the planned alert changes to the device state.
+func (eval *alertEvaluator) commit() {
+	applyAlertChanges(eval.state, eval.created, eval.ended)
+}
+
+// applyAlertChanges appends created alerts and replaces ended ones, keeping
+// each rule's active-alert pointer in sync. It is shared by live evaluation
+// and WAL recovery.
+func applyAlertChanges(state *deviceState, created, ended []*Alert) {
+	for _, alert := range created {
+		state.alerts = append(state.alerts, alert)
+		if rs, ok := state.rules[alert.RuleID]; ok {
+			rs.activeAlertID = alert.ID
+		}
+	}
+	for _, alert := range ended {
+		state.alerts[alert.ID-1] = alert
+		if rs, ok := state.rules[alert.RuleID]; ok && rs.activeAlertID == alert.ID {
+			rs.activeAlertID = 0
+		}
+	}
+}
+
+func cloneRule(rule Rule) Rule {
+	return rule
+}
+
+func cloneAlert(alert Alert) Alert {
+	if alert.RecoverSequence != nil {
+		seq := *alert.RecoverSequence
+		alert.RecoverSequence = &seq
+	}
+	if alert.RecoverValue != nil {
+		value := *alert.RecoverValue
+		alert.RecoverValue = &value
+	}
+	if alert.RecoverObservedAt != nil {
+		t := *alert.RecoverObservedAt
+		alert.RecoverObservedAt = &t
+	}
+	if alert.EndedAt != nil {
+		t := *alert.EndedAt
+		alert.EndedAt = &t
+	}
+	if alert.AcknowledgedAt != nil {
+		t := *alert.AcknowledgedAt
+		alert.AcknowledgedAt = &t
+	}
+	return alert
+}
+
+func cloneAlerts(alerts []*Alert) []*Alert {
+	if alerts == nil {
+		return nil
+	}
+	cloned := make([]*Alert, len(alerts))
+	for i, alert := range alerts {
+		c := cloneAlert(*alert)
+		cloned[i] = &c
+	}
+	return cloned
 }
 
 // History returns one page of a device's event history. afterIndex is the first

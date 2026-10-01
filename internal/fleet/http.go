@@ -25,6 +25,12 @@ func NewHandler(store *Store) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{id}/replay", h.replay)
 	mux.HandleFunc("GET /v1/devices/{id}/history", h.history)
 	mux.HandleFunc("GET /v1/fleet", h.snapshot)
+	mux.HandleFunc("POST /v1/devices/{id}/rules", h.createRule)
+	mux.HandleFunc("GET /v1/devices/{id}/rules", h.listRules)
+	mux.HandleFunc("GET /v1/devices/{id}/rules/{ruleId}", h.getRule)
+	mux.HandleFunc("PUT /v1/devices/{id}/rules/{ruleId}", h.updateRule)
+	mux.HandleFunc("POST /v1/devices/{id}/alerts/{alertId}/acknowledge", h.ackAlert)
+	mux.HandleFunc("GET /v1/devices/{id}/alerts", h.listAlerts)
 	return mux
 }
 
@@ -246,6 +252,220 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) snapshot(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"devices": h.store.Snapshot()})
+}
+
+// --- rules ------------------------------------------------------------------
+
+func (h *handler) createRule(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		ID      string  `json:"id"`
+		Metric  string  `json:"metric"`
+		Trigger float64 `json:"trigger"`
+		Recover float64 `json:"recover"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must be a single valid JSON object"})
+		return
+	}
+	ruleID := strings.TrimSpace(request.ID)
+	metric := strings.TrimSpace(request.Metric)
+	if ruleID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
+		return
+	}
+	if metric == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "metric is required"})
+		return
+	}
+	if !finiteFloat(request.Trigger) || !finiteFloat(request.Recover) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "thresholds must be finite numbers"})
+		return
+	}
+	if request.Recover >= request.Trigger {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "recover threshold must be less than trigger threshold"})
+		return
+	}
+	rule, err := h.store.CreateRule(r.PathValue("id"), ruleID, metric, request.Trigger, request.Recover)
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrRuleConflict) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, rule)
+}
+
+func (h *handler) listRules(w http.ResponseWriter, r *http.Request) {
+	rules, err := h.store.ListRules(r.PathValue("id"))
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rules": rules})
+}
+
+func (h *handler) getRule(w http.ResponseWriter, r *http.Request) {
+	rule, err := h.store.GetRule(r.PathValue("id"), r.PathValue("ruleId"))
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrRuleNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, rule)
+}
+
+func (h *handler) updateRule(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Metric  *string  `json:"metric"`
+		Trigger *float64 `json:"trigger"`
+		Recover *float64 `json:"recover"`
+		Enabled *bool    `json:"enabled"`
+		Version int64    `json:"version"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must be a single valid JSON object"})
+		return
+	}
+	if request.Version < 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "version is required"})
+		return
+	}
+	if request.Metric != nil && strings.TrimSpace(*request.Metric) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "metric must not be blank"})
+		return
+	}
+	if request.Trigger != nil && !finiteFloat(*request.Trigger) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "trigger must be a finite number"})
+		return
+	}
+	if request.Recover != nil && !finiteFloat(*request.Recover) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "recover must be a finite number"})
+		return
+	}
+	update := ruleUpdate{}
+	if request.Metric != nil {
+		metric := strings.TrimSpace(*request.Metric)
+		update.Metric = &metric
+	}
+	if request.Trigger != nil {
+		update.Trigger = request.Trigger
+	}
+	if request.Recover != nil {
+		update.Recover = request.Recover
+	}
+	if request.Enabled != nil {
+		update.Enabled = request.Enabled
+	}
+	rule, _, err := h.store.UpdateRule(r.PathValue("id"), r.PathValue("ruleId"), update, request.Version)
+	if errors.Is(err, ErrDeviceNotFound) || errors.Is(err, ErrRuleNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrVersionConflict) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrInvalidRule) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "recover threshold must be less than trigger threshold"})
+		return
+	}
+	if errors.Is(err, ErrStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, rule)
+}
+
+// --- alerts -----------------------------------------------------------------
+
+func (h *handler) listAlerts(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	filter := AlertFilter{RuleID: strings.TrimSpace(query.Get("ruleId"))}
+	if raw := strings.TrimSpace(query.Get("status")); raw != "" {
+		if raw != alertStatusActive && raw != alertStatusEnded {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be active or ended"})
+			return
+		}
+		filter.Status = raw
+	}
+	if raw := strings.TrimSpace(query.Get("acknowledged")); raw != "" {
+		switch raw {
+		case "true", "1":
+			v := true
+			filter.Acknowledged = &v
+		case "false", "0":
+			v := false
+			filter.Acknowledged = &v
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "acknowledged must be true or false"})
+			return
+		}
+	}
+	alerts, err := h.store.ListAlerts(r.PathValue("id"), filter)
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrRuleNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"alerts": alerts})
+}
+
+func (h *handler) ackAlert(w http.ResponseWriter, r *http.Request) {
+	alertID, err := strconv.ParseInt(r.PathValue("alertId"), 10, 64)
+	if err != nil || alertID < 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "alertId must be a positive integer"})
+		return
+	}
+	alert, err := h.store.AckAlert(r.PathValue("id"), alertID)
+	if errors.Is(err, ErrDeviceNotFound) || errors.Is(err, ErrAlertNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, alert)
+}
+
+func finiteFloat(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func hasBlankKey(values map[string]float64) bool {

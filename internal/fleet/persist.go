@@ -53,6 +53,8 @@ const (
 	recRegister
 	recTelemetry
 	recReplay
+	recRule
+	recAlertAck
 )
 
 // ErrStorageUnavailable wraps a durable-write failure at runtime. A request
@@ -82,6 +84,11 @@ type walTelemetry struct {
 	Sequence   int64              `json:"sequence"`
 	ObservedAt time.Time          `json:"observedAt"`
 	Values     map[string]float64 `json:"values"`
+	// Alerts and Ended carry the alert changes judged from this sample, in the
+	// same commit unit as the sample itself. Absent in records written before
+	// alerting existed.
+	Alerts []*Alert `json:"alerts,omitempty"`
+	Ended  []*Alert `json:"ended,omitempty"`
 }
 
 type walSample struct {
@@ -92,7 +99,9 @@ type walSample struct {
 
 // walReplay is one committed batch. Samples holds the full ordered batch
 // (duplicates included) and Receipt the first-acceptance receipt; new events
-// and their sequences are derived by zipping the two during recovery.
+// and their sequences are derived by zipping the two during recovery. Alerts
+// and Ended carry the alert changes judged from the batch's new samples, in
+// the same commit unit as the batch itself.
 type walReplay struct {
 	DeviceID      string             `json:"deviceId"`
 	BatchID       string             `json:"batchId"`
@@ -100,6 +109,23 @@ type walReplay struct {
 	Receipt       ReplayReceipt      `json:"receipt"`
 	LastSeenAt    *time.Time         `json:"lastSeenAt,omitempty"`
 	LastTelemetry map[string]float64 `json:"lastTelemetry,omitempty"`
+	Alerts        []*Alert           `json:"alerts,omitempty"`
+	Ended         []*Alert           `json:"ended,omitempty"`
+}
+
+// walRule is one committed rule create or update. Ended holds the alerts the
+// update terminated with reason rule_changed, in the same commit unit.
+type walRule struct {
+	DeviceID string  `json:"deviceId"`
+	Rule     Rule    `json:"rule"`
+	Ended    []*Alert `json:"ended,omitempty"`
+}
+
+// walAlertAck is one committed alert acknowledgment.
+type walAlertAck struct {
+	DeviceID       string    `json:"deviceId"`
+	AlertID        int64     `json:"alertId"`
+	AcknowledgedAt time.Time `json:"acknowledgedAt"`
 }
 
 // walFile is the durable backend. walDurable is the committed WAL length (also
@@ -315,7 +341,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 		if crc32.Checksum(walData[pos:pos+5+length], crcTable) != wantCRC {
 			return nil, fmt.Errorf("write-ahead log %s is corrupt at byte %d: frame failed its integrity check (file left untouched)", walPath, pos)
 		}
-		if recType < recInstance || recType > recReplay {
+		if recType < recInstance || recType > recAlertAck {
 			return nil, fmt.Errorf("write-ahead log %s uses unsupported record type %d at byte %d", walPath, recType, pos)
 		}
 		frames = append(frames, parsedFrame{recType: recType, payload: payload})
@@ -341,7 +367,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 			}
 			instanceID = rec.InstanceID
 			sawInstance = true
-		case recRegister, recTelemetry, recReplay:
+		case recRegister, recTelemetry, recReplay, recRule, recAlertAck:
 			if !sawInstance {
 				return nil, fmt.Errorf("write-ahead log %s is corrupt: data record precedes instance marker", walPath)
 			}
@@ -440,6 +466,40 @@ func marshalFrame(recType byte, value any) ([]byte, error) {
 	return frame, nil
 }
 
+// applyAlertRecord validates and applies the alert changes carried by a
+// telemetry or replay record. It rejects relational inconsistency so a damaged
+// WAL fails startup rather than producing broken alert state.
+func applyAlertRecord(state *deviceState, created, ended []*Alert) error {
+	wantID := int64(len(state.alerts)) + 1
+	for _, alert := range created {
+		if alert == nil {
+			return errors.New("alert record contains a null create")
+		}
+		if alert.ID != wantID {
+			return fmt.Errorf("alert create id mismatch: got %d, want %d", alert.ID, wantID)
+		}
+		if alert.Status != alertStatusActive || alert.RuleID == "" || alert.Metric == "" ||
+			alert.TriggerSequence <= 0 || alert.TriggerObservedAt.IsZero() {
+			return fmt.Errorf("alert %d create is incomplete", alert.ID)
+		}
+		wantID++
+	}
+	maxID := int64(len(state.alerts) + len(created))
+	for _, alert := range ended {
+		if alert == nil {
+			return errors.New("alert record contains a null end")
+		}
+		if alert.ID < 1 || alert.ID > maxID {
+			return fmt.Errorf("alert end id %d out of range (1..%d)", alert.ID, maxID)
+		}
+		if alert.Status != alertStatusEnded || alert.EndReason != endReasonRecovered {
+			return fmt.Errorf("alert %d end is malformed", alert.ID)
+		}
+	}
+	applyAlertChanges(state, created, ended)
+	return nil
+}
+
 // applyRecord rebuilds in-memory state from one committed record, rejecting
 // any structural or relational inconsistency. It never calls the clock, so
 // recovery cannot refresh device timestamps.
@@ -465,6 +525,7 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			},
 			byEvent: make(map[string]int64),
 			batches: make(map[string]storedBatch),
+			rules:   make(map[string]*ruleState),
 		}
 		return nil
 
@@ -490,6 +551,9 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		})
 		state.device.LastSeenAt = rec.ObservedAt.UTC()
 		state.device.LastTelemetry = cloneTelemetry(rec.Values)
+		if err := applyAlertRecord(state, rec.Alerts, rec.Ended); err != nil {
+			return err
+		}
 		return nil
 
 	case recReplay:
@@ -573,6 +637,71 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		}
 
 		state.batches[rec.BatchID] = storedBatch{samples: samples, receipt: cloneReceipt(rec.Receipt)}
+		if err := applyAlertRecord(state, rec.Alerts, rec.Ended); err != nil {
+			return err
+		}
+		return nil
+
+	case recRule:
+		var rec walRule
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid rule record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("rule for unknown device %q", rec.DeviceID)
+		}
+		if rec.Rule.ID == "" || rec.Rule.Metric == "" || rec.Rule.Version < 1 ||
+			rec.Rule.CreatedAt.IsZero() || rec.Rule.UpdatedAt.IsZero() {
+			return fmt.Errorf("device %q rule record is incomplete", rec.DeviceID)
+		}
+		if existing, exists := state.rules[rec.Rule.ID]; exists {
+			if existing.rule.Version != rec.Rule.Version-1 {
+				return fmt.Errorf("device %q rule %q version gap: got %d, want %d",
+					rec.DeviceID, rec.Rule.ID, rec.Rule.Version, existing.rule.Version+1)
+			}
+			existing.rule = rec.Rule
+		} else {
+			if rec.Rule.Version != 1 {
+				return fmt.Errorf("device %q rule %q first record has version %d, want 1",
+					rec.DeviceID, rec.Rule.ID, rec.Rule.Version)
+			}
+			state.rules[rec.Rule.ID] = &ruleState{rule: rec.Rule}
+		}
+		for _, alert := range rec.Ended {
+			if alert == nil || alert.ID < 1 || int(alert.ID) > len(state.alerts) {
+				return fmt.Errorf("device %q rule %q ends unknown alert", rec.DeviceID, rec.Rule.ID)
+			}
+			if alert.Status != alertStatusEnded || alert.EndReason != endReasonRuleChanged || alert.EndedAt == nil {
+				return fmt.Errorf("device %q rule %q end of alert %d is malformed", rec.DeviceID, rec.Rule.ID, alert.ID)
+			}
+			state.alerts[alert.ID-1] = alert
+			if rs, ok := state.rules[alert.RuleID]; ok && rs.activeAlertID == alert.ID {
+				rs.activeAlertID = 0
+			}
+		}
+		return nil
+
+	case recAlertAck:
+		var rec walAlertAck
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid alert ack record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("alert ack for unknown device %q", rec.DeviceID)
+		}
+		if rec.AlertID < 1 || int(rec.AlertID) > len(state.alerts) {
+			return fmt.Errorf("device %q ack for unknown alert %d", rec.DeviceID, rec.AlertID)
+		}
+		if rec.AcknowledgedAt.IsZero() {
+			return fmt.Errorf("device %q ack for alert %d missing time", rec.DeviceID, rec.AlertID)
+		}
+		alert := state.alerts[rec.AlertID-1]
+		if alert.AcknowledgedAt == nil {
+			t := rec.AcknowledgedAt.UTC()
+			alert.AcknowledgedAt = &t
+		}
 		return nil
 
 	default:
