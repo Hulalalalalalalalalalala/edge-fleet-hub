@@ -37,6 +37,13 @@ func NewHandler(store *Store) http.Handler {
 	mux.HandleFunc("GET /v1/devices/{id}/configs/status", h.configStatus)
 	mux.HandleFunc("POST /v1/devices/{id}/configs/receipts", h.receiveConfigReceipt)
 	mux.HandleFunc("GET /v1/devices/{id}/configs/receipts", h.listConfigReceipts)
+	mux.HandleFunc("POST /v1/devices/{id}/tasks", h.createTask)
+	mux.HandleFunc("GET /v1/devices/{id}/tasks", h.listTasks)
+	mux.HandleFunc("POST /v1/devices/{id}/tasks/claim", h.claimTask)
+	mux.HandleFunc("GET /v1/devices/{id}/tasks/{taskId}", h.getTask)
+	mux.HandleFunc("POST /v1/devices/{id}/tasks/{taskId}/reports", h.reportTask)
+	mux.HandleFunc("POST /v1/devices/{id}/tasks/{taskId}/cancel", h.cancelTask)
+	mux.HandleFunc("GET /v1/devices/{id}/tasks/{taskId}/audit", h.listTaskAudit)
 	return mux
 }
 

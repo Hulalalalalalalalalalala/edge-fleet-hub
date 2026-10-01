@@ -128,6 +128,8 @@ type deviceState struct {
 	rules   map[string]*ruleState
 	alerts  []*Alert // per-device, ordered by alert id (id = index + 1)
 	config  *configState
+	tasks   []*taskState          // per-device, ordered by task id (id = index + 1)
+	tasksByRequest map[string]*taskState // requestId -> first task
 }
 
 type Store struct {

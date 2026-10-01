@@ -58,6 +58,11 @@ const (
 	recAlertAck
 	recConfigPublish
 	recConfigReceipt
+	recTaskCreate
+	recTaskClaim
+	recTaskReport
+	recTaskTimeout
+	recTaskCancel
 )
 
 // ErrStorageUnavailable wraps a durable-write failure at runtime. A request
@@ -150,6 +155,70 @@ type walConfigReceipt struct {
 	Success    bool      `json:"success"`
 	Reason     string    `json:"reason,omitempty"`
 	ReceivedAt time.Time `json:"receivedAt"`
+}
+
+// walTaskCreate is one committed task creation together with its audit record.
+type walTaskCreate struct {
+	DeviceID        string          `json:"deviceId"`
+	TaskID          int64           `json:"taskId"`
+	RequestID       string          `json:"requestId"`
+	DurationSeconds int             `json:"durationSeconds"`
+	CreatedAt       time.Time       `json:"createdAt"`
+	NextClaimableAt time.Time       `json:"nextClaimableAt"`
+	Audit           TaskAuditRecord `json:"audit"`
+}
+
+// walTaskClaim is one committed task claim together with its audit record.
+type walTaskClaim struct {
+	DeviceID   string          `json:"deviceId"`
+	TaskID     int64           `json:"taskId"`
+	Attempt    int             `json:"attempt"`
+	Credential string          `json:"credential"`
+	ClaimedAt  time.Time       `json:"claimedAt"`
+	Deadline   time.Time       `json:"deadline"`
+	Audit      TaskAuditRecord `json:"audit"`
+}
+
+// walTaskReport is one committed device outcome together with the resulting
+// task state and audit record.
+type walTaskReport struct {
+	DeviceID        string          `json:"deviceId"`
+	TaskID          int64           `json:"taskId"`
+	ReceiptID       string          `json:"receiptId"`
+	Success         bool            `json:"success"`
+	Reason          string          `json:"reason,omitempty"`
+	Result          json.RawMessage `json:"result,omitempty"`
+	ReceivedAt      time.Time       `json:"receivedAt"`
+	Status          string          `json:"status"`
+	Failures        int             `json:"failures"`
+	NextClaimableAt time.Time       `json:"nextClaimableAt,omitempty"`
+	FailureReason   string          `json:"failureReason,omitempty"`
+	CompletedAt     *time.Time      `json:"completedAt,omitempty"`
+	Audit           TaskAuditRecord `json:"audit"`
+}
+
+// walTaskTimeout is one committed deadline expiry together with the resulting
+// task state and audit record.
+type walTaskTimeout struct {
+	DeviceID        string          `json:"deviceId"`
+	TaskID          int64           `json:"taskId"`
+	Attempt         int             `json:"attempt"`
+	Deadline        time.Time       `json:"deadline"`
+	Status          string          `json:"status"`
+	Failures        int             `json:"failures"`
+	NextClaimableAt time.Time       `json:"nextClaimableAt,omitempty"`
+	FailureReason   string          `json:"failureReason,omitempty"`
+	CompletedAt     *time.Time      `json:"completedAt,omitempty"`
+	Audit           TaskAuditRecord `json:"audit"`
+}
+
+// walTaskCancel is one committed task cancellation together with its audit
+// record.
+type walTaskCancel struct {
+	DeviceID   string          `json:"deviceId"`
+	TaskID     int64           `json:"taskId"`
+	CanceledAt time.Time       `json:"canceledAt"`
+	Audit      TaskAuditRecord `json:"audit"`
 }
 
 // walFile is the durable backend. walDurable is the committed WAL length (also
@@ -365,7 +434,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 		if crc32.Checksum(walData[pos:pos+5+length], crcTable) != wantCRC {
 			return nil, fmt.Errorf("write-ahead log %s is corrupt at byte %d: frame failed its integrity check (file left untouched)", walPath, pos)
 		}
-		if recType < recInstance || recType > recConfigReceipt {
+		if recType < recInstance || recType > recTaskCancel {
 			return nil, fmt.Errorf("write-ahead log %s uses unsupported record type %d at byte %d", walPath, recType, pos)
 		}
 		frames = append(frames, parsedFrame{recType: recType, payload: payload})
@@ -391,7 +460,8 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 			}
 			instanceID = rec.InstanceID
 			sawInstance = true
-		case recRegister, recTelemetry, recReplay, recRule, recAlertAck, recConfigPublish, recConfigReceipt:
+		case recRegister, recTelemetry, recReplay, recRule, recAlertAck, recConfigPublish, recConfigReceipt,
+			recTaskCreate, recTaskClaim, recTaskReport, recTaskTimeout, recTaskCancel:
 			if !sawInstance {
 				return nil, fmt.Errorf("write-ahead log %s is corrupt: data record precedes instance marker", walPath)
 			}
@@ -823,6 +893,200 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		if rec.Success && rec.Version > cfg.applied {
 			cfg.applied = rec.Version
 		}
+		return nil
+
+	case recTaskCreate:
+		var rec walTaskCreate
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid task create record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("task create for unknown device %q", rec.DeviceID)
+		}
+		if rec.RequestID == "" || rec.DurationSeconds < 1 || rec.DurationSeconds > taskMaxDuration || rec.CreatedAt.IsZero() {
+			return fmt.Errorf("device %q task create record is incomplete", rec.DeviceID)
+		}
+		state.ensureTasks()
+		if _, dup := state.tasksByRequest[rec.RequestID]; dup {
+			return fmt.Errorf("device %q duplicate task request %q", rec.DeviceID, rec.RequestID)
+		}
+		if rec.TaskID != int64(len(state.tasks))+1 {
+			return fmt.Errorf("device %q task id gap: got %d, want %d", rec.DeviceID, rec.TaskID, len(state.tasks)+1)
+		}
+		task := DiagnosticTask{
+			ID:              rec.TaskID,
+			RequestID:       rec.RequestID,
+			DurationSeconds: rec.DurationSeconds,
+			Status:          taskStatusPending,
+			CreatedAt:       rec.CreatedAt.UTC(),
+			NextClaimableAt: rec.NextClaimableAt.UTC(),
+		}
+		ts := &taskState{task: task, reports: make(map[string]storedReport)}
+		rec.Audit.Seq = 1
+		ts.audit = append(ts.audit, rec.Audit)
+		state.tasks = append(state.tasks, ts)
+		state.tasksByRequest[rec.RequestID] = ts
+		return nil
+
+	case recTaskClaim:
+		var rec walTaskClaim
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid task claim record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("task claim for unknown device %q", rec.DeviceID)
+		}
+		ts := findTask(state, rec.TaskID)
+		if ts == nil {
+			return fmt.Errorf("device %q claim for unknown task %d", rec.DeviceID, rec.TaskID)
+		}
+		if ts.task.Status != taskStatusPending && ts.task.Status != taskStatusWaiting {
+			return fmt.Errorf("device %q task %d claim in bad state %q", rec.DeviceID, rec.TaskID, ts.task.Status)
+		}
+		if ts.task.Attempts != rec.Attempt-1 {
+			return fmt.Errorf("device %q task %d attempt gap: got %d, want %d", rec.DeviceID, rec.TaskID, rec.Attempt, ts.task.Attempts+1)
+		}
+		if rec.Credential == "" || rec.ClaimedAt.IsZero() || rec.Deadline.IsZero() {
+			return fmt.Errorf("device %q task %d claim record is incomplete", rec.DeviceID, rec.TaskID)
+		}
+		ts.task.Status = taskStatusInProgress
+		ts.task.Attempts = rec.Attempt
+		ts.task.Credential = rec.Credential
+		claimedAt := rec.ClaimedAt.UTC()
+		ts.task.ClaimedAt = &claimedAt
+		deadline := rec.Deadline.UTC()
+		ts.task.Deadline = &deadline
+		ts.task.NextClaimableAt = time.Time{}
+		rec.Audit.Seq = int64(len(ts.audit)) + 1
+		ts.audit = append(ts.audit, rec.Audit)
+		return nil
+
+	case recTaskReport:
+		var rec walTaskReport
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid task report record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("task report for unknown device %q", rec.DeviceID)
+		}
+		ts := findTask(state, rec.TaskID)
+		if ts == nil {
+			return fmt.Errorf("device %q report for unknown task %d", rec.DeviceID, rec.TaskID)
+		}
+		if ts.task.Status != taskStatusInProgress {
+			return fmt.Errorf("device %q task %d report in bad state %q", rec.DeviceID, rec.TaskID, ts.task.Status)
+		}
+		if rec.ReceiptID == "" || rec.ReceivedAt.IsZero() {
+			return fmt.Errorf("device %q task report record is incomplete", rec.DeviceID)
+		}
+		if _, dup := ts.reports[rec.ReceiptID]; dup {
+			return fmt.Errorf("device %q duplicate task report receipt %q", rec.DeviceID, rec.ReceiptID)
+		}
+		if !rec.Success && strings.TrimSpace(rec.Reason) == "" {
+			return fmt.Errorf("device %q task report %q fails without a reason", rec.DeviceID, rec.ReceiptID)
+		}
+		if rec.Success && !isJSONObject(rec.Result) {
+			return fmt.Errorf("device %q task report %q success lacks an object result", rec.DeviceID, rec.ReceiptID)
+		}
+		if rec.Status != taskStatusSucceeded && rec.Status != taskStatusWaiting && rec.Status != taskStatusFailed {
+			return fmt.Errorf("device %q task %d report has bad resulting status %q", rec.DeviceID, rec.TaskID, rec.Status)
+		}
+		ts.task.Status = rec.Status
+		ts.task.Failures = rec.Failures
+		ts.task.NextClaimableAt = rec.NextClaimableAt.UTC()
+		ts.task.FailureReason = rec.FailureReason
+		if rec.CompletedAt != nil {
+			t := rec.CompletedAt.UTC()
+			ts.task.CompletedAt = &t
+		}
+		if rec.Success {
+			ts.task.Result = cloneJSON(rec.Result)
+		}
+		ts.task.Credential = ""
+		ts.task.ClaimedAt = nil
+		ts.task.Deadline = nil
+		report := storedReport{
+			receiptID:  rec.ReceiptID,
+			success:    rec.Success,
+			reason:     rec.Reason,
+			result:     cloneJSON(rec.Result),
+			receivedAt: rec.ReceivedAt.UTC(),
+		}
+		ts.reports[rec.ReceiptID] = report
+		rec.Audit.Seq = int64(len(ts.audit)) + 1
+		ts.audit = append(ts.audit, rec.Audit)
+		return nil
+
+	case recTaskTimeout:
+		var rec walTaskTimeout
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid task timeout record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("task timeout for unknown device %q", rec.DeviceID)
+		}
+		ts := findTask(state, rec.TaskID)
+		if ts == nil {
+			return fmt.Errorf("device %q timeout for unknown task %d", rec.DeviceID, rec.TaskID)
+		}
+		if ts.task.Status != taskStatusInProgress {
+			return fmt.Errorf("device %q task %d timeout in bad state %q", rec.DeviceID, rec.TaskID, ts.task.Status)
+		}
+		if ts.task.Attempts != rec.Attempt {
+			return fmt.Errorf("device %q task %d timeout attempt mismatch: got %d, want %d", rec.DeviceID, rec.TaskID, rec.Attempt, ts.task.Attempts)
+		}
+		if rec.Deadline.IsZero() || rec.FailureReason == "" {
+			return fmt.Errorf("device %q task %d timeout record is incomplete", rec.DeviceID, rec.TaskID)
+		}
+		if rec.Status != taskStatusWaiting && rec.Status != taskStatusFailed {
+			return fmt.Errorf("device %q task %d timeout has bad resulting status %q", rec.DeviceID, rec.TaskID, rec.Status)
+		}
+		ts.task.Status = rec.Status
+		ts.task.Failures = rec.Failures
+		ts.task.NextClaimableAt = rec.NextClaimableAt.UTC()
+		ts.task.FailureReason = rec.FailureReason
+		if rec.CompletedAt != nil {
+			t := rec.CompletedAt.UTC()
+			ts.task.CompletedAt = &t
+		}
+		ts.task.Credential = ""
+		ts.task.ClaimedAt = nil
+		ts.task.Deadline = nil
+		rec.Audit.Seq = int64(len(ts.audit)) + 1
+		ts.audit = append(ts.audit, rec.Audit)
+		return nil
+
+	case recTaskCancel:
+		var rec walTaskCancel
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid task cancel record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("task cancel for unknown device %q", rec.DeviceID)
+		}
+		ts := findTask(state, rec.TaskID)
+		if ts == nil {
+			return fmt.Errorf("device %q cancel for unknown task %d", rec.DeviceID, rec.TaskID)
+		}
+		if ts.task.Status == taskStatusSucceeded || ts.task.Status == taskStatusFailed {
+			return fmt.Errorf("device %q task %d cancel after end", rec.DeviceID, rec.TaskID)
+		}
+		if rec.CanceledAt.IsZero() {
+			return fmt.Errorf("device %q task %d cancel record is incomplete", rec.DeviceID, rec.TaskID)
+		}
+		ts.task.Status = taskStatusCanceled
+		completedAt := rec.CanceledAt.UTC()
+		ts.task.CompletedAt = &completedAt
+		ts.task.Credential = ""
+		ts.task.ClaimedAt = nil
+		ts.task.Deadline = nil
+		rec.Audit.Seq = int64(len(ts.audit)) + 1
+		ts.audit = append(ts.audit, rec.Audit)
 		return nil
 
 	default:
