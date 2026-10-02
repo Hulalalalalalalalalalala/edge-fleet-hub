@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -24,6 +25,8 @@ func NewHandler(store *Store) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{id}/telemetry", h.telemetry)
 	mux.HandleFunc("POST /v1/devices/{id}/replay", h.replay)
 	mux.HandleFunc("GET /v1/devices/{id}/history", h.history)
+	mux.HandleFunc("GET /v1/devices/{id}/history/retention", h.getRetention)
+	mux.HandleFunc("PUT /v1/devices/{id}/history/retention", h.setRetention)
 	mux.HandleFunc("GET /v1/fleet", h.snapshot)
 	mux.HandleFunc("POST /v1/devices/{id}/rules", h.createRule)
 	mux.HandleFunc("GET /v1/devices/{id}/rules", h.listRules)
@@ -214,7 +217,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 		limit = value
 	}
 
-	var afterIndex, highWater int64
+	var startSeq, highWater int64
 	rawCursor := strings.TrimSpace(query.Get("cursor"))
 	if rawCursor != "" {
 		// An unknown device is always 404, even with a malformed or foreign
@@ -225,17 +228,25 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 		}
 		cursor, err := decodeCursor(rawCursor)
 		if err != nil || cursor.DeviceID != id ||
-			!bytes.Equal(cursor.IID, h.store.instanceID()) ||
-			!cursor.From.Equal(filter.From) || !cursor.To.Equal(filter.To) {
+			!cursor.From.Equal(filter.From) || !cursor.To.Equal(filter.To) ||
+			!bytes.Equal(cursor.IID, h.store.instanceID()) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 			return
 		}
-		afterIndex, highWater = cursor.ScanPos, cursor.HighWater
+		startSeq, highWater = cursor.StartSeq, cursor.HighWater
 	}
 
-	events, appliedBound, nextIndex, hasMore, err := h.store.History(id, filter, afterIndex, highWater, limit)
+	events, appliedBound, nextStart, hasMore, err := h.store.History(id, filter, startSeq, highWater, limit)
 	if errors.Is(err, ErrDeviceNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	var gone *historyGoneError
+	if errors.As(err, &gone) {
+		writeJSON(w, http.StatusGone, map[string]any{
+			"error":            ErrHistoryGone.Error(),
+			"earliestSequence": gone.earliestSequence,
+		})
 		return
 	}
 	if err != nil {
@@ -251,7 +262,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 			From:      filter.From,
 			To:        filter.To,
 			HighWater: highWater,
-			ScanPos:   nextIndex,
+			StartSeq:  nextStart,
 			IID:       h.store.instanceID(),
 		})
 	}
@@ -265,6 +276,52 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) snapshot(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"devices": h.store.Snapshot()})
+}
+
+// --- history retention ------------------------------------------------------
+
+func (h *handler) getRetention(w http.ResponseWriter, r *http.Request) {
+	status, err := h.store.GetRetention(r.PathValue("id"))
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *handler) setRetention(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		MaxEvents *int64 `json:"maxEvents"`
+	}
+	if err := decodeSingleJSON(r, &request); err != nil || request.MaxEvents == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "maxEvents is required as a single integer"})
+		return
+	}
+	maxEvents := *request.MaxEvents
+	if maxEvents < 0 || maxEvents > maxRetentionEvents {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("maxEvents must be between 0 and %d", maxRetentionEvents),
+		})
+		return
+	}
+	status, err := h.store.SetRetention(r.PathValue("id"), maxEvents)
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 // --- rules ------------------------------------------------------------------

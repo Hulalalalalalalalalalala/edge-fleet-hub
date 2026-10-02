@@ -15,7 +15,24 @@ var (
 	ErrRuleConflict    = errors.New("rule already exists")
 	ErrVersionConflict = errors.New("rule version conflict")
 	ErrInvalidRule     = errors.New("invalid rule")
+	// ErrHistoryGone means a continuation cursor's start record was trimmed by
+	// the retention limit before the next page was read.
+	ErrHistoryGone = errors.New("cursor start no longer retained")
 )
+
+// maxRetentionEvents bounds a per-device history retention setting.
+const maxRetentionEvents = 10000
+
+// RetentionStatus reports a device's history retention settings and counters.
+// MaxEvents 0 means unlimited. EarliestSequence is nil for an empty history;
+// MaxSequence is the highest sequence ever received (0 before any sample) and
+// never retreats, even after trimming.
+type RetentionStatus struct {
+	MaxEvents        int64  `json:"maxEvents"`
+	RetainedEvents   int64  `json:"retainedEvents"`
+	EarliestSequence *int64 `json:"earliestSequence"`
+	MaxSequence      int64  `json:"maxSequence"`
+}
 
 // Rule is a per-device threshold rule. It judges only samples accepted while
 // enabled; it never backfills history. Device and ID are immutable after
@@ -120,16 +137,88 @@ type storedBatch struct {
 	receipt ReplayReceipt
 }
 
+// knownSample is the durable replay-deduplication record for one eventId. It is
+// retained even after the event itself leaves history through the retention
+// limit, so a trimmed sample re-submitted later is still recognised as a
+// duplicate (same content) or a conflict (different content).
+type knownSample struct {
+	sequence   int64
+	observedAt time.Time
+	values     map[string]float64
+}
+
 type deviceState struct {
-	device  Device
-	events  []Event          // history ordered by sequence (sequence = index + 1)
-	byEvent map[string]int64 // eventId -> sequence
-	batches map[string]storedBatch
-	rules   map[string]*ruleState
-	alerts  []*Alert // per-device, ordered by alert id (id = index + 1)
-	config  *configState
-	tasks   []*taskState          // per-device, ordered by task id (id = index + 1)
+	device         Device
+	events         []Event                // retained history, ascending sequence (events[i].Sequence = eventBase + i + 1)
+	eventBase      int64                  // number of oldest events removed by retention; sequence of events[0] is eventBase+1
+	maxEvents      int64                  // retention cap; 0 means unlimited
+	known          map[string]knownSample // eventId -> first sample ever received (survives trimming)
+	batches        map[string]storedBatch
+	rules          map[string]*ruleState
+	alerts         []*Alert // per-device, ordered by alert id (id = index + 1)
+	config         *configState
+	tasks          []*taskState          // per-device, ordered by task id (id = index + 1)
 	tasksByRequest map[string]*taskState // requestId -> first task
+}
+
+// maxSequence is the highest receive sequence ever assigned to the device. It
+// never retreats: trimming removes events but keeps consuming nothing, and new
+// samples continue after it.
+func (state *deviceState) maxSequence() int64 {
+	return state.eventBase + int64(len(state.events))
+}
+
+// earliestSequence returns the first currently retained sequence, or 0 when
+// the history is empty.
+func (state *deviceState) earliestSequence() int64 {
+	if len(state.events) == 0 {
+		return 0
+	}
+	return state.eventBase + 1
+}
+
+// retentionStatus snapshots the retention view of the device.
+func (state *deviceState) retentionStatus() RetentionStatus {
+	status := RetentionStatus{
+		MaxEvents:      state.maxEvents,
+		RetainedEvents: int64(len(state.events)),
+		MaxSequence:    state.maxSequence(),
+	}
+	if earliest := state.earliestSequence(); earliest != 0 {
+		status.EarliestSequence = &earliest
+	}
+	return status
+}
+
+// planTrimThrough reports the cumulative count of oldest events that must be
+// removed for the history to satisfy maxEvents after a write that leaves
+// maxSequence at maxSeq. It only grows: raising the limit or going unlimited
+// never brings trimmed events back.
+func planTrimThrough(eventBase, maxSeq, maxEvents int64) int64 {
+	if maxEvents == 0 {
+		return eventBase
+	}
+	if through := maxSeq - maxEvents; through > eventBase {
+		return through
+	}
+	return eventBase
+}
+
+// applyTrim drops oldest retained events through sequence trimThrough. It
+// touches neither deduplication records nor any other device state.
+func (state *deviceState) applyTrim(trimThrough int64) {
+	if trimThrough <= state.eventBase {
+		return
+	}
+	drop := trimThrough - state.eventBase
+	if drop > int64(len(state.events)) {
+		drop = int64(len(state.events))
+	}
+	// Drop the prefix without preserving its backing slots.
+	remaining := make([]Event, len(state.events)-int(drop))
+	copy(remaining, state.events[drop:])
+	state.events = remaining
+	state.eventBase += drop
 }
 
 type Store struct {
@@ -180,11 +269,49 @@ func (s *Store) Register(id, site string) (Device, bool, error) {
 	}
 	s.devices[id] = &deviceState{
 		device:  device,
-		byEvent: make(map[string]int64),
+		known:   make(map[string]knownSample),
 		batches: make(map[string]storedBatch),
 		rules:   make(map[string]*ruleState),
 	}
 	return cloneDevice(device), true, nil
+}
+
+// GetRetention returns the device's retention limit and history counters.
+func (s *Store) GetRetention(id string) (RetentionStatus, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return RetentionStatus{}, ErrDeviceNotFound
+	}
+	return state.retentionStatus(), nil
+}
+
+// SetRetention changes the per-device history cap. A maxEvents of 0 removes
+// the limit; values 1..maxRetentionEvents keep at most that many newest
+// samples. Lowering the limit trims the oldest events immediately by receive
+// sequence; raising it only affects future writes. Device activity, last
+// telemetry, alerts and other devices are untouched.
+func (s *Store) SetRetention(id string, maxEvents int64) (RetentionStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return RetentionStatus{}, ErrDeviceNotFound
+	}
+	trimThrough := planTrimThrough(state.eventBase, state.maxSequence(), maxEvents)
+	if s.wal != nil {
+		if err := s.wal.appendRecord(recRetention, walRetention{
+			DeviceID:    id,
+			MaxEvents:   maxEvents,
+			TrimThrough: trimThrough,
+		}); err != nil {
+			return RetentionStatus{}, storageUnavailable(err)
+		}
+	}
+	state.maxEvents = maxEvents
+	state.applyTrim(trimThrough)
+	return state.retentionStatus(), nil
 }
 
 // RecordTelemetry stores a live telemetry sample in the device history. The
@@ -198,17 +325,19 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 		return Device{}, ErrDeviceNotFound
 	}
 	now := s.now().UTC()
-	sequence := int64(len(state.events)) + 1
+	sequence := state.maxSequence() + 1
+	trimThrough := planTrimThrough(state.eventBase, sequence, state.maxEvents)
 	eval := newAlertEvaluator(state)
 	eval.evaluate(sequence, now, values)
 	if s.wal != nil {
 		if err := s.wal.appendRecord(recTelemetry, walTelemetry{
-			DeviceID:   id,
-			Sequence:   sequence,
-			ObservedAt: now,
-			Values:     values,
-			Alerts:     eval.created,
-			Ended:      eval.ended,
+			DeviceID:    id,
+			Sequence:    sequence,
+			ObservedAt:  now,
+			Values:      values,
+			TrimThrough: trimThrough,
+			Alerts:      eval.created,
+			Ended:       eval.ended,
 		}); err != nil {
 			return Device{}, storageUnavailable(err)
 		}
@@ -221,6 +350,7 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 	state.device.LastSeenAt = now
 	state.device.LastTelemetry = cloneTelemetry(values)
 	eval.commit()
+	state.applyTrim(trimThrough)
 	return cloneDevice(state.device), nil
 }
 
@@ -245,28 +375,32 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		return cloneReceipt(previous.receipt), true, nil
 	}
 
-	// Validate every sample against committed history before appending so a
-	// conflict rolls back without leaving sequences, events or receipts.
+	// Validate every sample against the device's dedup memory before assigning
+	// anything, so a conflict rolls back without leaving sequences, events or
+	// receipts. A previously trimmed event is still known here: identical
+	// content stays a duplicate (and never re-enters history), different
+	// content still conflicts the whole batch.
 	type plan struct {
 		sample   Sample
 		sequence int64
 		dup      bool
 	}
 	planned := make([]plan, len(samples))
-	nextSequence := int64(len(state.events)) + 1
+	nextSequence := state.maxSequence() + 1
 	for i, sample := range samples {
-		if sequence, seen := state.byEvent[sample.EventID]; seen {
-			existing := state.events[sequence-1]
-			if !sameInstant(existing.ObservedAt, sample.ObservedAt) ||
-				!sameValues(existing.Values, sample.Values) {
+		if known, seen := state.known[sample.EventID]; seen {
+			if !sameInstant(known.observedAt, sample.ObservedAt) ||
+				!sameValues(known.values, sample.Values) {
 				return ReplayReceipt{}, false, ErrBatchConflict
 			}
-			planned[i] = plan{sample, sequence, true}
+			planned[i] = plan{sample, known.sequence, true}
 			continue
 		}
 		planned[i] = plan{sample, nextSequence, false}
 		nextSequence++
 	}
+	maxSequence := nextSequence - 1
+	trimThrough := planTrimThrough(state.eventBase, maxSequence, state.maxEvents)
 
 	// Build the receipt from the plan: only samples that matched a committed
 	// event before this batch are duplicates.
@@ -309,12 +443,13 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 	var committedAt time.Time
 	if s.wal != nil {
 		record := walReplay{
-			DeviceID: id,
-			BatchID:  batchID,
-			Samples:  make([]walSample, len(samples)),
-			Receipt:  receipt,
-			Alerts:   eval.created,
-			Ended:    eval.ended,
+			DeviceID:    id,
+			BatchID:     batchID,
+			Samples:     make([]walSample, len(samples)),
+			Receipt:     receipt,
+			TrimThrough: trimThrough,
+			Alerts:      eval.created,
+			Ended:       eval.ended,
 		}
 		for i, sample := range samples {
 			record.Samples[i] = walSample{
@@ -333,7 +468,9 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		}
 	}
 
-	// Commit: append new samples in array order.
+	// Commit: append new samples in array order. Every new sample registers in
+	// the durable dedup memory, even when the retention limit immediately
+	// trims its event out of history.
 	for _, entry := range planned {
 		if entry.dup {
 			continue
@@ -343,7 +480,11 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 			ObservedAt: entry.sample.ObservedAt,
 			Values:     cloneTelemetry(entry.sample.Values),
 		})
-		state.byEvent[entry.sample.EventID] = entry.sequence
+		state.known[entry.sample.EventID] = knownSample{
+			sequence:   entry.sequence,
+			observedAt: entry.sample.ObservedAt,
+			values:     cloneTelemetry(entry.sample.Values),
+		}
 	}
 
 	committed := make([]Sample, len(samples))
@@ -361,6 +502,10 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		state.device.LastTelemetry = cloneTelemetry(samples[lastNew].Values)
 	}
 	eval.commit()
+	// Enforce the retention limit after the whole batch is accepted: all new
+	// samples judged, kept their assigned sequences and appear on the receipt;
+	// only the oldest excess events leave history.
+	state.applyTrim(trimThrough)
 	return receipt, false, nil
 }
 
@@ -708,27 +853,52 @@ func cloneAlerts(alerts []*Alert) []*Alert {
 	return cloned
 }
 
-// History returns one page of a device's event history. afterIndex is the first
-// 0-based event slot to scan (0 for the first page); limit caps the number of
-// matching events returned. bound pins the scan to sequences no larger than
-// bound; a zero bound means "current maximum", which is then returned so
-// callers can pin subsequent pages. nextIndex is the slot a following page
-// should start at when hasMore is true. Concurrent writes therefore cannot
-// skip or duplicate rows within a paged walk.
-func (s *Store) History(id string, filter HistoryFilter, afterIndex, bound int64, limit int) (events []Event, appliedBound, nextIndex int64, hasMore bool, err error) {
+// historyGoneError carries the current earliest retained sequence alongside
+// ErrHistoryGone so a 410 response can tell the client where the surviving
+// history resumes.
+type historyGoneError struct {
+	earliestSequence int64
+}
+
+func (e *historyGoneError) Error() string { return ErrHistoryGone.Error() }
+func (e *historyGoneError) Unwrap() error { return ErrHistoryGone }
+
+// History returns one page of a device's event history. startSeq is the first
+// receive sequence to scan (1 or 0 for the first page, which begins at the
+// current earliest retained event); limit caps the number of matching events
+// returned. bound pins the scan to sequences no larger than bound; a zero
+// bound means "current maximum", which is then returned so callers can pin
+// subsequent pages. nextStart is the sequence a following page should start at
+// when hasMore is true. Retention may have removed the start of a continuation
+// page: then ErrHistoryGone is returned with the current earliest sequence, so
+// the missing range is never skipped silently. Concurrent writes cannot skip
+// or duplicate rows within a paged walk.
+func (s *Store) History(id string, filter HistoryFilter, startSeq, bound int64, limit int) (events []Event, appliedBound, nextStart int64, hasMore bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	state, ok := s.devices[id]
 	if !ok {
 		return nil, 0, 0, false, ErrDeviceNotFound
 	}
-	highWater := int64(len(state.events))
+	highWater := state.maxSequence()
 	if bound == 0 {
 		bound = highWater
 	}
+	continuation := startSeq > 0
+	if !continuation {
+		startSeq = state.earliestSequence()
+		if startSeq == 0 {
+			startSeq = 1
+		}
+	} else if startSeq < state.earliestSequence() || startSeq > state.maxSequence() {
+		// The exact record the continuation starts at (or a prefix containing
+		// it) was trimmed. Report 410 with the live window's first sequence
+		// instead of silently resuming partway through the pinned range.
+		return nil, bound, 0, false, &historyGoneError{earliestSequence: state.earliestSequence()}
+	}
 	events = make([]Event, 0, limit)
-	for index := afterIndex; index < bound; index++ {
-		event := state.events[index]
+	for seq := startSeq; seq <= bound; seq++ {
+		event := state.events[seq-1-state.eventBase]
 		if !filter.From.IsZero() && event.ObservedAt.Before(filter.From) {
 			continue
 		}
@@ -739,11 +909,11 @@ func (s *Store) History(id string, filter HistoryFilter, afterIndex, bound int64
 			events = append(events, cloneEvent(event))
 			continue
 		}
-		// This match belongs to the next page; resume scanning here so rows in
-		// the gap are never examined twice.
-		return events, bound, index, true, nil
+		// This match belongs to the next page; resume scanning at its sequence
+		// so rows in the gap are never examined twice.
+		return events, bound, seq, true, nil
 	}
-	return events, bound, bound, false, nil
+	return events, bound, 0, false, nil
 }
 
 func (s *Store) Snapshot() []Device {

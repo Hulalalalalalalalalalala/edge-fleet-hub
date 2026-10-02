@@ -63,6 +63,7 @@ const (
 	recTaskReport
 	recTaskTimeout
 	recTaskCancel
+	recRetention
 )
 
 // ErrStorageUnavailable wraps a durable-write failure at runtime. A request
@@ -92,6 +93,10 @@ type walTelemetry struct {
 	Sequence   int64              `json:"sequence"`
 	ObservedAt time.Time          `json:"observedAt"`
 	Values     map[string]float64 `json:"values"`
+	// TrimThrough is the cumulative count of oldest events removed by the
+	// retention limit once this sample is committed. Absent/zero in records
+	// written before retention existed, which never trimmed anything.
+	TrimThrough int64 `json:"trimThrough,omitempty"`
 	// Alerts and Ended carry the alert changes judged from this sample, in the
 	// same commit unit as the sample itself. Absent in records written before
 	// alerting existed.
@@ -115,10 +120,20 @@ type walReplay struct {
 	BatchID       string             `json:"batchId"`
 	Samples       []walSample        `json:"samples"`
 	Receipt       ReplayReceipt      `json:"receipt"`
+	TrimThrough   int64              `json:"trimThrough,omitempty"`
 	LastSeenAt    *time.Time         `json:"lastSeenAt,omitempty"`
 	LastTelemetry map[string]float64 `json:"lastTelemetry,omitempty"`
 	Alerts        []*Alert           `json:"alerts,omitempty"`
 	Ended         []*Alert           `json:"ended,omitempty"`
+}
+
+// walRetention is one committed retention setting. TrimThrough is the
+// cumulative number of oldest events that had to be removed to satisfy the
+// new limit at commit time; it can only grow.
+type walRetention struct {
+	DeviceID    string `json:"deviceId"`
+	MaxEvents   int64  `json:"maxEvents"`
+	TrimThrough int64  `json:"trimThrough,omitempty"`
 }
 
 // walRule is one committed rule create or update. Ended holds the alerts the
@@ -434,7 +449,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 		if crc32.Checksum(walData[pos:pos+5+length], crcTable) != wantCRC {
 			return nil, fmt.Errorf("write-ahead log %s is corrupt at byte %d: frame failed its integrity check (file left untouched)", walPath, pos)
 		}
-		if recType < recInstance || recType > recTaskCancel {
+		if recType < recInstance || recType > recRetention {
 			return nil, fmt.Errorf("write-ahead log %s uses unsupported record type %d at byte %d", walPath, recType, pos)
 		}
 		frames = append(frames, parsedFrame{recType: recType, payload: payload})
@@ -461,7 +476,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 			instanceID = rec.InstanceID
 			sawInstance = true
 		case recRegister, recTelemetry, recReplay, recRule, recAlertAck, recConfigPublish, recConfigReceipt,
-			recTaskCreate, recTaskClaim, recTaskReport, recTaskTimeout, recTaskCancel:
+			recTaskCreate, recTaskClaim, recTaskReport, recTaskTimeout, recTaskCancel, recRetention:
 			if !sawInstance {
 				return nil, fmt.Errorf("write-ahead log %s is corrupt: data record precedes instance marker", walPath)
 			}
@@ -560,6 +575,29 @@ func marshalFrame(recType byte, value any) ([]byte, error) {
 	return frame, nil
 }
 
+// validateTrim checks a record's cumulative trim pointer against the state
+// during recovery. It must never move backwards, never pass the record's own
+// high-water sequence, and it must equal exactly what the live limit would
+// have produced, so a damaged or hand-edited WAL fails startup.
+func validateTrim(state *deviceState, trimThrough, recordMaxSeq, limit int64) error {
+	if trimThrough < state.eventBase {
+		return fmt.Errorf("device %q retention trim pointer went backwards: %d < %d",
+			state.device.ID, trimThrough, state.eventBase)
+	}
+	if trimThrough > recordMaxSeq {
+		return fmt.Errorf("device %q retention trim pointer %d past sequence %d",
+			state.device.ID, trimThrough, recordMaxSeq)
+	}
+	if limit < 0 || limit > maxRetentionEvents {
+		return fmt.Errorf("device %q retention limit %d out of range", state.device.ID, limit)
+	}
+	if want := planTrimThrough(state.eventBase, recordMaxSeq, limit); trimThrough != want {
+		return fmt.Errorf("device %q retention trim pointer %d is inconsistent (want %d for limit %d)",
+			state.device.ID, trimThrough, want, limit)
+	}
+	return nil
+}
+
 // applyAlertRecord validates and applies the alert changes carried by a
 // telemetry or replay record. It rejects relational inconsistency so a damaged
 // WAL fails startup rather than producing broken alert state.
@@ -617,7 +655,7 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 				RegisteredAt: rec.RegisteredAt.UTC(),
 				LastSeenAt:   rec.LastSeenAt.UTC(),
 			},
-			byEvent: make(map[string]int64),
+			known:   make(map[string]knownSample),
 			batches: make(map[string]storedBatch),
 			rules:   make(map[string]*ruleState),
 		}
@@ -632,11 +670,14 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		if !ok {
 			return fmt.Errorf("telemetry for unknown device %q", rec.DeviceID)
 		}
-		if rec.Sequence != int64(len(state.events))+1 {
-			return fmt.Errorf("device %q telemetry sequence gap: got %d, want %d", rec.DeviceID, rec.Sequence, len(state.events)+1)
+		if rec.Sequence != state.maxSequence()+1 {
+			return fmt.Errorf("device %q telemetry sequence gap: got %d, want %d", rec.DeviceID, rec.Sequence, state.maxSequence()+1)
 		}
 		if rec.ObservedAt.IsZero() || len(rec.Values) == 0 {
 			return fmt.Errorf("device %q telemetry record missing fields", rec.DeviceID)
+		}
+		if err := validateTrim(state, rec.TrimThrough, rec.Sequence, state.maxEvents); err != nil {
+			return err
 		}
 		state.events = append(state.events, Event{
 			Sequence:   rec.Sequence,
@@ -648,6 +689,7 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		if err := applyAlertRecord(state, rec.Alerts, rec.Ended); err != nil {
 			return err
 		}
+		state.applyTrim(rec.TrimThrough)
 		return nil
 
 	case recReplay:
@@ -685,13 +727,12 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 				ObservedAt: entry.ObservedAt.UTC(),
 				Values:     cloneTelemetry(entry.Values),
 			}
-			if sequence, seen := state.byEvent[entry.EventID]; seen {
-				existing := state.events[sequence-1]
-				if !sameInstant(existing.ObservedAt, entry.ObservedAt) || !sameValues(existing.Values, entry.Values) {
-					return fmt.Errorf("device %q dedupe record for %q disagrees with history", rec.DeviceID, entry.EventID)
+			if known, seen := state.known[entry.EventID]; seen {
+				if !sameInstant(known.observedAt, entry.ObservedAt) || !sameValues(known.values, entry.Values) {
+					return fmt.Errorf("device %q dedupe record for %q disagrees with stored sample", rec.DeviceID, entry.EventID)
 				}
-				if !status.Duplicate || status.Sequence != sequence {
-					return fmt.Errorf("device %q receipt for %q should reuse sequence %d", rec.DeviceID, entry.EventID, sequence)
+				if !status.Duplicate || status.Sequence != known.sequence {
+					return fmt.Errorf("device %q receipt for %q should reuse sequence %d", rec.DeviceID, entry.EventID, known.sequence)
 				}
 				dupCount++
 				continue
@@ -699,7 +740,7 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			if status.Duplicate {
 				return fmt.Errorf("device %q receipt marks unseen event %q as duplicate", rec.DeviceID, entry.EventID)
 			}
-			want := int64(len(state.events)) + 1
+			want := state.maxSequence() + 1
 			if status.Sequence != want {
 				return fmt.Errorf("device %q batch %q sequence mismatch for %q: got %d, want %d", rec.DeviceID, rec.BatchID, entry.EventID, status.Sequence, want)
 			}
@@ -708,13 +749,21 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 				ObservedAt: entry.ObservedAt.UTC(),
 				Values:     cloneTelemetry(entry.Values),
 			})
-			state.byEvent[entry.EventID] = status.Sequence
+			state.known[entry.EventID] = knownSample{
+				sequence:   status.Sequence,
+				observedAt: entry.ObservedAt.UTC(),
+				values:     cloneTelemetry(entry.Values),
+			}
 			newCount++
 			lastNew = i
 		}
 		if rec.Receipt.NewCount != newCount || rec.Receipt.Duplicate != dupCount {
 			return fmt.Errorf("device %q batch %q receipt counts disagree with samples (%d/%d vs %d/%d)",
 				rec.DeviceID, rec.BatchID, rec.Receipt.NewCount, rec.Receipt.Duplicate, newCount, dupCount)
+		}
+		batchMaxSeq := state.maxSequence()
+		if err := validateTrim(state, rec.TrimThrough, batchMaxSeq, state.maxEvents); err != nil {
+			return err
 		}
 
 		if newCount > 0 {
@@ -734,6 +783,26 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		if err := applyAlertRecord(state, rec.Alerts, rec.Ended); err != nil {
 			return err
 		}
+		state.applyTrim(rec.TrimThrough)
+		return nil
+
+	case recRetention:
+		var rec walRetention
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid retention record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("retention for unknown device %q", rec.DeviceID)
+		}
+		if rec.MaxEvents < 0 || rec.MaxEvents > maxRetentionEvents {
+			return fmt.Errorf("device %q retention limit %d out of range", rec.DeviceID, rec.MaxEvents)
+		}
+		if err := validateTrim(state, rec.TrimThrough, state.maxSequence(), rec.MaxEvents); err != nil {
+			return err
+		}
+		state.maxEvents = rec.MaxEvents
+		state.applyTrim(rec.TrimThrough)
 		return nil
 
 	case recRule:

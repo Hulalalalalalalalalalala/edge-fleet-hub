@@ -34,14 +34,16 @@ EDGE_FLEET_DATA_DIR=./fleet-data go run ./cmd/edge-fleet
   healthy again.
 - After a normal exit, a crash or a forced kill, reopening the same directory
   restores devices, registration and last-active times, last telemetry, the
-  complete histories with their receive sequences, per-device event
-  deduplication records and batch receipts, rules and alerts, and the complete
-  configuration delivery state (published versions, target/applied versions,
-  application receipts and publish/receipt deduplication records). Recovery
-  never refreshes device timestamps; new samples continue the previous
-  sequence. Re-submitting a batch that had already succeeded returns the first
-  receipt (`200`); changing its content still returns `409`. The same applies
-  to configuration publish requests and application receipts.
+  complete retained histories with their receive-sequence counters and
+  retention limits, per-device event deduplication records (including events
+  trimmed out of history) and batch receipts, rules and alerts, and the
+  complete configuration delivery state (published versions, target/applied
+  versions, application receipts and publish/receipt deduplication records).
+  Data written before a retention limit existed defaults to unlimited.
+  Recovery never refreshes device timestamps; new samples continue the
+  previous sequence. Re-submitting a batch that had already succeeded returns
+  the first receipt (`200`); changing its content still returns `409`. The
+  same applies to configuration publish requests and application receipts.
 - History continuation tokens issued before a restart remain valid afterwards
   and keep their pinned sequence high-water mark. Using a cursor against a
   different data directory (even one with the same device ids) returns `400`;
@@ -139,6 +141,67 @@ nor duplicate rows (start a fresh first page to see newer data). A cursor is
 only valid for its device and filter — reusing it on another device, with a
 different filter, or after tampering returns `400`; an unknown device returns
 `404`.
+
+While paging, retention trimming only removes records strictly before the
+cursor's continuation start, so a walk in progress stays valid and keeps its
+first-page upper bound — newer samples never leak in and missing ranges are
+never silently skipped. If the exact record the continuation starts at has
+been trimmed, the cursor returns `410 Gone` with the current
+`earliestSequence`; issue a fresh first page (starting at that sequence) to
+continue.
+
+## History retention
+
+Each device keeps its own bounded-history setting, independent of every other
+device. `GET` and `PUT /v1/devices/{id}/history/retention` query and change
+`maxEvents`:
+
+- `0` — unlimited (the default for new devices and for data written before
+  this feature existed);
+- `1`–`10000` — keep at most that many of the newest samples.
+
+Both operations return the same body:
+
+```json
+{
+  "maxEvents": 1000,
+  "retainedEvents": 1000,
+  "earliestSequence": 42,
+  "maxSequence": 1041
+}
+```
+
+`earliestSequence` is `null` for an empty device and `maxSequence` is the
+highest receive sequence ever accepted (starts at `0` and never retreats).
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8080/v1/devices/gateway-01/history/retention \
+  -H 'Content-Type: application/json' -d '{"maxEvents":1000}'
+```
+
+Lowering the limit immediately removes the oldest events by **receive**
+sequence (observed time is irrelevant to retention); live telemetry and
+successful replay batches enforce the same limit afterwards. Raising the
+limit or switching back to unlimited only affects future writes — already
+trimmed events never reappear. Trimming never renumbers or reuses sequences:
+new samples continue after the all-time maximum. It also does not change last
+telemetry, last-active time, alerts (including their trigger/recovery
+evidence), configurations or diagnostic tasks.
+
+A replay batch larger than the limit is still accepted in full: every sample
+keeps its ordered sequence, judges the rules and appears on the receipt, and
+only afterwards are the oldest excess events dropped. A duplicate whose event
+was already trimmed is still recognised — identical content returns its
+original sequence without re-entering history, evicting anything, refreshing
+device state or firing alerts again; different content still returns `409`,
+and retrying the original batch still returns its first receipt.
+
+A missing field, a non-integer or out-of-range `maxEvents`, or a body with
+more than one JSON document returns `400`; an unknown device returns `404`; a
+successful update returns `200`. When local persistence is enabled, the
+setting, trimming, cumulative sequences and replay deduplication records
+survive restarts, and a setting or write that cannot be persisted returns
+`503` with nothing applied and no sequence consumed.
 
 ## Configuration delivery
 
