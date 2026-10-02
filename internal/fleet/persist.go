@@ -63,6 +63,7 @@ const (
 	recTaskReport
 	recTaskTimeout
 	recTaskCancel
+	recRetention
 )
 
 // ErrStorageUnavailable wraps a durable-write failure at runtime. A request
@@ -219,6 +220,14 @@ type walTaskCancel struct {
 	TaskID     int64           `json:"taskId"`
 	CanceledAt time.Time       `json:"canceledAt"`
 	Audit      TaskAuditRecord `json:"audit"`
+}
+
+// walRetention is one committed telemetry retention cap. 0 means unlimited.
+// Cleanup itself is not recorded: it is rebuilt during recovery by enforcing
+// the cap on the replayed event stream.
+type walRetention struct {
+	DeviceID  string `json:"deviceId"`
+	MaxEvents int64  `json:"maxEvents"`
 }
 
 // walFile is the durable backend. walDurable is the committed WAL length (also
@@ -434,7 +443,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 		if crc32.Checksum(walData[pos:pos+5+length], crcTable) != wantCRC {
 			return nil, fmt.Errorf("write-ahead log %s is corrupt at byte %d: frame failed its integrity check (file left untouched)", walPath, pos)
 		}
-		if recType < recInstance || recType > recTaskCancel {
+		if recType < recInstance || recType > recRetention {
 			return nil, fmt.Errorf("write-ahead log %s uses unsupported record type %d at byte %d", walPath, recType, pos)
 		}
 		frames = append(frames, parsedFrame{recType: recType, payload: payload})
@@ -461,7 +470,7 @@ func NewPersistentStore(dir string) (_ *Store, err error) {
 			instanceID = rec.InstanceID
 			sawInstance = true
 		case recRegister, recTelemetry, recReplay, recRule, recAlertAck, recConfigPublish, recConfigReceipt,
-			recTaskCreate, recTaskClaim, recTaskReport, recTaskTimeout, recTaskCancel:
+			recTaskCreate, recTaskClaim, recTaskReport, recTaskTimeout, recTaskCancel, recRetention:
 			if !sawInstance {
 				return nil, fmt.Errorf("write-ahead log %s is corrupt: data record precedes instance marker", walPath)
 			}
@@ -617,7 +626,7 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 				RegisteredAt: rec.RegisteredAt.UTC(),
 				LastSeenAt:   rec.LastSeenAt.UTC(),
 			},
-			byEvent: make(map[string]int64),
+			byEvent: make(map[string]dedupEvent),
 			batches: make(map[string]storedBatch),
 			rules:   make(map[string]*ruleState),
 		}
@@ -632,8 +641,8 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		if !ok {
 			return fmt.Errorf("telemetry for unknown device %q", rec.DeviceID)
 		}
-		if rec.Sequence != int64(len(state.events))+1 {
-			return fmt.Errorf("device %q telemetry sequence gap: got %d, want %d", rec.DeviceID, rec.Sequence, len(state.events)+1)
+		if rec.Sequence != state.maxSequence+1 {
+			return fmt.Errorf("device %q telemetry sequence gap: got %d, want %d", rec.DeviceID, rec.Sequence, state.maxSequence+1)
 		}
 		if rec.ObservedAt.IsZero() || len(rec.Values) == 0 {
 			return fmt.Errorf("device %q telemetry record missing fields", rec.DeviceID)
@@ -643,6 +652,8 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			ObservedAt: rec.ObservedAt.UTC(),
 			Values:     cloneTelemetry(rec.Values),
 		})
+		state.maxSequence = rec.Sequence
+		enforceRetention(state)
 		state.device.LastSeenAt = rec.ObservedAt.UTC()
 		state.device.LastTelemetry = cloneTelemetry(rec.Values)
 		if err := applyAlertRecord(state, rec.Alerts, rec.Ended); err != nil {
@@ -685,13 +696,12 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 				ObservedAt: entry.ObservedAt.UTC(),
 				Values:     cloneTelemetry(entry.Values),
 			}
-			if sequence, seen := state.byEvent[entry.EventID]; seen {
-				existing := state.events[sequence-1]
-				if !sameInstant(existing.ObservedAt, entry.ObservedAt) || !sameValues(existing.Values, entry.Values) {
+			if record, seen := state.byEvent[entry.EventID]; seen {
+				if !sameInstant(record.ObservedAt, entry.ObservedAt) || !sameValues(record.Values, entry.Values) {
 					return fmt.Errorf("device %q dedupe record for %q disagrees with history", rec.DeviceID, entry.EventID)
 				}
-				if !status.Duplicate || status.Sequence != sequence {
-					return fmt.Errorf("device %q receipt for %q should reuse sequence %d", rec.DeviceID, entry.EventID, sequence)
+				if !status.Duplicate || status.Sequence != record.Sequence {
+					return fmt.Errorf("device %q receipt for %q should reuse sequence %d", rec.DeviceID, entry.EventID, record.Sequence)
 				}
 				dupCount++
 				continue
@@ -699,7 +709,7 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			if status.Duplicate {
 				return fmt.Errorf("device %q receipt marks unseen event %q as duplicate", rec.DeviceID, entry.EventID)
 			}
-			want := int64(len(state.events)) + 1
+			want := state.maxSequence + 1
 			if status.Sequence != want {
 				return fmt.Errorf("device %q batch %q sequence mismatch for %q: got %d, want %d", rec.DeviceID, rec.BatchID, entry.EventID, status.Sequence, want)
 			}
@@ -708,10 +718,16 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 				ObservedAt: entry.ObservedAt.UTC(),
 				Values:     cloneTelemetry(entry.Values),
 			})
-			state.byEvent[entry.EventID] = status.Sequence
+			state.byEvent[entry.EventID] = dedupEvent{
+				Sequence:   status.Sequence,
+				ObservedAt: entry.ObservedAt.UTC(),
+				Values:     cloneTelemetry(entry.Values),
+			}
+			state.maxSequence = status.Sequence
 			newCount++
 			lastNew = i
 		}
+		enforceRetention(state)
 		if rec.Receipt.NewCount != newCount || rec.Receipt.Duplicate != dupCount {
 			return fmt.Errorf("device %q batch %q receipt counts disagree with samples (%d/%d vs %d/%d)",
 				rec.DeviceID, rec.BatchID, rec.Receipt.NewCount, rec.Receipt.Duplicate, newCount, dupCount)
@@ -1087,6 +1103,22 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		ts.task.Deadline = nil
 		rec.Audit.Seq = int64(len(ts.audit)) + 1
 		ts.audit = append(ts.audit, rec.Audit)
+		return nil
+
+	case recRetention:
+		var rec walRetention
+		if err := json.Unmarshal(payload, &rec); err != nil {
+			return fmt.Errorf("invalid retention record: %w", err)
+		}
+		state, ok := s.devices[rec.DeviceID]
+		if !ok {
+			return fmt.Errorf("retention for unknown device %q", rec.DeviceID)
+		}
+		if rec.MaxEvents != 0 && (rec.MaxEvents < 1 || rec.MaxEvents > 10000) {
+			return fmt.Errorf("device %q retention cap %d is out of range", rec.DeviceID, rec.MaxEvents)
+		}
+		state.retention = rec.MaxEvents
+		enforceRetention(state)
 		return nil
 
 	default:

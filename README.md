@@ -140,6 +140,52 @@ only valid for its device and filter — reusing it on another device, with a
 different filter, or after tampering returns `400`; an unknown device returns
 `404`.
 
+## Telemetry history retention
+
+Each device can cap how many history events it keeps by receive sequence.
+`maxEvents` is `0` for unlimited (the default) or `1`–`10000` for the maximum
+number of retained events. Lowering the cap immediately cleans the oldest
+events; live telemetry and accepted replay batches enforce the same cap after
+each commit. Raising the cap or restoring unlimited only affects future writes
+— cleaned history never reappears. Cleanup never reorders or reuses sequences;
+new samples continue after the highest sequence ever assigned.
+
+`GET /v1/devices/{id}/history/retention` and
+`PUT /v1/devices/{id}/history/retention` (body `{"maxEvents":N}`) both return:
+
+```json
+{"maxEvents": 100, "retainedCount": 42, "earliestSequence": 1, "maxSequence": 100}
+```
+
+For an empty device `earliestSequence` is `null` and `maxSequence` is `0`.
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8080/v1/devices/gateway-01/history/retention \
+  -H 'Content-Type: application/json' -d '{"maxEvents":100}'
+```
+
+Missing fields, non-integer values, out-of-range values, and bodies containing
+more than one JSON document return `400`; an unknown device returns `404`. A
+batch whose new samples exceed the cap is still fully received, assigned
+sequences in order and judged by rules; only the last `maxEvents` are kept, and
+the receipt still lists every sample. Cleaned eventIds remain dedup records:
+the same content reuses the original sequence, different content conflicts the
+whole batch (`409`).
+
+While paging, cleanup only removes records before the cursor's resume point;
+the continuation stays valid and respects the first-page bound. If the resume
+point itself was cleaned, a valid cursor returns `410` with the current
+`earliestSequence` — start a fresh query to continue. Cursors are scoped to
+their device, filter and data directory; tampering or switching device/filter
+returns `400`.
+
+With local persistence enabled, the cap, cleanup results, cumulative sequences
+and replay dedup records all survive restart; old data defaults to unlimited.
+A cursor unaffected by cleanup before a restart remains valid afterwards. If a
+setting or write cannot be persisted it returns `503`: that setting, samples,
+cleanup, receipt and alert changes do not take effect and no sequence is
+consumed.
+
 ## Configuration delivery
 
 Each registered device has its own configuration version line. Versions are

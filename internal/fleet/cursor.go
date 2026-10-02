@@ -18,7 +18,7 @@ type pageCursor struct {
 	From      time.Time `json:"f,omitempty"`
 	To        time.Time `json:"t,omitempty"`
 	HighWater int64     `json:"h"`
-	ScanPos   int64     `json:"p"`           // 0-based event slot the next page starts at
+	ScanSeq   int64     `json:"s"`           // receive sequence the next page starts at
 	IID       []byte    `json:"i,omitempty"` // data-directory instance scope
 }
 

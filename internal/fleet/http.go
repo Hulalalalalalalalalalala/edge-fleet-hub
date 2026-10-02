@@ -24,6 +24,8 @@ func NewHandler(store *Store) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{id}/telemetry", h.telemetry)
 	mux.HandleFunc("POST /v1/devices/{id}/replay", h.replay)
 	mux.HandleFunc("GET /v1/devices/{id}/history", h.history)
+	mux.HandleFunc("GET /v1/devices/{id}/history/retention", h.getRetention)
+	mux.HandleFunc("PUT /v1/devices/{id}/history/retention", h.setRetention)
 	mux.HandleFunc("GET /v1/fleet", h.snapshot)
 	mux.HandleFunc("POST /v1/devices/{id}/rules", h.createRule)
 	mux.HandleFunc("GET /v1/devices/{id}/rules", h.listRules)
@@ -214,7 +216,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 		limit = value
 	}
 
-	var afterIndex, highWater int64
+	var startSeq, highWater int64
 	rawCursor := strings.TrimSpace(query.Get("cursor"))
 	if rawCursor != "" {
 		// An unknown device is always 404, even with a malformed or foreign
@@ -230,12 +232,20 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 			return
 		}
-		afterIndex, highWater = cursor.ScanPos, cursor.HighWater
+		startSeq, highWater = cursor.ScanSeq, cursor.HighWater
 	}
 
-	events, appliedBound, nextIndex, hasMore, err := h.store.History(id, filter, afterIndex, highWater, limit)
+	events, appliedBound, nextScanSeq, hasMore, err := h.store.History(id, filter, startSeq, highWater, limit)
 	if errors.Is(err, ErrDeviceNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	var gone *ErrHistoryGone
+	if errors.As(err, &gone) {
+		writeJSON(w, http.StatusGone, map[string]any{
+			"error":            "history cursor is no longer valid",
+			"earliestSequence": gone.EarliestSequence,
+		})
 		return
 	}
 	if err != nil {
@@ -251,7 +261,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 			From:      filter.From,
 			To:        filter.To,
 			HighWater: highWater,
-			ScanPos:   nextIndex,
+			ScanSeq:   nextScanSeq,
 			IID:       h.store.instanceID(),
 		})
 	}
@@ -261,6 +271,54 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 		"events":     events,
 		"nextCursor": nextCursor,
 	})
+}
+
+// getRetention returns the device's telemetry retention state.
+func (h *handler) getRetention(w http.ResponseWriter, r *http.Request) {
+	info, err := h.store.GetRetention(r.PathValue("id"))
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// setRetention updates the device's telemetry retention cap.
+func (h *handler) setRetention(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		MaxEvents *int64 `json:"maxEvents"`
+	}
+	if err := decodeSingleJSON(r, &request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must be a single valid JSON object"})
+		return
+	}
+	if request.MaxEvents == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "maxEvents is required"})
+		return
+	}
+	maxEvents := *request.MaxEvents
+	if maxEvents != 0 && (maxEvents < 1 || maxEvents > 10000) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "maxEvents must be 0 or between 1 and 10000"})
+		return
+	}
+	info, err := h.store.SetRetention(r.PathValue("id"), maxEvents)
+	if errors.Is(err, ErrDeviceNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, ErrStorageUnavailable) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
 }
 
 func (h *handler) snapshot(w http.ResponseWriter, _ *http.Request) {

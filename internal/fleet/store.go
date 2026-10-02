@@ -17,6 +17,17 @@ var (
 	ErrInvalidRule     = errors.New("invalid rule")
 )
 
+// ErrHistoryGone is reported when a history cursor's resume point has been
+// removed by retention cleanup. The caller must start a fresh query; the
+// current earliest retained sequence is attached.
+type ErrHistoryGone struct {
+	EarliestSequence int64
+}
+
+func (e *ErrHistoryGone) Error() string {
+	return "history cursor is no longer valid"
+}
+
 // Rule is a per-device threshold rule. It judges only samples accepted while
 // enabled; it never backfills history. Device and ID are immutable after
 // creation. Version starts at 1 and bumps on every successful update.
@@ -112,6 +123,18 @@ type HistoryFilter struct {
 	To   time.Time
 }
 
+// RetentionInfo describes a device's telemetry retention state. MaxEvents is
+// the configured cap (0 = unlimited); RetainedCount is the number of events
+// currently retained; EarliestSequence is the lowest retained receive sequence
+// (nil when empty); MaxSequence is the highest receive sequence ever assigned
+// (0 when empty).
+type RetentionInfo struct {
+	MaxEvents        int64  `json:"maxEvents"`
+	RetainedCount    int64  `json:"retainedCount"`
+	EarliestSequence *int64 `json:"earliestSequence"`
+	MaxSequence      int64  `json:"maxSequence"`
+}
+
 // StoredBatch records the ordered samples an accepted batchId committed along
 // with the receipt returned on first acceptance, so a repeated batchId can be
 // checked for identical content and replayed with the original receipt.
@@ -122,14 +145,31 @@ type storedBatch struct {
 
 type deviceState struct {
 	device  Device
-	events  []Event          // history ordered by sequence (sequence = index + 1)
-	byEvent map[string]int64 // eventId -> sequence
+	events  []Event             // retained history, ordered by receive sequence (contiguous)
+	maxSequence int64           // highest receive sequence ever assigned (0 when none)
+	byEvent map[string]dedupEvent // eventId -> dedup record (survives history cleanup)
 	batches map[string]storedBatch
 	rules   map[string]*ruleState
 	alerts  []*Alert // per-device, ordered by alert id (id = index + 1)
 	config  *configState
 	tasks   []*taskState          // per-device, ordered by task id (id = index + 1)
 	tasksByRequest map[string]*taskState // requestId -> first task
+
+	// retention caps the number of retained events by receive sequence. 0 means
+	// unlimited. Cleanup only removes the oldest events; it never reorders or
+	// reuses sequences, and dedup records (byEvent) outlive the events they
+	// refer to so a cleaned eventId still resolves to its original sequence and
+	// can be compared for content equality on a later replay.
+	retention int64
+}
+
+// dedupEvent remembers the content of a committed eventId so a later replay can
+// distinguish a duplicate (same content, reuses the sequence) from a conflict
+// (different content, 409) even after the event has been cleaned from history.
+type dedupEvent struct {
+	Sequence   int64
+	ObservedAt time.Time
+	Values     map[string]float64
 }
 
 type Store struct {
@@ -180,7 +220,7 @@ func (s *Store) Register(id, site string) (Device, bool, error) {
 	}
 	s.devices[id] = &deviceState{
 		device:  device,
-		byEvent: make(map[string]int64),
+		byEvent: make(map[string]dedupEvent),
 		batches: make(map[string]storedBatch),
 		rules:   make(map[string]*ruleState),
 	}
@@ -198,7 +238,7 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 		return Device{}, ErrDeviceNotFound
 	}
 	now := s.now().UTC()
-	sequence := int64(len(state.events)) + 1
+	sequence := state.maxSequence + 1
 	eval := newAlertEvaluator(state)
 	eval.evaluate(sequence, now, values)
 	if s.wal != nil {
@@ -218,6 +258,8 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 		ObservedAt: now,
 		Values:     cloneTelemetry(values),
 	})
+	state.maxSequence = sequence
+	enforceRetention(state)
 	state.device.LastSeenAt = now
 	state.device.LastTelemetry = cloneTelemetry(values)
 	eval.commit()
@@ -253,15 +295,14 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 		dup      bool
 	}
 	planned := make([]plan, len(samples))
-	nextSequence := int64(len(state.events)) + 1
+	nextSequence := state.maxSequence + 1
 	for i, sample := range samples {
-		if sequence, seen := state.byEvent[sample.EventID]; seen {
-			existing := state.events[sequence-1]
-			if !sameInstant(existing.ObservedAt, sample.ObservedAt) ||
-				!sameValues(existing.Values, sample.Values) {
+		if record, seen := state.byEvent[sample.EventID]; seen {
+			if !sameInstant(record.ObservedAt, sample.ObservedAt) ||
+				!sameValues(record.Values, sample.Values) {
 				return ReplayReceipt{}, false, ErrBatchConflict
 			}
-			planned[i] = plan{sample, sequence, true}
+			planned[i] = plan{sample, record.Sequence, true}
 			continue
 		}
 		planned[i] = plan{sample, nextSequence, false}
@@ -343,8 +384,16 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 			ObservedAt: entry.sample.ObservedAt,
 			Values:     cloneTelemetry(entry.sample.Values),
 		})
-		state.byEvent[entry.sample.EventID] = entry.sequence
+		state.byEvent[entry.sample.EventID] = dedupEvent{
+			Sequence:   entry.sequence,
+			ObservedAt: entry.sample.ObservedAt,
+			Values:     cloneTelemetry(entry.sample.Values),
+		}
+		if entry.sequence > state.maxSequence {
+			state.maxSequence = entry.sequence
+		}
 	}
+	enforceRetention(state)
 
 	committed := make([]Sample, len(samples))
 	copy(committed, samples)
@@ -367,6 +416,71 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 func cloneReceipt(receipt ReplayReceipt) ReplayReceipt {
 	receipt.SampleStatus = append([]SampleStatus(nil), receipt.SampleStatus...)
 	return receipt
+}
+
+// enforceRetention removes the oldest events so the retained count never
+// exceeds the device's cap. It only drops from the front; sequences are never
+// reordered or reused, and byEvent dedup records are left intact so a cleaned
+// eventId still resolves to its original sequence on a later replay. A cap of 0
+// means unlimited. Caller must hold s.mu.
+func enforceRetention(state *deviceState) {
+	if state.retention <= 0 {
+		return
+	}
+	if excess := int64(len(state.events)) - state.retention; excess > 0 {
+		state.events = state.events[excess:]
+	}
+}
+
+// retentionInfo builds the current retention snapshot. Caller must hold s.mu
+// (read or write).
+func retentionInfo(state *deviceState) RetentionInfo {
+	info := RetentionInfo{
+		MaxEvents:     state.retention,
+		RetainedCount: int64(len(state.events)),
+		MaxSequence:   state.maxSequence,
+	}
+	if len(state.events) > 0 {
+		earliest := state.events[0].Sequence
+		info.EarliestSequence = &earliest
+	}
+	return info
+}
+
+// GetRetention returns the device's telemetry retention state.
+func (s *Store) GetRetention(id string) (RetentionInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return RetentionInfo{}, ErrDeviceNotFound
+	}
+	return retentionInfo(state), nil
+}
+
+// SetRetention updates the device's telemetry retention cap (0 = unlimited).
+// Lowering the cap immediately cleans the oldest events; raising it or
+// restoring unlimited only affects future writes. The change is committed to
+// the WAL before it takes effect, so a persistence failure leaves the previous
+// cap and history untouched.
+func (s *Store) SetRetention(id string, maxEvents int64) (RetentionInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.devices[id]
+	if !ok {
+		return RetentionInfo{}, ErrDeviceNotFound
+	}
+	if s.wal != nil {
+		if err := s.wal.appendRecord(recRetention, walRetention{
+			DeviceID:  id,
+			MaxEvents: maxEvents,
+		}); err != nil {
+			return RetentionInfo{}, storageUnavailable(err)
+		}
+	}
+	state.retention = maxEvents
+	enforceRetention(state)
+	return retentionInfo(state), nil
 }
 
 // --- rules and alerts -------------------------------------------------------
@@ -708,27 +822,44 @@ func cloneAlerts(alerts []*Alert) []*Alert {
 	return cloned
 }
 
-// History returns one page of a device's event history. afterIndex is the first
-// 0-based event slot to scan (0 for the first page); limit caps the number of
-// matching events returned. bound pins the scan to sequences no larger than
-// bound; a zero bound means "current maximum", which is then returned so
-// callers can pin subsequent pages. nextIndex is the slot a following page
-// should start at when hasMore is true. Concurrent writes therefore cannot
-// skip or duplicate rows within a paged walk.
-func (s *Store) History(id string, filter HistoryFilter, afterIndex, bound int64, limit int) (events []Event, appliedBound, nextIndex int64, hasMore bool, err error) {
+// History returns one page of a device's event history. startSeq is the first
+// receive sequence to scan (0 for the first page); highWater caps the scan to
+// sequences no larger than it (0 means "current maximum", which is then
+// returned so callers can pin subsequent pages). The scan reads events in
+// receive order; a cursor whose resume sequence was removed by retention
+// cleanup reports ErrHistoryGone so the caller starts a fresh query rather than
+// silently skipping the gap. Concurrent writes therefore cannot skip or
+// duplicate rows within a paged walk, and new rows never enter a pinned page.
+func (s *Store) History(id string, filter HistoryFilter, startSeq, highWater int64, limit int) (events []Event, appliedHighWater, nextScanSeq int64, hasMore bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	state, ok := s.devices[id]
 	if !ok {
 		return nil, 0, 0, false, ErrDeviceNotFound
 	}
-	highWater := int64(len(state.events))
-	if bound == 0 {
-		bound = highWater
+	currentMax := state.maxSequence
+	if highWater == 0 {
+		highWater = currentMax
+	}
+	earliest := int64(0)
+	if len(state.events) > 0 {
+		earliest = state.events[0].Sequence
+	}
+	// A cursor whose resume point was cleaned is invalid; the caller must
+	// start a fresh query.
+	if startSeq > 0 && startSeq < earliest {
+		return nil, highWater, 0, false, &ErrHistoryGone{EarliestSequence: earliest}
+	}
+	startIdx := 0
+	if startSeq > 0 {
+		startIdx = int(startSeq - earliest)
 	}
 	events = make([]Event, 0, limit)
-	for index := afterIndex; index < bound; index++ {
+	for index := startIdx; index < len(state.events); index++ {
 		event := state.events[index]
+		if event.Sequence > highWater {
+			break
+		}
 		if !filter.From.IsZero() && event.ObservedAt.Before(filter.From) {
 			continue
 		}
@@ -739,11 +870,11 @@ func (s *Store) History(id string, filter HistoryFilter, afterIndex, bound int64
 			events = append(events, cloneEvent(event))
 			continue
 		}
-		// This match belongs to the next page; resume scanning here so rows in
-		// the gap are never examined twice.
-		return events, bound, index, true, nil
+		// This match belongs to the next page; resume scanning at its sequence
+		// so rows in the gap are never examined twice.
+		return events, highWater, event.Sequence, true, nil
 	}
-	return events, bound, bound, false, nil
+	return events, highWater, 0, false, nil
 }
 
 func (s *Store) Snapshot() []Device {
