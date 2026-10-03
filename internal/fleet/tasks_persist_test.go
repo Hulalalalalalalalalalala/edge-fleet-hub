@@ -387,6 +387,179 @@ func (w *permanentFailingWAL) appendRecord(recType byte, value any) error {
 	return fmt.Errorf("simulated permanent disk failure")
 }
 
+// --- a failed cancel keeps the in-progress execution eligible ----------------
+
+// A cancel whose record cannot be persisted returns 503 and commits nothing:
+// the task keeps its claim terms and audit trail, the device stays occupied,
+// and the pending task behind it is not advanced. Once storage is healthy the
+// cancel can be retried within the original deadline; only then is the
+// credential revoked and the device released.
+func TestPersistentTaskCancelWriteFailureKeepsExecution(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createTask(t, h, "gw", taskBody("req-1", 30), http.StatusCreated)
+	createTask(t, h, "gw", taskBody("req-2", 30), http.StatusCreated)
+	claim := claimTask(t, h, "gw", http.StatusOK)
+	if claim.Task.ID != 1 {
+		t.Fatalf("claimed task %d, want 1", claim.Task.ID)
+	}
+	auditBefore := listAudit(t, h, "gw", 1)
+	if got := joinEvents(eventsOf(auditBefore)); got != "created,claimed" {
+		t.Fatalf("audit before cancel = %s", got)
+	}
+
+	real := store.wal.(*walFile)
+	store.wal = &permanentFailingWAL{}
+
+	// The cancel cannot be recorded: 503.
+	r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/tasks/1/cancel", "")
+	if r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failing cancel = %d, want 503: %s", r.Code, r.Body.String())
+	}
+
+	// The task detail keeps the pre-cancel execution state: same attempt,
+	// claim time and deadline, and no completion time or result.
+	task := getTask(t, h, "gw", 1, http.StatusOK)
+	if task.Status != "in_progress" || task.Attempts != 1 {
+		t.Fatalf("failed cancel changed task: %+v", task)
+	}
+	if task.ClaimedAt == nil || claim.Task.ClaimedAt == nil || !task.ClaimedAt.Equal(*claim.Task.ClaimedAt) {
+		t.Fatalf("claimedAt after failed cancel = %v, want %v", task.ClaimedAt, claim.Task.ClaimedAt)
+	}
+	if task.Deadline == nil || !task.Deadline.Equal(claim.Deadline) {
+		t.Fatalf("deadline after failed cancel = %v, want %s", task.Deadline, claim.Deadline)
+	}
+	if task.CompletedAt != nil || task.Result != nil {
+		t.Fatalf("failed cancel left completion state: %+v", task)
+	}
+
+	// The audit trail is untouched: no canceled record was added.
+	audit := listAudit(t, h, "gw", 1)
+	if got := joinEvents(eventsOf(audit)); got != "created,claimed" {
+		t.Fatalf("audit after failed cancel = %s", got)
+	}
+
+	// The task list reflects the same un-canceled state.
+	list := decodeBody[struct {
+		Tasks []taskResponse `json:"tasks"`
+	}](t, doRequest(t, h, http.MethodGet, "/v1/devices/gw/tasks", ""))
+	if len(list.Tasks) != 2 || list.Tasks[0].Status != "in_progress" || list.Tasks[0].CompletedAt != nil {
+		t.Fatalf("list after failed cancel: %+v", list.Tasks)
+	}
+	if list.Tasks[0].ClaimedAt == nil || list.Tasks[0].Deadline == nil {
+		t.Fatalf("list lost the claim terms: %+v", list.Tasks[0])
+	}
+	if list.Tasks[1].Status != "pending" || list.Tasks[1].Attempts != 0 {
+		t.Fatalf("failed cancel advanced the pending task: %+v", list.Tasks[1])
+	}
+
+	// The device is still occupied by the in-progress task: the pending task
+	// is not handed out.
+	claimTask(t, h, "gw", http.StatusNoContent)
+	if task2 := getTask(t, h, "gw", 2, http.StatusOK); task2.Status != "pending" || task2.Attempts != 0 {
+		t.Fatalf("pending task advanced while device occupied: %+v", task2)
+	}
+
+	// Storage is healthy again; the retry lands within the original deadline
+	// and is the cancel that counts.
+	store.wal = real
+	cancelAt := claim.Deadline.Add(-20 * time.Second)
+	store.now = func() time.Time { return cancelAt }
+	canceled := cancelTask(t, h, "gw", 1, http.StatusOK)
+	if canceled.Status != "canceled" || canceled.CompletedAt == nil || !canceled.CompletedAt.Equal(cancelAt) {
+		t.Fatalf("retried cancel = %+v, want completedAt %s", canceled, cancelAt)
+	}
+	// The cancel did not claim again and cleared the claim terms.
+	if canceled.Attempts != 1 || canceled.ClaimedAt != nil || canceled.Deadline != nil {
+		t.Fatalf("cancel response kept claim state: %+v", canceled)
+	}
+
+	// Exactly one canceled record was appended after the untouched records.
+	audit = listAudit(t, h, "gw", 1)
+	if got := joinEvents(eventsOf(audit)); got != "created,claimed,canceled" {
+		t.Fatalf("audit after retried cancel = %s", got)
+	}
+	if !audit[0].At.Equal(auditBefore[0].At) || !audit[1].At.Equal(auditBefore[1].At) ||
+		audit[1].Attempt != auditBefore[1].Attempt || audit[1].FromStatus != auditBefore[1].FromStatus {
+		t.Fatalf("retried cancel rewrote earlier audit: %+v vs %+v", audit, auditBefore)
+	}
+	cancelRec := audit[2]
+	if cancelRec.Seq != 3 || cancelRec.FromStatus != "in_progress" || cancelRec.ToStatus != "canceled" ||
+		!cancelRec.At.Equal(cancelAt) {
+		t.Fatalf("cancel audit record = %+v", cancelRec)
+	}
+
+	// Queries agree: canceled, no claim terms, no result.
+	task = getTask(t, h, "gw", 1, http.StatusOK)
+	if task.Status != "canceled" || task.ClaimedAt != nil || task.Deadline != nil ||
+		task.Result != nil || task.CompletedAt == nil || !task.CompletedAt.Equal(cancelAt) {
+		t.Fatalf("task after retried cancel: %+v", task)
+	}
+	list = decodeBody[struct {
+		Tasks []taskResponse `json:"tasks"`
+	}](t, doRequest(t, h, http.MethodGet, "/v1/devices/gw/tasks", ""))
+	if list.Tasks[0].Status != "canceled" || list.Tasks[0].ClaimedAt != nil || list.Tasks[0].Deadline != nil {
+		t.Fatalf("list after retried cancel: %+v", list.Tasks[0])
+	}
+
+	// The released device now takes the previously blocked task; the canceled
+	// task is never handed out again.
+	claim2 := claimTask(t, h, "gw", http.StatusOK)
+	if claim2.Task.ID != 2 || claim2.Attempt != 1 {
+		t.Fatalf("claim after cancel = task %d attempt %d, want task 2 attempt 1", claim2.Task.ID, claim2.Attempt)
+	}
+
+	// The canceled task's credential is revoked: the first report with it
+	// conflicts and stores nothing.
+	reportTask(t, h, "gw", 1,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+	task = getTask(t, h, "gw", 1, http.StatusOK)
+	if task.Status != "canceled" || task.Result != nil {
+		t.Fatalf("report on canceled task changed it: %+v", task)
+	}
+	if got := joinEvents(eventsOf(listAudit(t, h, "gw", 1))); got != "created,claimed,canceled" {
+		t.Fatalf("audit after rejected report = %s", got)
+	}
+}
+
+// The failed cancel did not revoke the execution credential either: with
+// storage healthy and the deadline still ahead, the device can still complete
+// the very attempt the failed cancel tried to stop. This is the opposite
+// outcome of a committed cancel, which invalidates the credential.
+func TestPersistentTaskCancelWriteFailureKeepsCredential(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createTask(t, h, "gw", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "gw", http.StatusOK)
+
+	real := store.wal.(*walFile)
+	store.wal = &permanentFailingWAL{}
+	r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/tasks/1/cancel", "")
+	if r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failing cancel = %d, want 503: %s", r.Code, r.Body.String())
+	}
+	store.wal = real
+
+	// The original claim still reports successfully: 201 and the result is
+	// stored; the earlier 503 is not held against the execution.
+	report := reportTask(t, h, "gw", 1,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true,"checks":3}`), http.StatusCreated)
+	if !report.Success {
+		t.Fatalf("report after failed cancel = %+v", report)
+	}
+	task := getTask(t, h, "gw", 1, http.StatusOK)
+	if task.Status != "succeeded" || string(task.Result) != `{"ok":true,"checks":3}` || task.CompletedAt == nil {
+		t.Fatalf("task after report = %+v", task)
+	}
+	if got := joinEvents(eventsOf(listAudit(t, h, "gw", 1))); got != "created,claimed,succeeded" {
+		t.Fatalf("audit after report = %s", got)
+	}
+}
+
 // --- an old data directory (pre-task records) still opens --------------------
 
 func TestPersistentOldDataDirStillOpens(t *testing.T) {
