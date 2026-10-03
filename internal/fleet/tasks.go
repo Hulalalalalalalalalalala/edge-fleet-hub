@@ -47,6 +47,10 @@ const (
 	taskMaxAttempts = 3
 )
 
+// taskReasonDeadlineExceeded is the failure reason recorded for a deadline
+// expiry; device-reported failures carry the reason the device submitted.
+const taskReasonDeadlineExceeded = "deadline exceeded"
+
 var (
 	// ErrTaskNotFound is reported for a task id the device has never seen.
 	ErrTaskNotFound = errors.New("diagnostic task not found")
@@ -325,7 +329,9 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 		Attempt: ts.task.Attempts,
 		At:      now,
 	}
-	// Compute the resulting state without mutating yet.
+	// Compute the resulting state without mutating yet. A failure goes through
+	// the same shared rule as a deadline expiry; success ends the task outright.
+	var plan taskFailurePlan
 	newStatus := ts.task.Status
 	newFailures := ts.task.Failures
 	var newNextClaimableAt time.Time
@@ -338,21 +344,17 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 		auditRec.Event = auditEventSucceeded
 		auditRec.ToStatus = taskStatusSucceeded
 	} else {
-		newFailures++
-		newFailureReason = reason
-		if newFailures >= taskMaxAttempts {
-			newStatus = taskStatusFailed
-			completedAt := now
-			newCompletedAt = &completedAt
-			auditRec.Event = auditEventFailed
-			auditRec.ToStatus = taskStatusFailed
-		} else {
-			newStatus = taskStatusWaiting
-			newNextClaimableAt = now.Add(backoffFor(newFailures))
-			auditRec.Event = auditEventFailed
-			auditRec.ToStatus = taskStatusWaiting
-		}
-		auditRec.Reason = reason
+		// The wait runs from the server receive time and the device-supplied
+		// reason is retained.
+		plan = planTaskFailure(ts.task.Attempts, ts.task.Failures, now, reason, auditEventFailed, "")
+		newStatus = plan.status
+		newFailures = plan.failures
+		newNextClaimableAt = plan.nextClaimableAt
+		newFailureReason = plan.reason
+		newCompletedAt = plan.completedAt
+		auditRec.Event = plan.audit.Event
+		auditRec.ToStatus = plan.audit.ToStatus
+		auditRec.Reason = plan.audit.Reason
 	}
 	stored := storedReport{
 		receiptID:  receiptID,
@@ -381,17 +383,19 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 		}
 	}
 	// Commit the in-memory state only after the durable commit point.
-	ts.task.Status = newStatus
-	ts.task.Failures = newFailures
-	ts.task.NextClaimableAt = newNextClaimableAt
-	ts.task.FailureReason = newFailureReason
-	ts.task.CompletedAt = newCompletedAt
 	if success {
+		ts.task.Status = newStatus
+		ts.task.Failures = newFailures
+		ts.task.NextClaimableAt = newNextClaimableAt
+		ts.task.FailureReason = newFailureReason
+		ts.task.CompletedAt = newCompletedAt
 		ts.task.Result = cloneJSON(result)
+		ts.task.Credential = ""
+		ts.task.ClaimedAt = nil
+		ts.task.Deadline = nil
+	} else {
+		ts.applyTaskFailure(plan)
 	}
-	ts.task.Credential = ""
-	ts.task.ClaimedAt = nil
-	ts.task.Deadline = nil
 	ts.reports[receiptID] = stored
 	ts.audit = append(ts.audit, auditRec)
 	return taskReportView(stored), false, nil
@@ -522,59 +526,98 @@ func (s *Store) evaluateTaskTimeouts(state *deviceState, now time.Time) error {
 		if !now.After(deadline) {
 			continue
 		}
-		attempt := ts.task.Attempts
-		newFailures := ts.task.Failures + 1
-		reason := "deadline exceeded"
-		auditRec := TaskAuditRecord{
-			Seq:        int64(len(ts.audit)) + 1,
-			Event:      auditEventTimedOut,
-			FromStatus: taskStatusInProgress,
-			Attempt:    attempt,
-			At:         deadline,
-			Reason:     reason,
-		}
-		newStatus := taskStatusWaiting
-		var newCompletedAt *time.Time
-		if newFailures >= taskMaxAttempts {
-			newStatus = taskStatusFailed
-			completedAt := deadline
-			newCompletedAt = &completedAt
-			auditRec.ToStatus = taskStatusFailed
-		} else {
-			newStatus = taskStatusWaiting
-			auditRec.ToStatus = taskStatusWaiting
-		}
-		var newNextClaimableAt time.Time
-		if newStatus == taskStatusWaiting {
-			newNextClaimableAt = deadline.Add(backoffFor(newFailures))
-		}
+		// Same shared failure rule as a device-reported failure, but the wait
+		// runs from the original deadline, the reason is fixed and the audit
+		// event is timed_out.
+		plan := planTaskFailure(ts.task.Attempts, ts.task.Failures, deadline,
+			taskReasonDeadlineExceeded, auditEventTimedOut, taskStatusInProgress)
+		plan.audit.Seq = int64(len(ts.audit)) + 1
 		if s.wal != nil {
 			if err := s.wal.appendRecord(recTaskTimeout, walTaskTimeout{
 				DeviceID:        state.device.ID,
 				TaskID:          ts.task.ID,
-				Attempt:         attempt,
+				Attempt:         ts.task.Attempts,
 				Deadline:        deadline,
-				Status:          newStatus,
-				Failures:        newFailures,
-				NextClaimableAt: newNextClaimableAt,
-				FailureReason:   reason,
-				CompletedAt:     newCompletedAt,
-				Audit:           auditRec,
+				Status:          plan.status,
+				Failures:        plan.failures,
+				NextClaimableAt: plan.nextClaimableAt,
+				FailureReason:   plan.reason,
+				CompletedAt:     plan.completedAt,
+				Audit:           plan.audit,
 			}); err != nil {
 				return storageUnavailable(err)
 			}
 		}
-		ts.task.Status = newStatus
-		ts.task.Failures = newFailures
-		ts.task.NextClaimableAt = newNextClaimableAt
-		ts.task.FailureReason = reason
-		ts.task.CompletedAt = newCompletedAt
-		ts.task.Credential = ""
-		ts.task.ClaimedAt = nil
-		ts.task.Deadline = nil
-		ts.audit = append(ts.audit, auditRec)
+		ts.applyTaskFailure(plan)
+		ts.audit = append(ts.audit, plan.audit)
 	}
 	return nil
+}
+
+// taskFailurePlan is the outcome of the shared failure rule: the task's next
+// status, its incremented failure count, the instant it becomes claimable
+// again (when the task is held for retry), the recorded failure reason and
+// completion time (when this failure ends it), and the lifecycle audit
+// record. Device-reported failures and deadline expiries are both planned
+// here so the two paths can never drift apart.
+type taskFailurePlan struct {
+	status          string
+	failures        int
+	nextClaimableAt time.Time
+	reason          string
+	completedAt     *time.Time
+	audit           TaskAuditRecord
+}
+
+// planTaskFailure applies the common failure rule. failures is the count
+// before this failure; at is the instant the backoff wait runs from (the
+// server receive time for a reported failure, the deadline itself for an
+// expiry). event distinguishes the audit trail (failed vs timed_out) and
+// fromStatus is the prior status recorded on that audit record (empty for a
+// reported failure, in_progress for an expiry). The first and second failures
+// schedule the matching backoff retry; the third ends the task.
+func planTaskFailure(attempt, failures int, at time.Time, reason, event, fromStatus string) taskFailurePlan {
+	newFailures := failures + 1
+	plan := taskFailurePlan{
+		failures: newFailures,
+		reason:   reason,
+		audit: TaskAuditRecord{
+			Event:   event,
+			Attempt: attempt,
+			At:      at,
+			Reason:  reason,
+		},
+	}
+	if fromStatus != "" {
+		plan.audit.FromStatus = fromStatus
+	}
+	if newFailures >= taskMaxAttempts {
+		plan.status = taskStatusFailed
+		completedAt := at
+		plan.completedAt = &completedAt
+		plan.audit.ToStatus = taskStatusFailed
+	} else {
+		plan.status = taskStatusWaiting
+		plan.nextClaimableAt = at.Add(backoffFor(newFailures))
+		plan.audit.ToStatus = taskStatusWaiting
+	}
+	return plan
+}
+
+// applyTaskFailure commits a planned failure onto the stored task: status,
+// failure count and backoff bookkeeping, plus release of the execution slot
+// (the current credential is invalidated and the device is freed). It does
+// not persist; callers must have durably committed the transition first. The
+// audit record is appended separately by the caller.
+func (ts *taskState) applyTaskFailure(plan taskFailurePlan) {
+	ts.task.Status = plan.status
+	ts.task.Failures = plan.failures
+	ts.task.NextClaimableAt = plan.nextClaimableAt
+	ts.task.FailureReason = plan.reason
+	ts.task.CompletedAt = plan.completedAt
+	ts.task.Credential = ""
+	ts.task.ClaimedAt = nil
+	ts.task.Deadline = nil
 }
 
 // backoffFor returns the wait after the given failure count. The third failure

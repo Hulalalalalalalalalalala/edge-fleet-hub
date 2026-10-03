@@ -303,6 +303,72 @@ func TestTaskTimeout(t *testing.T) {
 	}
 }
 
+// TestTaskReportedFailureAndTimeoutShareCounter drives one task through a
+// reported failure then a deadline expiry: the two sources must accumulate into
+// the same failure count, so the second failure waits 2s and a third failure
+// from either source ends the task. The audit trail keeps the two events
+// distinct.
+func TestTaskReportedFailureAndTimeoutShareCounter(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 1), http.StatusCreated)
+
+	// First failure is device-reported: wait 1s from the receive time.
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+	reportedAt := clock.UTC()
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "disk full", ""), http.StatusCreated)
+	task := getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "waiting" || task.FailureReason != "disk full" {
+		t.Fatalf("after reported failure: %+v", task)
+	}
+	if !task.NextClaimableAt.Equal(reportedAt.Add(1 * time.Second)) {
+		t.Fatalf("next claimable = %s, want report time +1s", task.NextClaimableAt)
+	}
+
+	// Second failure is a timeout. Advance to the re-claim, then past deadline.
+	*clock = clock.Add(2 * time.Second)
+	claim = claimTask(t, h, "dev-1", http.StatusOK)
+	if claim.Attempt != 2 {
+		t.Fatalf("attempt = %d, want 2", claim.Attempt)
+	}
+	deadline := claim.Deadline
+	*clock = clock.Add(3 * time.Second)
+	task = getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "waiting" || task.FailureReason != "deadline exceeded" {
+		t.Fatalf("after second (timeout) failure: %+v", task)
+	}
+	// The shared counter makes this the second failure -> 2s from the deadline.
+	if !task.NextClaimableAt.Equal(deadline.Add(2 * time.Second)) {
+		t.Fatalf("next claimable = %s, want deadline +2s", task.NextClaimableAt)
+	}
+
+	// A third reported failure ends the task and records a completion time.
+	*clock = clock.Add(3 * time.Second)
+	claim = claimTask(t, h, "dev-1", http.StatusOK)
+	if claim.Attempt != 3 {
+		t.Fatalf("attempt = %d, want 3", claim.Attempt)
+	}
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-2", claim.Credential, false, "gave up", ""), http.StatusCreated)
+	task = getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "failed" || task.CompletedAt == nil {
+		t.Fatalf("task should be failed after third failure: %+v", task)
+	}
+	claimTask(t, h, "dev-1", http.StatusNoContent)
+
+	// The two sources stay distinguishable in the audit trail.
+	events := listAudit(t, h, "dev-1", claim.Task.ID)
+	got := make([]string, len(events))
+	for i, rec := range events {
+		got[i] = rec.Event
+	}
+	if want := "created,claimed,failed,claimed,timed_out,claimed,failed"; strings.Join(got, ",") != want {
+		t.Fatalf("audit events = %s, want %s", strings.Join(got, ","), want)
+	}
+}
+
 func TestTaskTimeoutThirdAttemptEnds(t *testing.T) {
 	store, clock := newClockStore()
 	h := NewHandler(store)
