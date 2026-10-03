@@ -254,6 +254,126 @@ func TestPersistentConfigWriteFailureReturns503(t *testing.T) {
 
 // --- existing directories keep working --------------------------------------
 
+// --- the failure-reason rule survives restarts and receipt dedup --------------
+
+func TestPersistentFailureReasonTracksStillUnappliedVersions(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	publishConfig(t, h, "gw", publishBody("p1", 0, `{"v":1}`), http.StatusCreated)
+	publishConfig(t, h, "gw", publishBody("p2", 1, `{"v":2}`), http.StatusCreated)
+	publishConfig(t, h, "gw", publishBody("p3", 2, `{"v":3}`), http.StatusCreated)
+
+	// Failures arrive out of version order (v3 then v2): the current reason is
+	// the most recently received failure for a still-unapplied version.
+	postReceipt(t, h, "gw", receiptBody("rc-f3", 3, false, "存储空间不足"), http.StatusCreated)
+	postReceipt(t, h, "gw", receiptBody("rc-f2", 2, false, "配置校验失败"), http.StatusCreated)
+	if status := getConfigStatus(t, h, "gw"); status.TargetVersion != 3 ||
+		status.AppliedVersion != 0 || status.FailureReason != "配置校验失败" {
+		t.Fatalf("status after out-of-order failures = %+v", status)
+	}
+
+	// Duplicate v3 failure: 200 with its first receive time, no reordering.
+	f3Retry := postReceipt(t, h, "gw", receiptBody("rc-f3", 3, false, "存储空间不足"), http.StatusOK)
+
+	// v2 catches up: its failure is obsolete but the v3 failure resurfaces
+	// rather than being wiped by the success.
+	postReceipt(t, h, "gw", receiptBody("rc-ok-2", 2, true, ""), http.StatusCreated)
+	if status := getConfigStatus(t, h, "gw"); status.TargetVersion != 3 ||
+		status.AppliedVersion != 2 || status.FailureReason != "存储空间不足" {
+		t.Fatalf("status after lagging success = %+v", status)
+	}
+	// Repeating the obsolete v2 failure is still 200 and must not revive it.
+	postReceipt(t, h, "gw", receiptBody("rc-f2", 2, false, "配置校验失败"), http.StatusOK)
+	if status := getConfigStatus(t, h, "gw"); status.FailureReason != "存储空间不足" {
+		t.Fatalf("duplicate obsolete failure revived reason: %+v", status)
+	}
+	// A new receiptId failing the applied v2 is 409 and stores nothing.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs/receipts",
+		receiptBody("rc-f2-late", 2, false, "配置校验失败")); r.Code != http.StatusConflict {
+		t.Fatalf("new failure for applied v2 = %d, want 409: %s", r.Code, r.Body.String())
+	}
+	before := listConfigReceipts(t, h, "gw")
+	if len(before) != 3 ||
+		before[0].ReceiptID != "rc-f3" || before[0].Reason != "存储空间不足" ||
+		before[1].ReceiptID != "rc-f2" || before[1].Reason != "配置校验失败" ||
+		before[2].ReceiptID != "rc-ok-2" {
+		t.Fatalf("receipts before restart = %+v", before)
+	}
+	if !f3Retry.ReceivedAt.Equal(before[0].ReceivedAt) {
+		t.Fatalf("duplicate v3 time = %s, want first %s", f3Retry.ReceivedAt, before[0].ReceivedAt)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// After a restart the derived reason is recomputed from the recovered
+	// receipt history: v3 still unapplied, so its failure still shows.
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+	if status := getConfigStatus(t, h2, "gw"); status.TargetVersion != 3 ||
+		status.AppliedVersion != 2 || status.FailureReason != "存储空间不足" {
+		t.Fatalf("status after restart = %+v", status)
+	}
+	r := doRequest(t, h2, http.MethodGet, "/v1/devices/gw/configs/pending", "")
+	if r.Code != http.StatusOK || decodeBody[configViewResponse](t, r).Version != 3 {
+		t.Fatalf("pending after restart = %d %s, want 200 v3", r.Code, r.Body.String())
+	}
+	after := listConfigReceipts(t, h2, "gw")
+	if len(after) != 3 ||
+		after[0].ReceiptID != "rc-f3" || after[1].ReceiptID != "rc-f2" || after[2].ReceiptID != "rc-ok-2" {
+		t.Fatalf("receipts after restart = %+v", after)
+	}
+
+	// Receipt dedup survives the restart: despite the clock moving on during
+	// reopen, the retry is 200 with the ORIGINAL receive time and changes
+	// nothing.
+	rcF3Again := postReceipt(t, h2, "gw", receiptBody("rc-f3", 3, false, "存储空间不足"), http.StatusOK)
+	if !rcF3Again.ReceivedAt.Equal(after[0].ReceivedAt) {
+		t.Fatalf("post-restart retry time = %s, want first %s", rcF3Again.ReceivedAt, after[0].ReceivedAt)
+	}
+	postReceipt(t, h2, "gw", receiptBody("rc-f2", 2, false, "配置校验失败"), http.StatusOK)
+	if status := getConfigStatus(t, h2, "gw"); status.FailureReason != "存储空间不足" {
+		t.Fatalf("obsolete duplicate after restart revived reason: %+v", status)
+	}
+	if r := doRequest(t, h2, http.MethodPost, "/v1/devices/gw/configs/receipts",
+		receiptBody("rc-f2-other", 2, false, "x")); r.Code != http.StatusConflict {
+		t.Fatalf("new applied-v2 failure after restart = %d, want 409", r.Code)
+	}
+
+	// v3 applies: current reason clears and pending goes 204, but the failure
+	// receipts remain in history.
+	postReceipt(t, h2, "gw", receiptBody("rc-ok-3", 3, true, ""), http.StatusCreated)
+	if status := getConfigStatus(t, h2, "gw"); status.TargetVersion != 3 ||
+		status.AppliedVersion != 3 || status.FailureReason != "" {
+		t.Fatalf("status after final success = %+v", status)
+	}
+	if r := doRequest(t, h2, http.MethodGet, "/v1/devices/gw/configs/pending", ""); r.Code != http.StatusNoContent {
+		t.Fatalf("pending after final success = %d, want 204", r.Code)
+	}
+	if receipts := listConfigReceipts(t, h2, "gw"); len(receipts) != 4 {
+		t.Fatalf("clearing reason deleted history: %+v", receipts)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second restart keeps the clean derived status and the full history.
+	store3 := reopenPersistent(t, dir)
+	h3 := NewHandler(store3)
+	if status := getConfigStatus(t, h3, "gw"); status.TargetVersion != 3 ||
+		status.AppliedVersion != 3 || status.FailureReason != "" {
+		t.Fatalf("status after second restart = %+v", status)
+	}
+	if receipts := listConfigReceipts(t, h3, "gw"); len(receipts) != 4 ||
+		receipts[0].ReceiptID != "rc-f3" || receipts[1].ReceiptID != "rc-f2" ||
+		receipts[2].ReceiptID != "rc-ok-2" || receipts[3].ReceiptID != "rc-ok-3" {
+		t.Fatalf("receipts after second restart = %+v", receipts)
+	}
+}
+
 func TestPersistentExistingDeviceStartsWithNoConfig(t *testing.T) {
 	dir := t.TempDir()
 	store := openPersistent(t, dir)
