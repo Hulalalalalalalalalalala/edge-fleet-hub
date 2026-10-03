@@ -448,6 +448,155 @@ Missing fields, wrong types and bodies containing more than one JSON document
 return `400`; an unknown device returns `404`. Configuration operations never
 modify telemetry history, device activity times, rules or alerts.
 
+## Remote diagnostics
+
+A fleet operator opens a diagnostic task for a registered device; the simulated
+device claims it, runs it for the task's bounded number of seconds, and reports
+the outcome. Start the server (`go run ./cmd/edge-fleet`) and follow the calls
+below in order; the timestamps in the responses are illustrative.
+
+Register the device as usual, then create a task with a time limit between 1
+and 60 seconds:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"gateway-01","site":"warehouse-a"}'
+# 201 -> {"id":"gateway-01","site":"warehouse-a", ...}
+
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"diag-2026-10-04-1","durationSeconds":30}'
+# 201 ->
+# {"id":1,"requestId":"diag-2026-10-04-1","durationSeconds":30,
+#  "status":"pending","attempts":0,"createdAt":"...","nextClaimableAt":"..."}
+```
+
+Creating a task only opens it: it is `pending` and carries no diagnostic
+result. A result exists only after the device reports a successful outcome.
+
+The device pulls the next task by claiming it:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# 200 ->
+# {"task":{"id":1,"requestId":"diag-2026-10-04-1","durationSeconds":30,
+#    "status":"in_progress","attempts":1,"createdAt":"...",
+#    "claimedAt":"2026-10-04T10:00:00Z","deadline":"2026-10-04T10:00:30Z"},
+#  "attempt":1,
+#  "credential":"9e8525d072f9b9740f04e4994c88ec3b",
+#  "deadline":"2026-10-04T10:00:30Z"}
+```
+
+After the claim the task is `in_progress`, and the response gives the two
+values the report needs: the task number at `task.id` and the one-time
+execution `credential`. The `deadline` is 30 seconds after the claim. Only
+one task per device can be in progress, so a second claim while this one is
+running returns `204 No Content`. The credential is returned **only** by the
+claim call — `GET /v1/devices/{id}/tasks` and
+`GET /v1/devices/{id}/tasks/{taskId}` never include it.
+
+Report success to the task's `reports` endpoint before the deadline, using
+`task.id` and `credential` from the claim response. A successful report
+carries `success: true` and a `result` that is a JSON object; an empty object
+(`{}`) is a valid result:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rc-1",
+       "credential":"9e8525d072f9b9740f04e4994c88ec3b",
+       "success":true,
+       "result":{"ok":true,"checks":42}}'
+# 201 ->
+# {"receiptId":"diag-rc-1","success":true,
+#  "result":{"ok":true,"checks":42},
+#  "receivedAt":"2026-10-04T10:00:03Z"}
+```
+
+A first-time accepted report returns `201`. `receivedAt` is the server time
+at which that result was first received — it stays fixed on every later retry
+of the same `receiptId`. Querying the task now shows `succeeded`, the saved
+result and the completion time:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1
+# 200 ->
+# {"id":1,"requestId":"diag-2026-10-04-1","durationSeconds":30,
+#  "status":"succeeded","attempts":1,"createdAt":"...",
+#  "result":{"ok":true,"checks":42},
+#  "completedAt":"2026-10-04T10:00:03Z"}
+```
+
+The task's audit trail records the success (alongside the earlier create and
+claim transitions):
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1/audit
+# 200 ->
+# {"audit":[
+#   {"seq":1,"event":"created","toStatus":"pending", ...},
+#   {"seq":2,"event":"claimed","fromStatus":"pending",
+#    "toStatus":"in_progress","attempt":1,"at":"2026-10-04T10:00:00Z"},
+#   {"seq":3,"event":"succeeded","toStatus":"succeeded","attempt":1,
+#    "at":"2026-10-04T10:00:03Z"}]}
+```
+
+### Retrying after a lost response
+
+If the `201` response never arrives, resend the **same** body with the same
+`receiptId`. The credential from the original claim is still presented; an
+already-accepted report keeps replaying with it even though the task is
+finished:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rc-1",
+       "credential":"9e8525d072f9b9740f04e4994c88ec3b",
+       "success":true,
+       "result":{"checks":42.0,"ok":true}}'
+# 200 ->
+# {"receiptId":"diag-rc-1","success":true,
+#  "result":{"ok":true,"checks":42},
+#  "receivedAt":"2026-10-04T10:00:03Z"}
+```
+
+The duplicate returns `200` with the first receipt and its **original**
+`receivedAt`: the task is not completed a second time, no second `succeeded`
+audit record is added, and the saved result is unchanged. Result equality is
+semantic:
+
+- Object key order is ignored — `{"ok":true,"checks":42}` and
+  `{"checks":42,"ok":true}` are the same result.
+- Numbers compare by value — `42` and `42.0` are the same result.
+- Array element order is significant — `{"v":[1,2]}` and `{"v":[2,1]}` are
+  different results.
+
+Two reuses of a completed task are rejected with `409
+{"error":"diagnostic task conflict"}`, and the saved result stays exactly as
+first accepted:
+
+- the same `receiptId` with a changed result (or a changed `success`/
+  `reason`), e.g. `{"ok":false,"checks":42}`;
+- a brand-new `receiptId` submitted after the task already succeeded.
+
+### Failure conditions for a report
+
+- `400` — a required field is missing or blank (`receiptId`, `credential` or
+  `success`), or a successful report's `result` is missing or not a JSON
+  object (an array, string or number is rejected).
+- `409` — a **first** submission presents a credential that does not match
+  the current claim, or arrives after the claim's `deadline`. The deadline
+  instant itself is still within the attempt: a report presented exactly at
+  `deadline` is accepted; only a strictly later instant is past it.
+- `404` — the device or task id does not exist.
+
+Task creation has its own validation: a blank `requestId`, a missing
+`durationSeconds`, or a duration outside 1–60 returns `400`; reusing a
+`requestId` with the same duration is an idempotent retry (`200`, first task
+returned) and with a different duration is `409`.
+
 ## Persistence and restart
 
 Without `EDGE_FLEET_DATA_DIR`, everything (devices, events, sequences, batch
