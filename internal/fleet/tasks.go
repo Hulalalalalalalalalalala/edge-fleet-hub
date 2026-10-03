@@ -54,9 +54,10 @@ var (
 	// ErrTaskNotFound is reported for a task id the device has never seen.
 	ErrTaskNotFound = errors.New("diagnostic task not found")
 	// ErrTaskConflict covers a requestId reused with a different duration, a
-	// receiptId reused with different content, a report presented with a stale
-	// or foreign credential (or after its deadline), and a cancel attempted
-	// after a success or failure end.
+	// receiptId already accepted by another task of the same device, a
+	// receiptId reused on its own task with different content, a report presented
+	// with a stale or foreign credential (or after its deadline), and a cancel
+	// attempted after a success or failure end.
 	ErrTaskConflict = errors.New("diagnostic task conflict")
 )
 
@@ -147,6 +148,9 @@ func (state *deviceState) ensureTasks() {
 	}
 	if state.tasksByRequest == nil {
 		state.tasksByRequest = make(map[string]*taskState)
+	}
+	if state.taskReceipts == nil {
+		state.taskReceipts = make(map[string]int64)
 	}
 }
 
@@ -290,13 +294,18 @@ func (s *Store) ClaimTask(id string) (ClaimView, bool, error) {
 
 // ReportTask records one device-reported outcome.
 //
-// A repeated receiptId with identical success/result/reason returns the first
-// report (repeat=true); a reused receiptId with different content conflicts. A
-// new receiptId is accepted only when the task is in progress, the credential
-// matches the current attempt, and the deadline has not passed; otherwise it
-// conflicts. Success ends the task with a JSON object result; a failure
-// invalidates the credential, releases the device, and either schedules a
-// backoff retry or ends the task on the third failure.
+// A receiptId belongs to exactly one task of the device: the task on which it
+// was first accepted. Presenting an already-accepted receiptId on another task
+// always conflicts, even with identical content, a valid current credential and
+// time left on the deadline; it completes nothing on that task and the number
+// stays bound to the first task. On the owning task, a repeated receiptId with
+// identical success/result/reason returns the first report (repeat=true); a
+// reused receiptId with different content conflicts. A new, unbound receiptId
+// is accepted only when the task is in progress, the credential matches the
+// current attempt, and the deadline has not passed; otherwise it conflicts and
+// does not occupy the number. Success ends the task with a JSON object result;
+// a failure invalidates the credential, releases the device, and either
+// schedules a backoff retry or ends the task on the third failure.
 func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string, success bool, reason string, result json.RawMessage) (TaskReport, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -312,6 +321,12 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 	now := s.now().UTC()
 	if err := s.evaluateTaskTimeouts(state, now); err != nil {
 		return TaskReport{}, false, err
+	}
+	// A number accepted by another task of this device can never become this
+	// task's receipt: neither the content, the credential nor the deadline
+	// matter, and the rejected submission changes nothing on this task.
+	if owner, bound := state.taskReceipts[receiptID]; bound && owner != taskID {
+		return TaskReport{}, false, ErrTaskConflict
 	}
 	if previous, seen := ts.reports[receiptID]; seen {
 		if previous.success != success || previous.reason != reason || !sameReportResult(previous.result, result) {
@@ -392,6 +407,7 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 	}
 	releaseTaskAttempt(&ts.task)
 	ts.reports[receiptID] = stored
+	state.taskReceipts[receiptID] = taskID
 	ts.audit = append(ts.audit, auditRec)
 	return taskReportView(stored), false, nil
 }

@@ -159,6 +159,12 @@ type deviceState struct {
 	config         *configState
 	tasks          []*taskState          // per-device, ordered by task id (id = index + 1)
 	tasksByRequest map[string]*taskState // requestId -> first task
+	// taskReceipts binds each accepted diagnostic receiptId to the one task
+	// that first accepted it. A receipt number may be retried on its owning
+	// task but can never be accepted as a new receipt by another task of the
+	// same device. Configuration receipts live in a separate map and do not
+	// participate in this binding.
+	taskReceipts map[string]int64 // receiptId -> owning task id
 }
 
 // maxSequence is the highest receive sequence ever assigned to the device. It

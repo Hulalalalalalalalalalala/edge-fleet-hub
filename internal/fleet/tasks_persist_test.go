@@ -191,6 +191,50 @@ func TestPersistentTaskFailureReceiptRetryRestores(t *testing.T) {
 	}
 }
 
+// A receipt number's task ownership survives a restart: a number accepted by
+// task 1 still conflicts on another task after reopening the directory, while
+// its first receipt keeps replaying on task 1 with the original receive time.
+func TestPersistentTaskReceiptOwnershipRestores(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createTask(t, h, "gw", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "gw", http.StatusOK)
+	first := reportTask(t, h, "gw", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+	createTask(t, h, "gw", taskBody("req-2", 30), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	// Task 2 is claimed in the new process with its own fresh credential.
+	claim2 := claimTask(t, h2, "gw", http.StatusOK)
+	if claim2.Task.ID != 2 {
+		t.Fatalf("claim after restart took task %d, want 2", claim2.Task.ID)
+	}
+	// The number stays bound to task 1: task 2 cannot take it.
+	reportTask(t, h2, "gw", 2,
+		reportBody("rcpt-1", claim2.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+	if task := getTask(t, h2, "gw", 2, http.StatusOK); task.Status != "in_progress" {
+		t.Fatalf("conflict after restart disturbed task 2: %+v", task)
+	}
+
+	// An unused number completes task 2.
+	reportTask(t, h2, "gw", 2,
+		reportBody("rcpt-2", claim2.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+
+	// The original receipt replays on task 1 with the first receive time.
+	retry := reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", "any-credential-now", true, "", `{"ok":true}`), http.StatusOK)
+	if !retry.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("retry after restart receivedAt = %s, want %s", retry.ReceivedAt, first.ReceivedAt)
+	}
+}
+
 func TestPersistentTaskCancelRestores(t *testing.T) {
 	dir := t.TempDir()
 	store := openPersistent(t, dir)

@@ -581,15 +581,32 @@ first accepted:
   `reason`), e.g. `{"ok":false,"checks":42}`;
 - a brand-new `receiptId` submitted after the task already succeeded.
 
+A diagnostic `receiptId` belongs to exactly one task **of the device**: the
+task on which it was first accepted. Submitting an already-accepted number to
+another task of the same device is `409` even when the content is identical,
+the second task is still within its deadline and the request carries that
+task's own valid credential. The second task keeps its previous status,
+attempt count, deadline and credential, and neither its query result nor its
+audit trail gains a completion or failure record; retrying with an unused
+`receiptId` still succeeds while the execution is valid. The same number is
+accepted independently on another device, and configuration application
+receipts use a separate number space that does not take part in this check.
+The binding is made only on acceptance, so a submission rejected for its
+credential or deadline does not occupy the number. With local persistence
+enabled, the ownership survives a restart of the data directory and the
+original receipt still replays with its first `receivedAt`.
+
 ### Failure conditions for a report
 
 - `400` — a required field is missing or blank (`receiptId`, `credential` or
   `success`), or a successful report's `result` is missing or not a JSON
   object (an array, string or number is rejected).
 - `409` — a **first** submission presents a credential that does not match
-  the current claim, or arrives after the claim's `deadline`. The deadline
-  instant itself is still within the attempt: a report presented exactly at
-  `deadline` is accepted; only a strictly later instant is past it.
+  the current claim, or arrives after the claim's `deadline`; or the
+  `receiptId` was already accepted by another task of the same device. The
+  deadline instant itself is still within the attempt: a report presented
+  exactly at `deadline` is accepted; only a strictly later instant is past
+  it.
 - `404` — the device or task id does not exist.
 
 Task creation has its own validation: a blank `requestId`, a missing
