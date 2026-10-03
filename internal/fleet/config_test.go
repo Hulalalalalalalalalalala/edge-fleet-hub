@@ -327,6 +327,90 @@ func TestConfigRequestDedupRetryStaysFirstResultAfterNewerVersions(t *testing.T)
 	}
 }
 
+// --- numbers beyond the float64 range stay legal and exact -------------------
+
+func TestConfigPublishKeepsOutOfRangeNumbersExact(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	// A legal JSON number larger than MaxFloat64 (or smaller than the smallest
+	// positive subnormal) must publish at any nesting depth and come back
+	// byte-for-byte, never as Infinity, zero, a string or a rounded value.
+	large := `{"range":1e309,"nested":{"steps":[-1e309,1e-400]}}`
+	first := publishConfig(t, h, "gw", publishBody("req-1", 0, large), http.StatusCreated)
+	if first.Version != 1 {
+		t.Fatalf("version = %d, want 1", first.Version)
+	}
+	if string(first.Config) != large {
+		t.Fatalf("publish result changed number: %s", first.Config)
+	}
+	firstTime := clock.UTC()
+
+	// History keeps the exact literals.
+	if configs := listConfigs(t, h, "gw"); len(configs) != 1 || string(configs[0].Config) != large {
+		t.Fatalf("history changed number: %+v", configs)
+	}
+	// The simulated device pull serves the exact literals as the pending target.
+	r := getPending(t, h, "gw")
+	if r.Code != http.StatusOK {
+		t.Fatalf("pending = %d, want 200", r.Code)
+	}
+	if pending := decodeBody[configViewResponse](t, r); string(pending.Config) != large {
+		t.Fatalf("pending changed number: %s", pending.Config)
+	}
+
+	// Same value in a different notation (10e308 == 1e309 exactly) is an
+	// idempotent retry: 200 with the first version, time and stored content.
+	*clock = clock.Add(time.Hour)
+	retry := publishConfig(t, h, "gw", publishBody("req-1", 0,
+		`{ "nested" : { "steps" : [ -10e308 , 10e-401 ] } , "range" : 10e308 }`), http.StatusOK)
+	if retry.Version != 1 || !retry.PublishedAt.Equal(firstTime) {
+		t.Fatalf("equal-value retry = %+v, want v1 at first time %s", retry, firstTime)
+	}
+	if string(retry.Config) != large {
+		t.Fatalf("retry rewrote stored content: %s", retry.Config)
+	}
+	if status := getConfigStatus(t, h, "gw"); status.TargetVersion != 1 {
+		t.Fatalf("retry created a version: %+v", status)
+	}
+
+	// A genuinely different out-of-range value conflicts and adds nothing.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("req-1", 0, `{"range":2e309,"nested":{"steps":[-1e309,1e-400]}}`)); r.Code != http.StatusConflict {
+		t.Fatalf("different value = %d, want 409", r.Code)
+	}
+	if configs := listConfigs(t, h, "gw"); len(configs) != 1 {
+		t.Fatalf("409 added a version: %+v", configs)
+	}
+}
+
+func TestConfigPublishRejectsNonFiniteNumberSpellings(t *testing.T) {
+	h := NewHandler(NewStore())
+	mustRegister(t, h, "gw")
+	for _, config := range []string{
+		`{"x":NaN}`,
+		`{"x":Infinity}`,
+		`{"x":-Infinity}`,
+		`{"nested":{"steps":[1e309,NaN]}}`,
+	} {
+		if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+			publishBody("r", 0, config)); r.Code != http.StatusBadRequest {
+			t.Fatalf("config %s => %d, want 400: %s", config, r.Code, r.Body.String())
+		}
+	}
+	// The rejected bodies changed no state, and the requestId they used (which
+	// never committed) is free for a corrected publish.
+	status := getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 0 || status.AppliedVersion != 0 {
+		t.Fatalf("rejected publish changed state: %+v", status)
+	}
+	if configs := listConfigs(t, h, "gw"); len(configs) != 0 {
+		t.Fatalf("rejected publish wrote history: %+v", configs)
+	}
+	publishConfig(t, h, "gw", publishBody("r", 0, `{"range":1e309}`), http.StatusCreated)
+}
+
 func TestConfigHistoryImmutableRollForwardByRePublishing(t *testing.T) {
 	h := NewHandler(NewStore())
 	mustRegister(t, h, "gw")

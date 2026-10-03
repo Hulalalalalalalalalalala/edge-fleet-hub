@@ -141,6 +141,59 @@ func TestPersistentRestartKeepsConfigNumbersExact(t *testing.T) {
 
 
 
+// --- recovered configs beyond float64 range stay valid and exact --------------
+
+func TestPersistentRestartKeepsOutOfRangeConfigNumbers(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	large := `{"range":1e309,"nested":{"steps":[-1e309,1e-400]}}`
+	publishConfig(t, h, "gw", publishBody("r1", 0, large), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recovery must not reject a once-committed config just because its numbers
+	// overflow float64, and the content comes back byte-identical.
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+	configs := listConfigs(t, h2, "gw")
+	if len(configs) != 1 || string(configs[0].Config) != large {
+		t.Fatalf("recovered out-of-range content = %+v, want %s", configs, large)
+	}
+	status := getConfigStatus(t, h2, "gw")
+	if status.TargetVersion != 1 || status.AppliedVersion != 0 {
+		t.Fatalf("status after restart = %+v", status)
+	}
+	r := doRequest(t, h2, http.MethodGet, "/v1/devices/gw/configs/pending", "")
+	if r.Code != http.StatusOK {
+		t.Fatalf("pending after restart = %d, want 200", r.Code)
+	}
+	if pending := decodeBody[configViewResponse](t, r); string(pending.Config) != large {
+		t.Fatalf("pending out-of-range content = %s", pending.Config)
+	}
+
+	// The recovered dedup record still compares out-of-range numbers exactly:
+	// equal value retries as the first result, a changed value conflicts.
+	retry := publishConfig(t, h2, "gw", publishBody("r1", 0,
+		`{"range":10e308,"nested":{"steps":[-10e308,10e-401]}}`), http.StatusOK)
+	if retry.Version != 1 || !retry.PublishedAt.Equal(configs[0].PublishedAt) {
+		t.Fatalf("retry after restart = %+v, want first result", retry)
+	}
+	if string(retry.Config) != large {
+		t.Fatalf("retry rewrote stored content: %s", retry.Config)
+	}
+	if r := doRequest(t, h2, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("r1", 0, `{"range":2e309,"nested":{"steps":[-1e309,1e-400]}}`)); r.Code != http.StatusConflict {
+		t.Fatalf("different out-of-range value after restart = %d, want 409", r.Code)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPersistentConfigWriteFailureReturns503(t *testing.T) {
 	dir := t.TempDir()
 	store := openPersistent(t, dir)

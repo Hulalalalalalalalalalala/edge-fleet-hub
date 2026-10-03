@@ -331,10 +331,13 @@ func cloneJSON(raw json.RawMessage) json.RawMessage {
 }
 
 // isNonEmptyJSONObject reports whether raw is exactly one JSON object with at
-// least one member. It is shared by HTTP validation and WAL recovery.
+// least one member. It is shared by HTTP validation and WAL recovery. Numbers
+// stay json.Number literals (via decodeJSONValue) so legal values beyond the
+// float64 range, such as 1e309 or 1e-400, validate and survive recovery
+// instead of being rejected as unrepresentable floats.
 func isNonEmptyJSONObject(raw json.RawMessage) bool {
-	var value any
-	if json.Unmarshal(raw, &value) != nil {
+	value, ok := decodeJSONValue(raw)
+	if !ok {
 		return false
 	}
 	object, ok := value.(map[string]any)
