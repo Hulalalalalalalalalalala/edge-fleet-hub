@@ -246,6 +246,87 @@ func TestConfigRequestDedupRetryReturns200FirstResult(t *testing.T) {
 	}
 }
 
+func TestConfigRequestDedupComparesNumbersExactly(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	publishConfig(t, h, "gw", publishBody("req-1", 0,
+		`{"big":9007199254740992,"frac":0.1,"zero":0,"nested":{"a":[1,2]}}`), http.StatusCreated)
+	firstTime := clock.UTC()
+	*clock = clock.Add(time.Hour)
+
+	// Numbers that only share a float64 (precision loss or underflow to zero)
+	// are different content, at any nesting depth.
+	changed := []string{
+		`{"big":9007199254740993,"frac":0.1,"zero":0,"nested":{"a":[1,2]}}`,
+		`{"big":9007199254740992,"frac":0.10000000000000001,"zero":0,"nested":{"a":[1,2]}}`,
+		`{"big":9007199254740992,"frac":0.1,"zero":1e-400,"nested":{"a":[1,2]}}`,
+		`{"big":9007199254740992,"frac":0.1,"zero":0,"nested":{"a":[1,9007199254740993]}}`,
+		`{"big":9007199254740992,"frac":0.1,"zero":0,"nested":{"a":[1,"2"]}}`,
+	}
+	for _, config := range changed {
+		if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+			publishBody("req-1", 0, config)); r.Code != http.StatusConflict {
+			t.Fatalf("changed content %s => %d, want 409", config, r.Code)
+		}
+	}
+	// The rejected retries created nothing and changed nothing.
+	status := getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 1 || status.AppliedVersion != 0 {
+		t.Fatalf("rejected retries changed state: %+v", status)
+	}
+	configs := listConfigs(t, h, "gw")
+	if len(configs) != 1 || string(configs[0].Config) != `{"big":9007199254740992,"frac":0.1,"zero":0,"nested":{"a":[1,2]}}` {
+		t.Fatalf("rejected retries rewrote history: %+v", configs)
+	}
+
+	// Same value in a different notation is still the same content: the retry
+	// returns the first result with the first publish time and content.
+	retry := publishConfig(t, h, "gw", publishBody("req-1", 0,
+		`{ "zero" : -0.000 , "frac" : 0.10000 , "big" : 9007199254740992.0 , "nested" : { "a" : [ 1e0 , 2.000 ] } }`), http.StatusOK)
+	if retry.Version != 1 || !retry.PublishedAt.Equal(firstTime) {
+		t.Fatalf("retry = %+v, want version 1 at first time %s", retry, firstTime)
+	}
+	if string(retry.Config) != `{"big":9007199254740992,"frac":0.1,"zero":0,"nested":{"a":[1,2]}}` {
+		t.Fatalf("retry rewrote stored content: %s", retry.Config)
+	}
+	if status := getConfigStatus(t, h, "gw"); status.TargetVersion != 1 {
+		t.Fatalf("target after retry = %d, want 1", status.TargetVersion)
+	}
+}
+
+func TestConfigRequestDedupRetryStaysFirstResultAfterNewerVersions(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	first := publishConfig(t, h, "gw", publishBody("req-1", 0, `{"v":9007199254740992}`), http.StatusCreated)
+	*clock = clock.Add(time.Hour)
+	publishConfig(t, h, "gw", publishBody("req-2", 1, `{"v":2}`), http.StatusCreated)
+	postReceipt(t, h, "gw", receiptBody("rc-2", 2, true, ""), http.StatusCreated)
+	*clock = clock.Add(time.Hour)
+
+	// A legal retry of the old requestId still returns its own first result;
+	// it neither creates a version nor moves the device back to the old target.
+	retry := publishConfig(t, h, "gw", publishBody("req-1", 0, `{"v":9007199254740992.0}`), http.StatusOK)
+	if retry.Version != 1 || !retry.PublishedAt.Equal(first.PublishedAt) {
+		t.Fatalf("old retry = %+v, want first result %+v", retry, first)
+	}
+	status := getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 2 || status.AppliedVersion != 2 {
+		t.Fatalf("old retry moved device state: %+v", status)
+	}
+	// And its content change is still a conflict, not a silent new publish.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("req-1", 0, `{"v":9007199254740993}`)); r.Code != http.StatusConflict {
+		t.Fatalf("changed old request = %d, want 409", r.Code)
+	}
+	if configs := listConfigs(t, h, "gw"); len(configs) != 2 {
+		t.Fatalf("old retry created a version: %+v", configs)
+	}
+}
+
 func TestConfigHistoryImmutableRollForwardByRePublishing(t *testing.T) {
 	h := NewHandler(NewStore())
 	mustRegister(t, h, "gw")

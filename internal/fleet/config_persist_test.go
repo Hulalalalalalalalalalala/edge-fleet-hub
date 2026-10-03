@@ -92,7 +92,54 @@ func TestPersistentRestartRestoresConfigState(t *testing.T) {
 	}
 }
 
-// --- runtime write failures return 503 and roll everything back --------------
+// --- recovered configs and dedup records keep exact numbers ------------------
+
+func TestPersistentRestartKeepsConfigNumbersExact(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	publishConfig(t, h, "gw", publishBody("r1", 0,
+		`{"big":9007199254740993,"tiny":1e-400,"frac":0.10000000000000001}`), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	// Recovered content is byte-identical: no number was rounded or rewritten.
+	configs := listConfigs(t, h2, "gw")
+	if len(configs) != 1 ||
+		string(configs[0].Config) != `{"big":9007199254740993,"tiny":1e-400,"frac":0.10000000000000001}` {
+		t.Fatalf("recovered content = %+v, numbers must not be rounded", configs)
+	}
+
+	// The recovered dedup record still judges by exact decimal value: a
+	// float64-equivalent but different number conflicts, an exact retry is 200.
+	if r := doRequest(t, h2, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("r1", 0, `{"big":9007199254740992,"tiny":1e-400,"frac":0.10000000000000001}`)); r.Code != http.StatusConflict {
+		t.Fatalf("rounded big after restart = %d, want 409", r.Code)
+	}
+	if r := doRequest(t, h2, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("r1", 0, `{"big":9007199254740993,"tiny":0,"frac":0.10000000000000001}`)); r.Code != http.StatusConflict {
+		t.Fatalf("underflowed tiny after restart = %d, want 409", r.Code)
+	}
+	retry := publishConfig(t, h2, "gw", publishBody("r1", 0,
+		`{"big":9007199254740993.0,"tiny":10e-401,"frac":0.100000000000000010}`), http.StatusOK)
+	if retry.Version != 1 || !retry.PublishedAt.Equal(configs[0].PublishedAt) {
+		t.Fatalf("retry after restart = %+v, want first result", retry)
+	}
+	if string(retry.Config) != `{"big":9007199254740993,"tiny":1e-400,"frac":0.10000000000000001}` {
+		t.Fatalf("retry rewrote stored content: %s", retry.Config)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+
 
 func TestPersistentConfigWriteFailureReturns503(t *testing.T) {
 	dir := t.TempDir()
