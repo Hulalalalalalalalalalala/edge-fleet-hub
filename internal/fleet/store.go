@@ -596,7 +596,8 @@ func (s *Store) UpdateRule(id, ruleID string, update ruleUpdate, version int64) 
 		return Rule{}, nil, ErrInvalidRule
 	}
 
-	// End the active alert of the old version before publishing the new one.
+	// Plan the ending of the old version's active alert; nothing is mutated
+	// until the update is durable.
 	var ended []*Alert
 	if rs.activeAlertID != 0 {
 		alert := cloneAlert(*state.alerts[rs.activeAlertID-1])
@@ -605,7 +606,6 @@ func (s *Store) UpdateRule(id, ruleID string, update ruleUpdate, version int64) 
 		now := s.now().UTC()
 		alert.EndedAt = &now
 		ended = append(ended, &alert)
-		rs.activeAlertID = 0
 	}
 
 	updated.Version++
@@ -617,9 +617,7 @@ func (s *Store) UpdateRule(id, ruleID string, update ruleUpdate, version int64) 
 		}
 	}
 	rs.rule = updated
-	for _, alert := range ended {
-		state.alerts[alert.ID-1] = alert
-	}
+	applyAlertChanges(state, nil, ended)
 	return cloneRule(updated), cloneAlerts(ended), nil
 }
 

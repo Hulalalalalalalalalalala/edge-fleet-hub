@@ -203,6 +203,160 @@ func TestPersistentAckWriteFailureReturns503(t *testing.T) {
 	}
 }
 
+// A failed rule update must not disturb the active alert: later samples keep
+// judging against the old rule, so no second alert opens and the original
+// alert still recovers at the old recovery threshold.
+func TestPersistentFailedRuleUpdateKeepsActiveAlert(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	created := createRule(t, h, "gw", "r1", "temperature", 30, 25)
+
+	// Temperature 32 opens alert 1 under rule version 1.
+	doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":32}`)
+
+	real := store.wal.(*walFile)
+	store.wal = &failingWAL{inner: real}
+
+	r := doRequest(t, h, http.MethodPut, "/v1/devices/gw/rules/r1",
+		`{"trigger":35,"recover":28,"version":1}`)
+	if r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failing update = %d, want 503: %s", r.Code, r.Body.String())
+	}
+
+	// The rule is exactly as before: thresholds, enabled flag, version and
+	// update time are all untouched by the failed write.
+	rule := decodeBody[ruleResponse](t, doRequest(t, h, http.MethodGet, "/v1/devices/gw/rules/r1", ""))
+	if rule.Metric != "temperature" || rule.Trigger != 30 || rule.Recover != 25 ||
+		!rule.Enabled || rule.Version != 1 || !rule.UpdatedAt.Equal(created.UpdatedAt) {
+		t.Fatalf("rule changed after failed update: %+v", rule)
+	}
+
+	// The alert is still the same active record, with no ending fields.
+	alerts := listAlerts(t, h, "gw", "")
+	if len(alerts) != 1 {
+		t.Fatalf("alerts after failed update = %+v", alerts)
+	}
+	alert := alerts[0]
+	if alert.ID != 1 || alert.Status != alertStatusActive || alert.RuleVersion != 1 ||
+		alert.TriggerSequence != 1 || alert.TriggerValue != 32 ||
+		alert.EndedAt != nil || alert.EndReason != "" {
+		t.Fatalf("alert disturbed by failed update: %+v", alert)
+	}
+
+	// Storage recovers. A sample between the old thresholds keeps the original
+	// alert; it must not open a second one.
+	store.wal = real
+	doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":33}`)
+	alerts = listAlerts(t, h, "gw", "")
+	if len(alerts) != 1 || alerts[0].ID != 1 || alerts[0].Status != alertStatusActive {
+		t.Fatalf("sustained sample opened a second alert: %+v", alerts)
+	}
+
+	// 26 is above the old recovery threshold: still no recovery.
+	doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":26}`)
+	alerts = listAlerts(t, h, "gw", "")
+	if len(alerts) != 1 || alerts[0].Status != alertStatusActive {
+		t.Fatalf("sample 26 ended the alert: %+v", alerts)
+	}
+
+	// 25 reaches the old recovery threshold: the original alert ends as
+	// recovered, recording this sample's sequence, value and observed time.
+	doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":25}`)
+	alerts = listAlerts(t, h, "gw", "")
+	if len(alerts) != 1 {
+		t.Fatalf("alerts after recovery = %+v", alerts)
+	}
+	alert = alerts[0]
+	if alert.ID != 1 || alert.Status != alertStatusEnded ||
+		alert.EndReason != endReasonRecovered ||
+		alert.RecoverSequence == nil || *alert.RecoverSequence != 4 ||
+		alert.RecoverValue == nil || *alert.RecoverValue != 25 ||
+		alert.RecoverObservedAt == nil {
+		t.Fatalf("recovered alert = %+v", alert)
+	}
+	// The trigger evidence and rule version were not overwritten.
+	if alert.RuleVersion != 1 || alert.TriggerSequence != 1 || alert.TriggerValue != 32 {
+		t.Fatalf("trigger evidence overwritten: %+v", alert)
+	}
+
+	// The failed update never consumed a version: the same request with the
+	// pre-failure version now commits and bumps the version exactly once.
+	r = doRequest(t, h, http.MethodPut, "/v1/devices/gw/rules/r1",
+		`{"trigger":35,"recover":28,"version":1}`)
+	if r.Code != http.StatusOK {
+		t.Fatalf("retried update = %d: %s", r.Code, r.Body.String())
+	}
+	rule = decodeBody[ruleResponse](t, r)
+	if rule.Version != 2 || rule.Trigger != 35 || rule.Recover != 28 {
+		t.Fatalf("retried update = %+v", rule)
+	}
+}
+
+// A failed update retried while its alert is still active ends that alert
+// with rule_changed, and rejected updates (409/400) never disturb it either.
+func TestPersistentFailedRuleUpdateRetryEndsActiveAlert(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createRule(t, h, "gw", "r1", "temperature", 30, 25)
+	doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":32}`)
+
+	real := store.wal.(*walFile)
+	store.wal = &failingWAL{inner: real}
+	r := doRequest(t, h, http.MethodPut, "/v1/devices/gw/rules/r1",
+		`{"trigger":35,"recover":28,"version":1}`)
+	if r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failing update = %d, want 503", r.Code)
+	}
+	store.wal = real
+
+	// The retry with the pre-failure version succeeds and ends the active
+	// alert as rule_changed.
+	r = doRequest(t, h, http.MethodPut, "/v1/devices/gw/rules/r1",
+		`{"trigger":35,"recover":28,"version":1}`)
+	if r.Code != http.StatusOK {
+		t.Fatalf("retried update = %d: %s", r.Code, r.Body.String())
+	}
+	alerts := listAlerts(t, h, "gw", "")
+	if len(alerts) != 1 || alerts[0].Status != alertStatusEnded ||
+		alerts[0].EndReason != endReasonRuleChanged || alerts[0].EndedAt == nil {
+		t.Fatalf("alert after retried update = %+v", alerts)
+	}
+
+	// New samples judge against the new thresholds.
+	doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":36}`)
+	alerts = listAlerts(t, h, "gw", "")
+	if len(alerts) != 2 || alerts[1].Status != alertStatusActive ||
+		alerts[1].RuleVersion != 2 {
+		t.Fatalf("alert under new rule = %+v", alerts)
+	}
+
+	// A stale version is rejected with 409 and an invalid threshold pair with
+	// 400; neither touches the active alert or the rule.
+	r = doRequest(t, h, http.MethodPut, "/v1/devices/gw/rules/r1",
+		`{"trigger":40,"recover":30,"version":1}`)
+	if r.Code != http.StatusConflict {
+		t.Fatalf("stale update = %d, want 409", r.Code)
+	}
+	r = doRequest(t, h, http.MethodPut, "/v1/devices/gw/rules/r1",
+		`{"trigger":20,"recover":30,"version":2}`)
+	if r.Code != http.StatusBadRequest {
+		t.Fatalf("invalid update = %d, want 400", r.Code)
+	}
+	rule := decodeBody[ruleResponse](t, doRequest(t, h, http.MethodGet, "/v1/devices/gw/rules/r1", ""))
+	if rule.Version != 2 || rule.Trigger != 35 || rule.Recover != 28 {
+		t.Fatalf("rule changed by rejected updates: %+v", rule)
+	}
+	alerts = listAlerts(t, h, "gw", "")
+	if len(alerts) != 2 || alerts[1].Status != alertStatusActive ||
+		alerts[1].EndedAt != nil || alerts[1].EndReason != "" {
+		t.Fatalf("alert disturbed by rejected updates: %+v", alerts)
+	}
+}
+
 func TestPersistentReplayAlertWriteFailureAtomic(t *testing.T) {
 	dir := t.TempDir()
 	store := openPersistent(t, dir)
