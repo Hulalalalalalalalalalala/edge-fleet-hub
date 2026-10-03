@@ -203,6 +203,139 @@ setting, trimming, cumulative sequences and replay deduplication records
 survive restarts, and a setting or write that cannot be persisted returns
 `503` with nothing applied and no sequence consumed.
 
+## Threshold rules and alerts
+
+A rule watches one telemetry metric on one device. `POST
+/v1/devices/{id}/rules` creates it enabled at `version` 1; a sample at or
+above `trigger` opens an alert, and a later sample at or below `recover` ends
+it (`recover` must be strictly below `trigger`). `GET
+/v1/devices/{id}/rules` and `GET /v1/devices/{id}/rules/{ruleId}` read rules
+back; `GET /v1/devices/{id}/alerts` lists alerts, filterable by `ruleId`,
+`status` (`active`/`ended`) and `acknowledged`.
+
+### Updating a rule
+
+`PUT /v1/devices/{id}/rules/{ruleId}` modifies a rule in place. The body
+carries the `version` the caller last read (optimistic concurrency) plus any
+of `metric`, `trigger`, `recover` and `enabled`; fields left out keep their
+current values. A successful update returns `200` with the rule at
+`version+1` — **every** successful update increments the version, even one
+that only toggles `enabled` or submits values identical to the current ones.
+
+A successful update also **ends the rule's currently active alert** (if any)
+with reason `rule_changed`. The walkthrough below runs the full cycle locally
+against one device and one temperature rule (timestamps are illustrative):
+
+```bash
+# register the device (skip if it already exists)
+curl -sS -X POST http://127.0.0.1:8080/v1/devices \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"gateway-01","site":"warehouse-a"}'
+
+# create the rule: trigger at 30, recover at 25
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"temp-high","metric":"temperature","trigger":30,"recover":25}'
+# 201 -> {"id":"temp-high","metric":"temperature","trigger":30,"recover":25,
+#         "enabled":true,"version":1,"createdAt":"...","updatedAt":"..."}
+
+# a sample at or above the trigger opens an alert
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/telemetry \
+  -H 'Content-Type: application/json' \
+  -d '{"temperature":31.5}'
+
+curl -sS 'http://127.0.0.1:8080/v1/devices/gateway-01/alerts?status=active'
+# 200 -> {"alerts":[{"id":1,"ruleId":"temp-high","ruleVersion":1,
+#         "metric":"temperature","trigger":30,"recover":25,"status":"active",
+#         "triggerSequence":1,"triggerValue":31.5,
+#         "triggerObservedAt":"2024-01-02T10:00:00Z"}]}
+
+# read the rule to learn its current version
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/rules/temp-high
+# 200 -> {"id":"temp-high",...,"trigger":30,"recover":25,"version":1,...}
+
+# raise the thresholds, passing the version just read
+curl -sS -X PUT http://127.0.0.1:8080/v1/devices/gateway-01/rules/temp-high \
+  -H 'Content-Type: application/json' \
+  -d '{"trigger":32,"recover":26,"version":1}'
+# 200 -> {"id":"temp-high","metric":"temperature","trigger":32,"recover":26,
+#         "enabled":true,"version":2,"createdAt":"...","updatedAt":"..."}
+```
+
+Querying the rule and the alerts afterwards shows both halves of the effect:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/rules/temp-high
+# 200 -> {"id":"temp-high",...,"trigger":32,"recover":26,"version":2,...}
+
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/alerts
+# 200 -> {"alerts":[{"id":1,"ruleId":"temp-high","ruleVersion":1,
+#         "metric":"temperature","trigger":30,"recover":25,"status":"ended",
+#         "triggerSequence":1,"triggerValue":31.5,
+#         "triggerObservedAt":"2024-01-02T10:00:00Z",
+#         "endedAt":"2024-01-02T10:05:00Z","endReason":"rule_changed"}]}
+```
+
+The ended record keeps the old `ruleVersion` (1), the thresholds in force
+when it fired (30/25) and its trigger evidence, and gains `endedAt` — the
+server time of the update. It has **no** `recoverSequence`, `recoverValue` or
+`recoverObservedAt`: those belong only to a natural recovery, where a later
+sample at or below `recover` ends the alert with `endReason: "recovered"`.
+Ending via `rule_changed` is an administrative close, not a recovered
+reading. If the rule had no active alert, the update leaves the alert list
+untouched — a modification never creates an alert on its own.
+
+The update does not re-judge historical samples either; only telemetry
+received afterwards is evaluated against the new version:
+
+```bash
+# 31.0 was above the old trigger (30) but is below the new one (32): no alert
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/telemetry \
+  -H 'Content-Type: application/json' -d '{"temperature":31.0}'
+curl -sS 'http://127.0.0.1:8080/v1/devices/gateway-01/alerts?status=active'
+# 200 -> {"alerts":[]}
+
+# reaching the new trigger opens a NEW alert recorded against version 2
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/telemetry \
+  -H 'Content-Type: application/json' -d '{"temperature":32.5}'
+curl -sS 'http://127.0.0.1:8080/v1/devices/gateway-01/alerts?status=active'
+# 200 -> {"alerts":[{"id":2,"ruleId":"temp-high","ruleVersion":2,
+#         "metric":"temperature","trigger":32,"recover":26,"status":"active",
+#         "triggerSequence":3,"triggerValue":32.5,
+#         "triggerObservedAt":"2024-01-02T10:06:00Z"}]}
+```
+
+The retrigger creates a fresh alert record (`id` 2) — it never reopens or
+reuses the record just ended by the update.
+
+Two failure branches leave everything exactly as it was:
+
+- **Stale version** — submitting again with the old `version` returns `409`;
+  the rule keeps its current content and version, and its alerts (active or
+  ended) are untouched. Re-read the rule to get the current version, then
+  decide whether the change is still wanted before resubmitting:
+
+  ```bash
+  curl -sS -X PUT http://127.0.0.1:8080/v1/devices/gateway-01/rules/temp-high \
+    -H 'Content-Type: application/json' \
+    -d '{"trigger":35,"version":1}'
+  # 409 -> {"error":"..."}
+  ```
+
+- **Invalid thresholds** — an update whose resulting `recover` is not
+  strictly below `trigger` returns `400`. No version is consumed and no
+  active alert is ended:
+
+  ```bash
+  curl -sS -X PUT http://127.0.0.1:8080/v1/devices/gateway-01/rules/temp-high \
+    -H 'Content-Type: application/json' \
+    -d '{"recover":32,"version":2}'   # recover 32 >= trigger 32
+  # 400 -> {"error":"recover threshold must be less than trigger threshold"}
+  ```
+
+An unknown device or rule id returns `404`; a malformed body, a blank
+`metric` or a non-finite threshold returns `400`.
+
 ## Configuration delivery
 
 Each registered device has its own configuration version line. Versions are
