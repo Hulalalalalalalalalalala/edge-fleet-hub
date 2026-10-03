@@ -270,6 +270,92 @@ func TestTaskReportFailureAndBackoff(t *testing.T) {
 	claimTask(t, h, "dev-1", http.StatusNoContent)
 }
 
+func TestTaskReportFailureRetry(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 30), http.StatusCreated)
+
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+	first := reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "disk full", ""), http.StatusCreated)
+	task := getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	nextClaimable := task.NextClaimableAt
+
+	// An identical retry is the received receipt again: 200 with the first
+	// receiptId, reason and receive time.
+	*clock = clock.Add(500 * time.Millisecond)
+	retry := reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "disk full", ""), http.StatusOK)
+	if retry.ReceiptID != first.ReceiptID || retry.Reason != first.Reason || !retry.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("retry = %+v, want the first receipt %+v", retry, first)
+	}
+
+	// The retry does not accumulate a failure, re-time the wait or add audit.
+	task = getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "waiting" || !task.NextClaimableAt.Equal(nextClaimable) {
+		t.Fatalf("retry changed the task: %+v", task)
+	}
+	audit := listAudit(t, h, "dev-1", claim.Task.ID)
+	if got := joinEvents(eventsOf(audit)); got != "created,claimed,failed" {
+		t.Fatalf("audit after retry = %s", got)
+	}
+
+	// Same receiptId with a changed reason or flipped to success -> 409, and
+	// the stored receipt is untouched.
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "other reason", ""), http.StatusConflict)
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+	again := reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "disk full", ""), http.StatusOK)
+	if !again.ReceivedAt.Equal(first.ReceivedAt) || again.Reason != "disk full" {
+		t.Fatalf("receipt after conflicts = %+v", again)
+	}
+
+	// A new receiptId with the stale credential is rejected and does not take
+	// the receiptId: the same receiptId is accepted once the task is claimed
+	// again and reported with the fresh credential.
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-2", claim.Credential, false, "too early", ""), http.StatusConflict)
+
+	// After the backoff the task is claimed again; the old receipt still
+	// replays with the original (now stale) credential and neither the replay
+	// nor a content conflict disturbs the running attempt.
+	*clock = nextClaimable.Add(time.Second)
+	claim2 := claimTask(t, h, "dev-1", http.StatusOK)
+	if claim2.Attempt != 2 {
+		t.Fatalf("re-claim attempt = %d, want 2", claim2.Attempt)
+	}
+	retry = reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "disk full", ""), http.StatusOK)
+	if !retry.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("retry after re-claim = %+v, want receivedAt %s", retry, first.ReceivedAt)
+	}
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "changed", ""), http.StatusConflict)
+	task = getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "in_progress" || task.Attempts != 2 || task.Deadline == nil || !task.Deadline.Equal(claim2.Deadline) {
+		t.Fatalf("running attempt disturbed: %+v", task)
+	}
+
+	// The device reports the new attempt's failure with a fresh receiptId and
+	// the current credential; it joins the usual accumulation and backoff.
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-2", claim2.Credential, false, "still full", ""), http.StatusCreated)
+	task = getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "waiting" || task.FailureReason != "still full" {
+		t.Fatalf("after second failure: %+v", task)
+	}
+	if !task.NextClaimableAt.Equal(clock.UTC().Add(2 * time.Second)) {
+		t.Fatalf("next claimable = %s, want +2s", task.NextClaimableAt)
+	}
+	audit = listAudit(t, h, "dev-1", claim.Task.ID)
+	if got := joinEvents(eventsOf(audit)); got != "created,claimed,failed,claimed,failed" {
+		t.Fatalf("audit = %s", got)
+	}
+}
+
 func TestTaskTimeout(t *testing.T) {
 	store, clock := newClockStore()
 	h := NewHandler(store)

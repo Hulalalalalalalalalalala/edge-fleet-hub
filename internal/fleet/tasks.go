@@ -314,7 +314,7 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 		return TaskReport{}, false, err
 	}
 	if previous, seen := ts.reports[receiptID]; seen {
-		if previous.success != success || previous.reason != reason || !sameJSON(previous.result, result) {
+		if previous.success != success || previous.reason != reason || !sameReportResult(previous.result, result) {
 			return TaskReport{}, false, ErrTaskConflict
 		}
 		return taskReportView(previous), true, nil
@@ -652,6 +652,17 @@ func taskReportView(report storedReport) TaskReport {
 		Result:     cloneJSON(report.result),
 		ReceivedAt: report.receivedAt,
 	}
+}
+
+// sameReportResult compares the result payloads of a committed report and its
+// retry. A failure report carries no result, so two empty payloads are equal;
+// anything non-empty uses the semantic JSON comparison shared with success
+// receipts (key order ignored, numbers compared by value).
+func sameReportResult(a, b json.RawMessage) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == len(b)
+	}
+	return sameJSON(a, b)
 }
 
 // isJSONObject reports whether raw is exactly one JSON object. It is shared by

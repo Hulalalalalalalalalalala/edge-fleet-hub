@@ -158,6 +158,39 @@ func TestPersistentTaskFailureRestores(t *testing.T) {
 	}
 }
 
+func TestPersistentTaskFailureReceiptRetryRestores(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createTask(t, h, "gw", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "gw", http.StatusOK)
+	first := reportTask(t, h, "gw", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "disk full", ""), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	// The received failure receipt replays after the restart with its first
+	// receive time; a changed reason still conflicts.
+	retry := reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", claim.Credential, false, "disk full", ""), http.StatusOK)
+	if retry.ReceiptID != "rcpt-1" || retry.Reason != "disk full" || !retry.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("retry after restart = %+v, want receivedAt %s", retry, first.ReceivedAt)
+	}
+	reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", claim.Credential, false, "other reason", ""), http.StatusConflict)
+
+	// The replay did not add a failure or an audit record.
+	audit := listAudit(t, h2, "gw", 1)
+	if got := joinEvents(eventsOf(audit)); got != "created,claimed,failed" {
+		t.Fatalf("audit after restart = %s", got)
+	}
+}
+
 func TestPersistentTaskCancelRestores(t *testing.T) {
 	dir := t.TempDir()
 	store := openPersistent(t, dir)
