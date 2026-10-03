@@ -448,6 +448,171 @@ Missing fields, wrong types and bodies containing more than one JSON document
 return `400`; an unknown device returns `404`. Configuration operations never
 modify telemetry history, device activity times, rules or alerts.
 
+## Remote diagnostics
+
+A fleet operator opens a diagnostic task for a registered device, and the
+simulated device claims it, runs it and reports the outcome. Start the server
+(`go run ./cmd/edge-fleet`) and follow the calls below in order; the
+timestamps and credential are illustrative — copy the task number, credential
+and deadline out of your own responses.
+
+Register the device, create one task with a time limit of 1–60 seconds, and
+claim it:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"gateway-01","site":"warehouse-a"}'
+# 201 -> {"id":"gateway-01","site":"warehouse-a", ...}
+
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"diag-2026-10-04-1","durationSeconds":30}'
+# 201 ->
+# {"id":1,"requestId":"diag-2026-10-04-1","durationSeconds":30,
+#  "status":"pending","attempts":0,
+#  "createdAt":"2026-10-04T10:00:00Z",
+#  "nextClaimableAt":"2026-10-04T10:00:00Z"}
+
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# 200 ->
+# {"task":{"id":1,"requestId":"diag-2026-10-04-1","durationSeconds":30,
+#   "status":"in_progress","attempts":1,
+#   "createdAt":"2026-10-04T10:00:00Z",
+#   "claimedAt":"2026-10-04T10:00:01Z",
+#   "deadline":"2026-10-04T10:00:31Z"},
+#  "attempt":1,
+#  "credential":"9f1c2a7e4b6d4801a3f5c8e2d7b09164",
+#  "deadline":"2026-10-04T10:00:31Z"}
+```
+
+- The claim hands the device the earliest-created claimable task. Afterwards
+  the task is `in_progress` and its deadline is the claim time plus
+  `durationSeconds` (a `durationSeconds` outside 1–60 is rejected at creation
+  with `400`).
+- Both values the report needs come **only from this claim response**: the
+  task number in `task.id` and the execution `credential`. Ordinary task
+  queries (`GET /v1/devices/{id}/tasks` and
+  `GET /v1/devices/{id}/tasks/{taskId}`) never return a credential.
+- Creating the task itself produces no diagnostic result: the task view has
+  no `result` field until a successful report is accepted.
+
+The device reports success to that task's `reports` entry, using the task id
+and credential from the claim:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rcpt-1",
+       "credential":"9f1c2a7e4b6d4801a3f5c8e2d7b09164",
+       "success":true,
+       "result":{"checks":42,"passed":true}}'
+# 201 ->
+# {"receiptId":"diag-rcpt-1","success":true,
+#  "result":{"checks":42,"passed":true},
+#  "receivedAt":"2026-10-04T10:00:02Z"}
+```
+
+- A successful report requires `success: true` and `result` as a JSON object
+  (nested objects, arrays and ordinary JSON values are allowed). An empty
+  object is a legal result: `"result":{}` records a successful run with no
+  data.
+- `receiptId` is the device-chosen id for this outcome and is deduplicated
+  within the device, so it is also the retry key if the response is lost.
+- `receivedAt` in the response is the server time at which it **first**
+  received this result.
+
+Query the same task and its audit trail:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1
+# 200 ->
+# {"id":1,"requestId":"diag-2026-10-04-1","durationSeconds":30,
+#  "status":"succeeded","attempts":1,
+#  "createdAt":"2026-10-04T10:00:00Z",
+#  "result":{"checks":42,"passed":true},
+#  "completedAt":"2026-10-04T10:00:02Z"}
+
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1/audit
+# 200 ->
+# {"audit":[
+#   {"seq":1,"event":"created","toStatus":"pending",
+#    "at":"2026-10-04T10:00:00Z"},
+#   {"seq":2,"event":"claimed","fromStatus":"pending",
+#    "toStatus":"in_progress","attempt":1,
+#    "at":"2026-10-04T10:00:01Z"},
+#   {"seq":3,"event":"succeeded","toStatus":"succeeded","attempt":1,
+#    "at":"2026-10-04T10:00:02Z"}]}
+```
+
+The task now reads `succeeded`, carries the saved result, and has
+`completedAt` stamped at the first report's receive time; the audit shows the
+successful completion as its last record.
+
+### Retrying after a lost response
+
+If the `201` response never reaches the device, resend exactly the same
+outcome under the same `receiptId` — here with the object keys reordered and
+`42` written as `42.0`:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rcpt-1",
+       "credential":"9f1c2a7e4b6d4801a3f5c8e2d7b09164",
+       "success":true,
+       "result":{"passed":true,"checks":42.0}}'
+# 200 ->
+# {"receiptId":"diag-rcpt-1","success":true,
+#  "result":{"checks":42,"passed":true},
+#  "receivedAt":"2026-10-04T10:00:02Z"}
+```
+
+- A recognised duplicate returns `200 OK` with the first stored receipt,
+  including the **first** `receivedAt` — the retry does not complete the task
+  a second time and no second `succeeded` record appears in the audit.
+- Equality ignores object key order and compares numbers by value, so `42`
+  and `42.0` are the same result. Array order is significant: a result whose
+  array elements are reordered (e.g. `"checks":[2,1]` after `[1,2]`) is a
+  different result and returns `409`.
+- Even though success invalidated the claim's credential, the already
+  accepted report can still be replayed with that original credential; the
+  duplicate is recognised by `receiptId` first.
+
+Two reuses of a finished task conflict instead, both with
+`409 {"error":"diagnostic task conflict"}`, and the saved result stays
+exactly as first accepted:
+
+```bash
+# same receiptId, changed result
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rcpt-1",
+       "credential":"9f1c2a7e4b6d4801a3f5c8e2d7b09164",
+       "success":true,"result":{"checks":43,"passed":true}}'
+# 409 -> {"error":"diagnostic task conflict"}
+
+# a brand-new receiptId after the task already succeeded
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/1/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rcpt-2",
+       "credential":"9f1c2a7e4b6d4801a3f5c8e2d7b09164",
+       "success":true,"result":{"checks":42,"passed":true}}'
+# 409 -> {"error":"diagnostic task conflict"}
+```
+
+### Report failure conditions
+
+- A report missing `receiptId`, `credential` or `success`, or a success whose
+  `result` is not a JSON object (an array, string or number), returns `400`,
+  e.g. `{"error":"a successful report requires a JSON object result"}`.
+- A first-time submission with a wrong or foreign credential, or one made
+  after the deadline from the claim response, returns
+  `409 {"error":"diagnostic task conflict"}`. The boundary is inclusive: a
+  report presented at exactly the deadline instant is still accepted; only a
+  strictly later time conflicts.
+- An unknown device or task id returns `404`.
+
 ## Persistence and restart
 
 Without `EDGE_FLEET_DATA_DIR`, everything (devices, events, sequences, batch
