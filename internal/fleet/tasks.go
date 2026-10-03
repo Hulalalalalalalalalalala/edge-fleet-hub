@@ -2,9 +2,9 @@ package fleet
 
 // Remote diagnostics let a fleet operator open a task for a registered device
 // and let a simulated device claim it, run it for a bounded number of seconds,
-// and report a success or failure outcome. Tasks are per-device: requestId and
-// receiptId are deduplicated within the device, and only one task may be
-// executing at a time.
+// and report a success or failure outcome. Tasks are per-device: requestId is
+// deduplicated within the device, a receiptId belongs to exactly one task of
+// the device, and only one task may be executing at a time.
 //
 // A task moves through pending -> in_progress -> waiting -> ... states. A
 // failure or a deadline expiry invalidates the current credential and releases
@@ -54,9 +54,10 @@ var (
 	// ErrTaskNotFound is reported for a task id the device has never seen.
 	ErrTaskNotFound = errors.New("diagnostic task not found")
 	// ErrTaskConflict covers a requestId reused with a different duration, a
-	// receiptId reused with different content, a report presented with a stale
-	// or foreign credential (or after its deadline), and a cancel attempted
-	// after a success or failure end.
+	// receiptId reused with different content or presented to another task than
+	// the one it belongs to, a report presented with a stale or foreign
+	// credential (or after its deadline), and a cancel attempted after a
+	// success or failure end.
 	ErrTaskConflict = errors.New("diagnostic task conflict")
 )
 
@@ -147,6 +148,9 @@ func (state *deviceState) ensureTasks() {
 	}
 	if state.tasksByRequest == nil {
 		state.tasksByRequest = make(map[string]*taskState)
+	}
+	if state.taskReceipts == nil {
+		state.taskReceipts = make(map[string]int64)
 	}
 }
 
@@ -290,13 +294,17 @@ func (s *Store) ClaimTask(id string) (ClaimView, bool, error) {
 
 // ReportTask records one device-reported outcome.
 //
-// A repeated receiptId with identical success/result/reason returns the first
-// report (repeat=true); a reused receiptId with different content conflicts. A
-// new receiptId is accepted only when the task is in progress, the credential
-// matches the current attempt, and the deadline has not passed; otherwise it
-// conflicts. Success ends the task with a JSON object result; a failure
-// invalidates the credential, releases the device, and either schedules a
-// backoff retry or ends the task on the third failure.
+// A receiptId belongs to exactly one task on the device once first accepted.
+// Reusing it on the same task with identical success/result/reason returns the
+// first report (repeat=true); reusing it on the same task with different
+// content or on any other task of the device conflicts, even when that other
+// task is in progress with a matching credential and within its deadline.
+// A receiptId not yet accepted is accepted only when the task is in progress,
+// the credential matches the current attempt, and the deadline has not
+// passed; otherwise it conflicts and stays free for later use. Success ends
+// the task with a JSON object result; a failure invalidates the credential,
+// releases the device, and either schedules a backoff retry or ends the task
+// on the third failure.
 func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string, success bool, reason string, result json.RawMessage) (TaskReport, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -313,7 +321,14 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 	if err := s.evaluateTaskTimeouts(state, now); err != nil {
 		return TaskReport{}, false, err
 	}
-	if previous, seen := ts.reports[receiptID]; seen {
+	// An accepted receiptId is bound to one task. On its own task it replays
+	// (identical content) or conflicts (changed content); on another task it
+	// always conflicts regardless of content, leaving that task untouched.
+	if owner, seen := state.taskReceipts[receiptID]; seen {
+		if owner != taskID {
+			return TaskReport{}, false, ErrTaskConflict
+		}
+		previous := ts.reports[receiptID]
 		if previous.success != success || previous.reason != reason || !sameReportResult(previous.result, result) {
 			return TaskReport{}, false, ErrTaskConflict
 		}
@@ -391,6 +406,7 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 		ts.task.Result = cloneJSON(result)
 	}
 	releaseTaskAttempt(&ts.task)
+	state.taskReceipts[receiptID] = taskID
 	ts.reports[receiptID] = stored
 	ts.audit = append(ts.audit, auditRec)
 	return taskReportView(stored), false, nil

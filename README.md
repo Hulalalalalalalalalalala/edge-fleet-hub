@@ -36,9 +36,11 @@ EDGE_FLEET_DATA_DIR=./fleet-data go run ./cmd/edge-fleet
   restores devices, registration and last-active times, last telemetry, the
   complete retained histories with their receive-sequence counters and
   retention limits, per-device event deduplication records (including events
-  trimmed out of history) and batch receipts, rules and alerts, and the
-  complete configuration delivery state (published versions, target/applied
-  versions, application receipts and publish/receipt deduplication records).
+  trimmed out of history) and batch receipts, rules and alerts, the complete
+  diagnostic task lifecycle (tasks, claims, attempts and backoffs, reports,
+  receipt-to-task ownership and audit trails), and the complete configuration
+  delivery state (published versions, target/applied versions, application
+  receipts and publish/receipt deduplication records).
   Data written before a retention limit existed defaults to unlimited.
   Recovery never refreshes device timestamps; new samples continue the
   previous sequence. Re-submitting a batch that had already succeeded returns
@@ -581,6 +583,32 @@ first accepted:
   `reason`), e.g. `{"ok":false,"checks":42}`;
 - a brand-new `receiptId` submitted after the task already succeeded.
 
+### A receiptId belongs to one task
+
+A `receiptId` is bound to the single device **and** task on which it was first
+accepted; it is not merely per-device. Reusing an already-accepted `receiptId`
+on a *different* task of the same device is `409
+{"error":"diagnostic task conflict"}` even if the report content is identical
+and the second task is still in progress, within its deadline and presenting
+its own valid credential. The first task's receipt is never returned as the
+second task's response: the second attempt keeps its status, attempt count,
+deadline and credential, and neither its query result nor its audit trail
+gains a completion or failure record. Submitting again with an unused
+`receiptId` completes the second task normally. The rule applies to failure
+receipts too — a failure receipt stays replayable on its own task (returning
+the first receive time) while the task waits, is claimed again or finally
+ends, but cannot be accepted on another task.
+
+The binding is scoped narrowly:
+
+- another device independently accepts the same `receiptId` for one of its
+  own tasks;
+- configuration application receipts (`/configs/receipts`) keep their own
+  separate `receiptId` space and do not participate in this check;
+- a rejected or unpersisted report never occupies a `receiptId`, so an id
+  refused for a bad credential, a passed deadline or a validation error can
+  still be accepted once the underlying condition clears.
+
 ### Failure conditions for a report
 
 - `400` — a required field is missing or blank (`receiptId`, `credential` or
@@ -589,7 +617,9 @@ first accepted:
 - `409` — a **first** submission presents a credential that does not match
   the current claim, or arrives after the claim's `deadline`. The deadline
   instant itself is still within the attempt: a report presented exactly at
-  `deadline` is accepted; only a strictly later instant is past it.
+  `deadline` is accepted; only a strictly later instant is past it. A first
+  submission whose `receiptId` already belongs to another task of the device
+  is likewise `409`.
 - `404` — the device or task id does not exist.
 
 Task creation has its own validation: a blank `requestId`, a missing

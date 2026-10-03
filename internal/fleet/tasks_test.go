@@ -735,3 +735,191 @@ func TestTaskDeadlineBoundary(t *testing.T) {
 		t.Fatalf("past the deadline: %+v", task)
 	}
 }
+
+// A receiptId accepted on one task belongs to it: submitting the same id to a
+// second task of the same device returns 409 even with identical content, a
+// valid credential and time remaining, and leaves the second attempt running
+// with no new completion or failure record.
+func TestTaskReceiptOwnedByOneTask(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+
+	// Task 1: claim and succeed with rcpt-shared.
+	createTask(t, h, "dev-1", taskBody("req-1", 60), http.StatusCreated)
+	claim1 := claimTask(t, h, "dev-1", http.StatusOK)
+	first := reportTask(t, h, "dev-1", claim1.Task.ID,
+		reportBody("rcpt-shared", claim1.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+
+	// Task 2 becomes claimable after task 1 ends.
+	createTask(t, h, "dev-1", taskBody("req-2", 60), http.StatusCreated)
+	claim2 := claimTask(t, h, "dev-1", http.StatusOK)
+	if claim2.Task.ID != 2 {
+		t.Fatalf("second claim took task %d, want 2", claim2.Task.ID)
+	}
+
+	// Reuse the first task's receiptId on task 2 with the same content -> 409.
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-shared", claim2.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+
+	// The second attempt is undisturbed: in_progress, same attempts/deadline/
+	// credential, no completion, no result, no failure reason.
+	task2 := getTask(t, h, "dev-1", 2, http.StatusOK)
+	if task2.Status != "in_progress" || task2.Attempts != 1 || task2.CompletedAt != nil {
+		t.Fatalf("task 2 disturbed: %+v", task2)
+	}
+	if task2.Deadline == nil || !task2.Deadline.Equal(claim2.Deadline) {
+		t.Fatalf("task 2 deadline changed: %+v vs claim %s", task2.Deadline, claim2.Deadline)
+	}
+	if store.devices["dev-1"].tasks[1].task.Credential != claim2.Credential {
+		t.Fatalf("task 2 credential changed")
+	}
+	if len(task2.Result) != 0 || task2.FailureReason != "" {
+		t.Fatalf("task 2 gained a result/failure: %+v", task2)
+	}
+	// No audit transition was added for the conflict.
+	audit2 := listAudit(t, h, "dev-1", 2)
+	if got := joinEvents(eventsOf(audit2)); got != "created,claimed" {
+		t.Fatalf("task 2 audit = %s", got)
+	}
+
+	// An unused receiptId completes the second task normally.
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-second", claim2.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+	if task := getTask(t, h, "dev-1", 2, http.StatusOK); task.Status != "succeeded" {
+		t.Fatalf("task 2 with fresh receipt = %+v", task)
+	}
+
+	// Both owners stay correct after both tasks ended: replays return the first
+	// receipt of the right task, cross-task reuse still 409s.
+	replay1 := reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-shared", claim1.Credential, true, "", `{"ok":true}`), http.StatusOK)
+	if !replay1.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("task 1 replay receivedAt = %s, want %s", replay1.ReceivedAt, first.ReceivedAt)
+	}
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-shared", claim2.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+	_ = clock
+}
+
+// Cross-task ownership also applies to failure receipts: the first failure
+// receipt stays bound to its task after the task enters waiting, survives
+// re-claim and final failure, and cannot start a second task.
+func TestTaskFailureReceiptOwnedAcrossRetriesAndTasks(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+
+	createTask(t, h, "dev-1", taskBody("req-1", 1), http.StatusCreated)
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+	first := reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-fail", claim.Credential, false, "disk full", ""), http.StatusCreated)
+
+	// While task 1 is waiting, claim task 2 and present task 1's failure
+	// receipt -> 409; task 2 keeps its running attempt.
+	createTask(t, h, "dev-1", taskBody("req-2", 60), http.StatusCreated)
+	claim2 := claimTask(t, h, "dev-1", http.StatusOK)
+	if claim2.Task.ID != 2 {
+		t.Fatalf("claim during wait took task %d, want 2", claim2.Task.ID)
+	}
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-fail", claim2.Credential, false, "disk full", ""), http.StatusConflict)
+	if task := getTask(t, h, "dev-1", 2, http.StatusOK); task.Status != "in_progress" {
+		t.Fatalf("task 2 disturbed: %+v", task)
+	}
+
+	// Finish task 2 with an unused id so the device frees up.
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-ok-2", claim2.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+
+	// Backoff elapsed: re-claim task 1. The old failure receipt still replays
+	// on its own task with the first receive time (even with the stale
+	// credential), and cross-task reuse after both ended still conflicts.
+	*clock = clock.Add(2 * time.Second)
+	claim3 := claimTask(t, h, "dev-1", http.StatusOK)
+	if claim3.Task.ID != 1 || claim3.Attempt != 2 {
+		t.Fatalf("re-claim = %+v, want task 1 attempt 2", claim3)
+	}
+	retry := reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-fail", claim.Credential, false, "disk full", ""), http.StatusOK)
+	if !retry.ReceivedAt.Equal(first.ReceivedAt) || retry.Reason != "disk full" {
+		t.Fatalf("failure receipt retry = %+v", retry)
+	}
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-fail", claim2.Credential, false, "disk full", ""), http.StatusConflict)
+
+	// A fresh receipt ends task 1 on the third failure; afterwards the
+	// first-task receipt is still only a replay on task 1.
+	reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-fail-2", claim3.Credential, false, "still full", ""), http.StatusCreated)
+	*clock = clock.Add(3 * time.Second)
+	claim4 := claimTask(t, h, "dev-1", http.StatusOK)
+	reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-fail", claim.Credential, false, "disk full", ""), http.StatusOK)
+	reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-fail-3", claim4.Credential, false, "gave up", ""), http.StatusCreated)
+	if task := getTask(t, h, "dev-1", 1, http.StatusOK); task.Status != "failed" {
+		t.Fatalf("task 1 = %+v, want failed", task)
+	}
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-fail", claim2.Credential, false, "disk full", ""), http.StatusConflict)
+}
+
+// A rejected first submission does not take the receiptId: once the reason for
+// rejection clears, the very same id is accepted with 201.
+func TestTaskRejectedReportDoesNotOwnReceipt(t *testing.T) {
+	store, _ := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 30), http.StatusCreated)
+	createTask(t, h, "dev-1", taskBody("req-2", 30), http.StatusCreated)
+
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+
+	// Wrong credential: rejected and must not occupy the id.
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", "bogus", true, "", `{"ok":true}`), http.StatusConflict)
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+
+	// After task 1 succeeds, claim task 2. The id from a rejected report to
+	// task 2 was never taken, but rcpt-1 now belongs to task 1, so task 2
+	// needs its own id; an id rejected earlier on task 2 is still free.
+	claim2 := claimTask(t, h, "dev-1", http.StatusOK)
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-not-mine", "bogus", true, "", `{"ok":true}`), http.StatusConflict)
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-1", claim2.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+	reportTask(t, h, "dev-1", 2,
+		reportBody("rcpt-not-mine", claim2.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+}
+
+// The receipt ownership constraint is per-device and per-domain: another
+// device accepts the same id independently, and a configuration receipt id is
+// checked separately from diagnostic receipts.
+func TestTaskReceiptOwnershipScopedToDeviceAndDomain(t *testing.T) {
+	store, _ := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	mustRegister(t, h, "dev-2")
+
+	// dev-1 task succeeds with rcpt-shared.
+	createTask(t, h, "dev-1", taskBody("req-a", 30), http.StatusCreated)
+	claim1 := claimTask(t, h, "dev-1", http.StatusOK)
+	reportTask(t, h, "dev-1", claim1.Task.ID,
+		reportBody("rcpt-shared", claim1.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+
+	// A different device accepts the same receiptId on its own task.
+	createTask(t, h, "dev-2", taskBody("req-b", 30), http.StatusCreated)
+	claim2 := claimTask(t, h, "dev-2", http.StatusOK)
+	report2 := reportTask(t, h, "dev-2", claim2.Task.ID,
+		reportBody("rcpt-shared", claim2.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+	if report2.ReceiptID != "rcpt-shared" {
+		t.Fatalf("other device receipt = %+v", report2)
+	}
+
+	// A configuration receipt with the same id is independent of diagnostic
+	// receipts: publish a config on dev-1 and accept its application receipt.
+	published := publishConfig(t, h, "dev-1", publishBody("cfg-1", 0, `{"v":1}`), http.StatusCreated)
+	postReceipt(t, h, "dev-1", receiptBody("rcpt-shared", published.Version, true, ""), http.StatusCreated)
+}

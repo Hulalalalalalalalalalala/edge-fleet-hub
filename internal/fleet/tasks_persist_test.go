@@ -371,3 +371,111 @@ func TestPersistentOldDataDirStillOpens(t *testing.T) {
 		t.Fatalf("tasks on old data dir = %+v", list.Tasks)
 	}
 }
+
+// --- receiptId task ownership survives restart --------------------------------
+
+func TestPersistentTaskReceiptOwnershipRestores(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createTask(t, h, "gw", taskBody("req-1", 60), http.StatusCreated)
+	claim := claimTask(t, h, "gw", http.StatusOK)
+	first := reportTask(t, h, "gw", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	// The original receipt still replays on its own task with the first receive
+	// time.
+	retry := reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true}`), http.StatusOK)
+	if !retry.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("retry receivedAt = %s, want %s", retry.ReceivedAt, first.ReceivedAt)
+	}
+
+	// A second task created after restart cannot reuse the accepted id, even
+	// with its own valid credential and time remaining.
+	createTask(t, h2, "gw", taskBody("req-2", 60), http.StatusCreated)
+	claim2 := claimTask(t, h2, "gw", http.StatusOK)
+	if claim2.Task.ID != 2 {
+		t.Fatalf("claim took task %d, want 2", claim2.Task.ID)
+	}
+	reportTask(t, h2, "gw", 2,
+		reportBody("rcpt-1", claim2.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+
+	// The conflict left no completion/failure record and the attempt runs on.
+	task2 := getTask(t, h2, "gw", 2, http.StatusOK)
+	if task2.Status != "in_progress" || task2.Attempts != 1 || task2.CompletedAt != nil {
+		t.Fatalf("task 2 disturbed: %+v", task2)
+	}
+	audit := listAudit(t, h2, "gw", 2)
+	if got := joinEvents(eventsOf(audit)); got != "created,claimed" {
+		t.Fatalf("task 2 audit = %s", got)
+	}
+
+	// An unused id completes the second task.
+	reportTask(t, h2, "gw", 2,
+		reportBody("rcpt-2", claim2.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+	if task := getTask(t, h2, "gw", 2, http.StatusOK); task.Status != "succeeded" {
+		t.Fatalf("task 2 = %+v", task)
+	}
+
+	// The binding is still present after another restart.
+	if err := store2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store3 := reopenPersistent(t, dir)
+	h3 := NewHandler(store3)
+	reportTask(t, h3, "gw", 2,
+		reportBody("rcpt-1", claim2.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+	again := reportTask(t, h3, "gw", 1,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true}`), http.StatusOK)
+	if !again.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("second-restart replay receivedAt = %s, want %s", again.ReceivedAt, first.ReceivedAt)
+	}
+}
+
+// Failure receipt ownership also survives restart: the waiting task's receipt
+// replays with its first receive time, and it cannot start another task.
+func TestPersistentTaskFailureReceiptOwnershipRestores(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createTask(t, h, "gw", taskBody("req-1", 60), http.StatusCreated)
+	claim := claimTask(t, h, "gw", http.StatusOK)
+	first := reportTask(t, h, "gw", claim.Task.ID,
+		reportBody("rcpt-fail", claim.Credential, false, "disk full", ""), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	retry := reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-fail", claim.Credential, false, "disk full", ""), http.StatusOK)
+	if !retry.ReceivedAt.Equal(first.ReceivedAt) || retry.Reason != "disk full" {
+		t.Fatalf("failure retry = %+v", retry)
+	}
+
+	// End task 1 so the next claim takes the new task 2.
+	cancelTask(t, h2, "gw", 1, http.StatusOK)
+	createTask(t, h2, "gw", taskBody("req-2", 60), http.StatusCreated)
+	claim2 := claimTask(t, h2, "gw", http.StatusOK)
+	if claim2.Task.ID != 2 {
+		t.Fatalf("claim took task %d, want 2", claim2.Task.ID)
+	}
+	reportTask(t, h2, "gw", 2,
+		reportBody("rcpt-fail", claim2.Credential, false, "disk full", ""), http.StatusConflict)
+	if task := getTask(t, h2, "gw", 2, http.StatusOK); task.Status != "in_progress" {
+		t.Fatalf("task 2 disturbed: %+v", task)
+	}
+	reportTask(t, h2, "gw", 2,
+		reportBody("rcpt-other", claim2.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+}

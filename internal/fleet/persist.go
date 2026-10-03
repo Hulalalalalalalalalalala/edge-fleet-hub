@@ -1054,6 +1054,9 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		if _, dup := ts.reports[rec.ReceiptID]; dup {
 			return fmt.Errorf("device %q duplicate task report receipt %q", rec.DeviceID, rec.ReceiptID)
 		}
+		if owner, taken := state.taskReceipts[rec.ReceiptID]; taken {
+			return fmt.Errorf("device %q task report receipt %q already belongs to task %d", rec.DeviceID, rec.ReceiptID, owner)
+		}
 		if !rec.Success && strings.TrimSpace(rec.Reason) == "" {
 			return fmt.Errorf("device %q task report %q fails without a reason", rec.DeviceID, rec.ReceiptID)
 		}
@@ -1085,6 +1088,7 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			receivedAt: rec.ReceivedAt.UTC(),
 		}
 		ts.reports[rec.ReceiptID] = report
+		state.taskReceipts[rec.ReceiptID] = rec.TaskID
 		rec.Audit.Seq = int64(len(ts.audit)) + 1
 		ts.audit = append(ts.audit, rec.Audit)
 		return nil
