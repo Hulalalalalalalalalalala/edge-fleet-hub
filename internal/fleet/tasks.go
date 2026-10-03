@@ -45,6 +45,9 @@ const (
 	taskMinDuration = 1
 	taskMaxDuration = 60
 	taskMaxAttempts = 3
+	// taskTimeoutReason is the failure reason recorded when an attempt runs
+	// past its deadline. Device-reported failures keep the submitted reason.
+	taskTimeoutReason = "deadline exceeded"
 )
 
 var (
@@ -320,39 +323,37 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 		return TaskReport{}, false, ErrTaskConflict
 	}
 
-	auditRec := TaskAuditRecord{
-		Seq:     int64(len(ts.audit)) + 1,
-		Attempt: ts.task.Attempts,
-		At:      now,
-	}
-	// Compute the resulting state without mutating yet.
+	// Compute the resulting state without mutating yet. Success ends the task
+	// with a JSON object result; a failure goes through the same backoff/end
+	// rules as a deadline expiry (see planTaskFailure).
 	newStatus := ts.task.Status
 	newFailures := ts.task.Failures
 	var newNextClaimableAt time.Time
 	var newFailureReason string
 	var newCompletedAt *time.Time
+	var auditRec TaskAuditRecord
 	if success {
 		newStatus = taskStatusSucceeded
 		completedAt := now
 		newCompletedAt = &completedAt
-		auditRec.Event = auditEventSucceeded
-		auditRec.ToStatus = taskStatusSucceeded
-	} else {
-		newFailures++
-		newFailureReason = reason
-		if newFailures >= taskMaxAttempts {
-			newStatus = taskStatusFailed
-			completedAt := now
-			newCompletedAt = &completedAt
-			auditRec.Event = auditEventFailed
-			auditRec.ToStatus = taskStatusFailed
-		} else {
-			newStatus = taskStatusWaiting
-			newNextClaimableAt = now.Add(backoffFor(newFailures))
-			auditRec.Event = auditEventFailed
-			auditRec.ToStatus = taskStatusWaiting
+		auditRec = TaskAuditRecord{
+			Seq:      int64(len(ts.audit)) + 1,
+			Event:    auditEventSucceeded,
+			ToStatus: taskStatusSucceeded,
+			Attempt:  ts.task.Attempts,
+			At:       now,
 		}
-		auditRec.Reason = reason
+	} else {
+		// The wait runs from the moment the server received the report and the
+		// device's own reason is retained.
+		outcome := planTaskFailure(ts.task, auditEventFailed, "", now, reason)
+		outcome.audit.Seq = int64(len(ts.audit)) + 1
+		auditRec = outcome.audit
+		newStatus = outcome.status
+		newFailures = outcome.failures
+		newNextClaimableAt = outcome.nextClaimableAt
+		newFailureReason = reason
+		newCompletedAt = outcome.completedAt
 	}
 	stored := storedReport{
 		receiptID:  receiptID,
@@ -389,9 +390,7 @@ func (s *Store) ReportTask(id string, taskID int64, receiptID, credential string
 	if success {
 		ts.task.Result = cloneJSON(result)
 	}
-	ts.task.Credential = ""
-	ts.task.ClaimedAt = nil
-	ts.task.Deadline = nil
+	releaseTaskAttempt(&ts.task)
 	ts.reports[receiptID] = stored
 	ts.audit = append(ts.audit, auditRec)
 	return taskReportView(stored), false, nil
@@ -443,9 +442,7 @@ func (s *Store) CancelTask(id string, taskID int64) (TaskView, error) {
 	ts.task.Status = taskStatusCanceled
 	completedAt := now
 	ts.task.CompletedAt = &completedAt
-	ts.task.Credential = ""
-	ts.task.ClaimedAt = nil
-	ts.task.Deadline = nil
+	releaseTaskAttempt(&ts.task)
 	ts.audit = append(ts.audit, auditRec)
 	return taskView(ts.task), nil
 }
@@ -519,62 +516,90 @@ func (s *Store) evaluateTaskTimeouts(state *deviceState, now time.Time) error {
 			continue
 		}
 		deadline := *ts.task.Deadline
+		// Exactly at the deadline is still within it; only a later instant
+		// expires it, so a long-delayed query never re-times a finished task.
 		if !now.After(deadline) {
 			continue
 		}
-		attempt := ts.task.Attempts
-		newFailures := ts.task.Failures + 1
-		reason := "deadline exceeded"
-		auditRec := TaskAuditRecord{
-			Seq:        int64(len(ts.audit)) + 1,
-			Event:      auditEventTimedOut,
-			FromStatus: taskStatusInProgress,
-			Attempt:    attempt,
-			At:         deadline,
-			Reason:     reason,
-		}
-		newStatus := taskStatusWaiting
-		var newCompletedAt *time.Time
-		if newFailures >= taskMaxAttempts {
-			newStatus = taskStatusFailed
-			completedAt := deadline
-			newCompletedAt = &completedAt
-			auditRec.ToStatus = taskStatusFailed
-		} else {
-			newStatus = taskStatusWaiting
-			auditRec.ToStatus = taskStatusWaiting
-		}
-		var newNextClaimableAt time.Time
-		if newStatus == taskStatusWaiting {
-			newNextClaimableAt = deadline.Add(backoffFor(newFailures))
-		}
+		// The failure is attributed to the deadline, not to the query time:
+		// the wait, completion and audit timestamp all run from the deadline.
+		outcome := planTaskFailure(ts.task, auditEventTimedOut, taskStatusInProgress, deadline, taskTimeoutReason)
+		outcome.audit.Seq = int64(len(ts.audit)) + 1
 		if s.wal != nil {
 			if err := s.wal.appendRecord(recTaskTimeout, walTaskTimeout{
 				DeviceID:        state.device.ID,
 				TaskID:          ts.task.ID,
-				Attempt:         attempt,
+				Attempt:         ts.task.Attempts,
 				Deadline:        deadline,
-				Status:          newStatus,
-				Failures:        newFailures,
-				NextClaimableAt: newNextClaimableAt,
-				FailureReason:   reason,
-				CompletedAt:     newCompletedAt,
-				Audit:           auditRec,
+				Status:          outcome.status,
+				Failures:        outcome.failures,
+				NextClaimableAt: outcome.nextClaimableAt,
+				FailureReason:   taskTimeoutReason,
+				CompletedAt:     outcome.completedAt,
+				Audit:           outcome.audit,
 			}); err != nil {
 				return storageUnavailable(err)
 			}
 		}
-		ts.task.Status = newStatus
-		ts.task.Failures = newFailures
-		ts.task.NextClaimableAt = newNextClaimableAt
-		ts.task.FailureReason = reason
-		ts.task.CompletedAt = newCompletedAt
-		ts.task.Credential = ""
-		ts.task.ClaimedAt = nil
-		ts.task.Deadline = nil
-		ts.audit = append(ts.audit, auditRec)
+		ts.task.Status = outcome.status
+		ts.task.Failures = outcome.failures
+		ts.task.NextClaimableAt = outcome.nextClaimableAt
+		ts.task.FailureReason = taskTimeoutReason
+		ts.task.CompletedAt = outcome.completedAt
+		releaseTaskAttempt(&ts.task)
+		ts.audit = append(ts.audit, outcome.audit)
 	}
 	return nil
+}
+
+// taskFailureOutcome is the planned, not-yet-committed result of one failure.
+type taskFailureOutcome struct {
+	status          string
+	failures        int
+	nextClaimableAt time.Time
+	completedAt     *time.Time
+	audit           TaskAuditRecord
+}
+
+// planTaskFailure applies the single failure rule shared by device-reported
+// failures and deadline expiries. It accumulates onto the task's current
+// failure count: the first two failures move the task to waiting with a 1s and
+// 2s backoff measured from at; the third ends it as failed and stamps at as the
+// completion time. event distinguishes the source (failed vs timed_out) and an
+// empty fromStatus matches a reported failure, which records none. It never
+// mutates the task and does not assign an audit sequence number.
+func planTaskFailure(task DiagnosticTask, event, fromStatus string, at time.Time, reason string) taskFailureOutcome {
+	failures := task.Failures + 1
+	outcome := taskFailureOutcome{
+		failures: failures,
+		audit: TaskAuditRecord{
+			Event:      event,
+			FromStatus: fromStatus,
+			Attempt:    task.Attempts,
+			At:         at,
+			Reason:     reason,
+		},
+	}
+	if failures >= taskMaxAttempts {
+		outcome.status = taskStatusFailed
+		completedAt := at
+		outcome.completedAt = &completedAt
+		outcome.audit.ToStatus = taskStatusFailed
+		return outcome
+	}
+	outcome.status = taskStatusWaiting
+	outcome.nextClaimableAt = at.Add(backoffFor(failures))
+	outcome.audit.ToStatus = taskStatusWaiting
+	return outcome
+}
+
+// releaseTaskAttempt invalidates the current attempt's credential and frees the
+// device so another claimable task can be taken. It is shared by every end of
+// an in-progress attempt: success, reported failure, timeout and cancel.
+func releaseTaskAttempt(task *DiagnosticTask) {
+	task.Credential = ""
+	task.ClaimedAt = nil
+	task.Deadline = nil
 }
 
 // backoffFor returns the wait after the given failure count. The third failure

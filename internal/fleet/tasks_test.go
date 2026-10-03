@@ -524,3 +524,128 @@ func TestTaskUnknownDeviceAndTask(t *testing.T) {
 		t.Fatalf("audit unknown task status = %d", r.Code)
 	}
 }
+
+// Reported failures and deadline timeouts accumulate into one failure count
+// with one set of backoff/end rules, while their timestamps, reasons and audit
+// events stay distinct.
+func TestTaskFailuresAccumulateAcrossSources(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 1), http.StatusCreated)
+
+	// Failure 1: device-reported; the wait runs from the receipt time.
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, false, "disk full", ""), http.StatusCreated)
+	task := getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "waiting" || task.FailureReason != "disk full" || task.Attempts != 1 {
+		t.Fatalf("after first failure: %+v", task)
+	}
+	if !task.NextClaimableAt.Equal(clock.UTC().Add(1 * time.Second)) {
+		t.Fatalf("next claimable = %s, want receipt time +1s", task.NextClaimableAt)
+	}
+	if got := store.devices["dev-1"].tasks[0].task.Failures; got != 1 {
+		t.Fatalf("failures = %d, want 1", got)
+	}
+
+	// The waiting task does not block another already-claimable task.
+	createTask(t, h, "dev-1", taskBody("req-other", 60), http.StatusCreated)
+	other := claimTask(t, h, "dev-1", http.StatusOK)
+	if other.Task.ID != 2 {
+		t.Fatalf("claim during backoff took task %d, want 2", other.Task.ID)
+	}
+	reportTask(t, h, "dev-1", other.Task.ID,
+		reportBody("rcpt-other", other.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+
+	// Failure 2: a timeout. It takes the 2-second backoff because the failure
+	// count is shared, and the wait runs from the deadline rather than the
+	// (much later) query time.
+	*clock = clock.Add(2 * time.Second)
+	claim = claimTask(t, h, "dev-1", http.StatusOK)
+	if claim.Attempt != 2 || claim.Task.ID != 1 {
+		t.Fatalf("re-claim = %+v, want task 1 attempt 2", claim)
+	}
+	deadline2 := claim.Deadline
+	*clock = clock.Add(4 * time.Second)
+	task = getTask(t, h, "dev-1", 1, http.StatusOK)
+	if task.Status != "waiting" || task.FailureReason != "deadline exceeded" {
+		t.Fatalf("after timeout: %+v", task)
+	}
+	if !task.NextClaimableAt.Equal(deadline2.Add(2 * time.Second)) {
+		t.Fatalf("next claimable = %s, want deadline +2s (shared failure 2)", task.NextClaimableAt)
+	}
+	if got := store.devices["dev-1"].tasks[0].task.Failures; got != 2 {
+		t.Fatalf("failures = %d, want 2", got)
+	}
+	// The timed-out credential no longer authorizes a receipt.
+	reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-late", claim.Credential, true, "", `{"ok":true}`), http.StatusConflict)
+	// Repeated queries neither re-time the task nor accumulate another failure.
+	getTask(t, h, "dev-1", 1, http.StatusOK)
+	if got := store.devices["dev-1"].tasks[0].task.Failures; got != 2 {
+		t.Fatalf("repeat query changed failures to %d", got)
+	}
+	if got := len(store.devices["dev-1"].tasks[0].audit); got != 5 {
+		t.Fatalf("audit length after repeat query = %d, want 5", got)
+	}
+
+	// Failure 3: a reported failure ends the task, stamped at receipt time.
+	claim = claimTask(t, h, "dev-1", http.StatusOK)
+	if claim.Attempt != 3 {
+		t.Fatalf("attempt = %d, want 3", claim.Attempt)
+	}
+	reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-3", claim.Credential, false, "gave up", ""), http.StatusCreated)
+	task = getTask(t, h, "dev-1", 1, http.StatusOK)
+	if task.Status != "failed" || task.CompletedAt == nil || task.Attempts != 3 {
+		t.Fatalf("after third failure: %+v", task)
+	}
+	if !task.CompletedAt.Equal(clock.UTC()) {
+		t.Fatalf("completedAt = %s, want receipt time %s", task.CompletedAt, clock.UTC())
+	}
+	claimTask(t, h, "dev-1", http.StatusNoContent)
+
+	// The audit keeps both sources distinct, dated and ordered.
+	audit := listAudit(t, h, "dev-1", 1)
+	if got := joinEvents(eventsOf(audit)); got != "created,claimed,failed,claimed,timed_out,claimed,failed" {
+		t.Fatalf("audit events = %s", got)
+	}
+	timedOut := audit[4]
+	if timedOut.Event != "timed_out" || timedOut.At != deadline2 || timedOut.Reason != "deadline exceeded" ||
+		timedOut.Attempt != 2 || timedOut.FromStatus != "in_progress" || timedOut.ToStatus != "waiting" {
+		t.Fatalf("timeout audit record = %+v", timedOut)
+	}
+	if audit[2].At.IsZero() || audit[6].ToStatus != "failed" {
+		t.Fatalf("reported failure audit records = %+v / %+v", audit[2], audit[6])
+	}
+}
+
+// An attempt is live exactly up to and including its deadline; only a strictly
+// later instant is a timeout.
+func TestTaskDeadlineBoundary(t *testing.T) {
+	store, _ := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 5), http.StatusCreated)
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+	deadline := claim.Deadline
+
+	// Exactly at the deadline the attempt is still in progress...
+	store.now = func() time.Time { return deadline }
+	if task := getTask(t, h, "dev-1", 1, http.StatusOK); task.Status != "in_progress" {
+		t.Fatalf("at the deadline status = %s, want in_progress", task.Status)
+	}
+	// ...and a report presented exactly then is accepted with the credential.
+	reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"ok":true}`), http.StatusCreated)
+
+	// A strictly later instant expires a fresh attempt.
+	createTask(t, h, "dev-1", taskBody("req-2", 5), http.StatusCreated)
+	claim2 := claimTask(t, h, "dev-1", http.StatusOK)
+	store.now = func() time.Time { return claim2.Deadline.Add(time.Second) }
+	task := getTask(t, h, "dev-1", claim2.Task.ID, http.StatusOK)
+	if task.Status != "waiting" || !task.NextClaimableAt.Equal(claim2.Deadline.Add(1*time.Second)) {
+		t.Fatalf("past the deadline: %+v", task)
+	}
+}
