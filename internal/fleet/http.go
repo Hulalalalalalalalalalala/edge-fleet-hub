@@ -76,12 +76,13 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) telemetry(w http.ResponseWriter, r *http.Request) {
-	values := map[string]float64{}
-	if err := decodeJSON(r, &values); err != nil || len(values) == 0 {
+	raw := map[string]json.RawMessage{}
+	if err := decodeJSON(r, &raw); err != nil || len(raw) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "telemetry values are required"})
 		return
 	}
-	if !finiteValues(values) {
+	values, ok := finiteMetricValues(raw)
+	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "telemetry values must be finite"})
 		return
 	}
@@ -104,9 +105,9 @@ func (h *handler) telemetry(w http.ResponseWriter, r *http.Request) {
 type replayRequest struct {
 	BatchID string `json:"batchId"`
 	Samples []struct {
-		EventID    string             `json:"eventId"`
-		ObservedAt string             `json:"observedAt"`
-		Values     map[string]float64 `json:"values"`
+		EventID    string                     `json:"eventId"`
+		ObservedAt string                     `json:"observedAt"`
+		Values     map[string]json.RawMessage `json:"values"`
 	} `json:"samples"`
 }
 
@@ -146,14 +147,15 @@ func (h *handler) replay(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "values must be a non-empty map with non-blank metric names"})
 			return
 		}
-		if !finiteValues(entry.Values) {
+		metricValues, valid := finiteMetricValues(entry.Values)
+		if !valid {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "values must be finite numbers"})
 			return
 		}
 		samples[i] = Sample{
 			EventID:    eventID,
 			ObservedAt: observedAt.UTC(),
-			Values:     cloneTelemetry(entry.Values),
+			Values:     metricValues,
 		}
 	}
 
@@ -538,7 +540,7 @@ func finiteFloat(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
-func hasBlankKey(values map[string]float64) bool {
+func hasBlankKey(values map[string]json.RawMessage) bool {
 	for key := range values {
 		if strings.TrimSpace(key) == "" {
 			return true
@@ -547,13 +549,24 @@ func hasBlankKey(values map[string]float64) bool {
 	return false
 }
 
-func finiteValues(values map[string]float64) bool {
-	for _, value := range values {
-		if math.IsNaN(value) || math.IsInf(value, 0) {
-			return false
+// finiteMetricValues converts the raw JSON metric map into float64 values.
+// Every entry must be a finite JSON number: JSON null must not silently become
+// the zero value, and strings, booleans, objects and arrays are not metric
+// values. A *float64 distinguishes a present 0 from an explicit null (which
+// decodes to a nil pointer).
+func finiteMetricValues(raw map[string]json.RawMessage) (map[string]float64, bool) {
+	values := make(map[string]float64, len(raw))
+	for key, token := range raw {
+		var number *float64
+		if err := json.Unmarshal(token, &number); err != nil || number == nil {
+			return nil, false
 		}
+		if !finiteFloat(*number) {
+			return nil, false
+		}
+		values[key] = *number
 	}
-	return true
+	return values, true
 }
 
 func decodeJSON(r *http.Request, target any) error {

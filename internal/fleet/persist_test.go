@@ -582,6 +582,65 @@ func TestPersistentReplayIsOneCommitUnit(t *testing.T) {
 	}
 }
 
+// Validation rejects a null metric value in the handler before the store is
+// touched, so durable mode appends no WAL frames: nothing survives on disk,
+// and the same batch/event identifiers are still usable after correction.
+func TestPersistentNullRejectionWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":0}`); r.Code != http.StatusAccepted {
+		t.Fatalf("baseline telemetry = %d", r.Code)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sizeBefore := len(walRaw(t, dir))
+
+	store = reopenPersistent(t, dir)
+	h = NewHandler(store)
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":null}`); r.Code != http.StatusBadRequest {
+		t.Fatalf("null telemetry = %d, want 400", r.Code)
+	}
+	bad := replayBody("batch-b",
+		sample("e1", "2024-01-02T10:01:00Z", `{"temperature":1}`),
+		sample("e2", "2024-01-02T10:02:00Z", `{"temperature":null}`),
+	)
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/replay", bad); r.Code != http.StatusBadRequest {
+		t.Fatalf("null replay = %d, want 400", r.Code)
+	}
+	if size := len(walRaw(t, dir)); size != sizeBefore {
+		t.Fatalf("WAL grew from %d to %d bytes after rejected requests", sizeBefore, size)
+	}
+	if events := allEvents(t, h, "gw"); len(events) != 1 {
+		t.Fatalf("rejected requests left events: %+v", events)
+	}
+
+	corrected := replayBody("batch-b",
+		sample("e1", "2024-01-02T10:01:00Z", `{"temperature":1}`),
+		sample("e2", "2024-01-02T10:02:00Z", `{"temperature":2}`),
+	)
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/replay", corrected); r.Code != http.StatusAccepted {
+		t.Fatalf("corrected batch = %d, want 202", r.Code)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// After restart the corrected batch is a known idempotent receipt (200),
+	// and no trace of the rejected attempt exists.
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+	events := allEvents(t, h2, "gw")
+	if len(events) != 3 || events[1].Sequence != 2 || events[2].Sequence != 3 {
+		t.Fatalf("restored history = %+v, want sequences 1..3", events)
+	}
+	if r := doRequest(t, h2, http.MethodPost, "/v1/devices/gw/replay", corrected); r.Code != http.StatusOK {
+		t.Fatalf("repeat corrected batch after restart = %d, want 200", r.Code)
+	}
+}
+
 // --- durable mode keeps atomicity under concurrency -------------------------
 
 func TestPersistentConcurrentWrites(t *testing.T) {

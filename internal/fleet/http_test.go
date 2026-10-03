@@ -190,6 +190,78 @@ func TestTelemetryRejectsNonFiniteValues(t *testing.T) {
 	}
 }
 
+// A JSON null is not a reading of zero: it must be rejected, must not enter
+// history, must not refresh the device and must not consume a sequence.
+func TestTelemetryRejectsNullWithoutTouchingState(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":20}`); r.Code != http.StatusAccepted {
+		t.Fatalf("baseline telemetry = %d", r.Code)
+	}
+	*clock = clock.Add(time.Minute)
+
+	for _, body := range []string{
+		`{"temperature":null}`,
+		`{"temperature":null,"battery":90}`, // a valid sibling must not rescue the request
+		`{"temperature":"20"}`,
+		`{"temperature":true}`,
+		`{"temperature":false}`,
+		`{"temperature":{"c":20}}`,
+		`{"temperature":[20]}`,
+	} {
+		r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", body)
+		if r.Code != http.StatusBadRequest {
+			t.Fatalf("body %s status = %d, want 400: %s", body, r.Code, r.Body.String())
+		}
+	}
+
+	events := allEvents(t, h, "gw")
+	if len(events) != 1 || events[0].Sequence != 1 || events[0].Values["temperature"] != 20 {
+		t.Fatalf("rejected telemetry changed history: %+v", events)
+	}
+	snapshot := decodeBody[struct {
+		Devices []Device `json:"devices"`
+	}](t, doRequest(t, h, http.MethodGet, "/v1/fleet", ""))
+	dev := snapshot.Devices[0]
+	if len(dev.LastTelemetry) != 1 || dev.LastTelemetry["temperature"] != 20 {
+		t.Fatalf("lastTelemetry = %+v, want unchanged {temperature:20}", dev.LastTelemetry)
+	}
+	if dev.LastSeenAt.Equal(*clock) {
+		t.Fatalf("lastSeenAt refreshed to %s by rejected telemetry", *clock)
+	}
+
+	// Retry with a real zero: accepted, and the sequence continues at 2 — no
+	// sequence was consumed by the rejected requests. Zero, negatives, decimals
+	// and scientific notation are all finite numbers.
+	for _, body := range []string{
+		`{"temperature":0}`,
+		`{"temperature":-5}`,
+		`{"temperature":21.25}`,
+		`{"temperature":1.5e3}`,
+		`{"humidity":50}`, // no temperature field: accepted as-is, no backfill
+	} {
+		r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", body)
+		if r.Code != http.StatusAccepted {
+			t.Fatalf("valid body %s status = %d, want 202: %s", body, r.Code, r.Body.String())
+		}
+	}
+	events = allEvents(t, h, "gw")
+	if len(events) != 6 {
+		t.Fatalf("history length = %d, want 6", len(events))
+	}
+	want := []float64{20, 0, -5, 21.25, 1500, 0}
+	for i, want := range want {
+		if events[i].Sequence != int64(i+1) || events[i].Values["temperature"] != want {
+			t.Fatalf("event %d = %+v, want temperature %v at sequence %d", i, events[i], want, i+1)
+		}
+	}
+	if events[5].Values["humidity"] != 50 {
+		t.Fatalf("last event values = %+v, want humidity:50", events[5].Values)
+	}
+}
+
 // --- replay: acceptance, dedup, receipts ------------------------------------
 
 func TestReplayNewBatchReturns202AndReceipt(t *testing.T) {
@@ -416,6 +488,15 @@ func TestReplayValidationFailures(t *testing.T) {
 		"blank metric name": `{"batchId":"b","samples":[` + sample("e1", "2024-01-02T10:00:00Z", `{"  ":1}`) + `]}`,
 		"bad observedAt":    `{"batchId":"b","samples":[` + sample("e1", "not-a-time", `{"v":1}`) + `]}`,
 		"non-finite values": `{"batchId":"b","samples":[` + sample("e1", "2024-01-02T10:00:00Z", `{"v":1e999}`) + `]}`,
+		"null value":        `{"batchId":"b","samples":[` + sample("e1", "2024-01-02T10:00:00Z", `{"v":null}`) + `]}`,
+		"null beside value": `{"batchId":"b","samples":[` + sample("e1", "2024-01-02T10:00:00Z", `{"v":1,"w":null}`) + `]}`,
+		"string value":      `{"batchId":"b","samples":[` + sample("e1", "2024-01-02T10:00:00Z", `{"v":"1"}`) + `]}`,
+		"bool value":        `{"batchId":"b","samples":[` + sample("e1", "2024-01-02T10:00:00Z", `{"v":true}`) + `]}`,
+		"object value":      `{"batchId":"b","samples":[` + sample("e1", "2024-01-02T10:00:00Z", `{"v":{"n":1}}`) + `]}`,
+		"array value":       `{"batchId":"b","samples":[` + sample("e1", "2024-01-02T10:00:00Z", `{"v":[1]}`) + `]}`,
+		"null second sample": `{"batchId":"b","samples":[` +
+			sample("e1", "2024-01-02T10:00:00Z", `{"v":1}`) + `,` +
+			sample("e2", "2024-01-02T10:01:00Z", `{"v":null}`) + `]}`,
 		"duplicate eventId": `{"batchId":"b","samples":[` + good + `,` + good + `]}`,
 	}
 	for name, body := range cases {
@@ -441,6 +522,78 @@ func TestReplayValidationFailures(t *testing.T) {
 	// Failed validation must not change history.
 	if events := allEvents(t, h, "gw"); len(events) != 0 {
 		t.Fatalf("failed requests left events: %+v", events)
+	}
+}
+
+// A null anywhere in a replay batch rejects the whole batch: the valid samples
+// before it leave no events, sequences, receipts or dedup records, and device
+// state is not refreshed. The same batch/event identifiers remain usable once
+// the null is replaced by a legal number.
+func TestReplayNullValueRollsBackAndStaysRetryable(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	// A genuine zero is accepted first and keeps sequence 1.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/replay",
+		replayBody("batch-a", sample("e0", "2024-01-02T09:00:00Z", `{"temperature":0}`))); r.Code != http.StatusAccepted {
+		t.Fatalf("batch-a = %d: %s", r.Code, r.Body.String())
+	}
+	*clock = clock.Add(time.Hour)
+
+	// e1 is valid, e2 carries null: the whole batch must be rejected and e1
+	// must not survive ahead of the bad sample.
+	bad := replayBody("batch-b",
+		sample("e1", "2024-01-02T10:01:00Z", `{"temperature":1}`),
+		sample("e2", "2024-01-02T10:02:00Z", `{"temperature":null}`),
+	)
+	r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/replay", bad)
+	if r.Code != http.StatusBadRequest || !strings.Contains(r.Body.String(), "finite") {
+		t.Fatalf("null batch status = %d body = %s, want 400 about finite values", r.Code, r.Body.String())
+	}
+
+	events := allEvents(t, h, "gw")
+	if len(events) != 1 || events[0].Sequence != 1 {
+		t.Fatalf("rejected batch left events: %+v", events)
+	}
+	snapshot := decodeBody[struct {
+		Devices []Device `json:"devices"`
+	}](t, doRequest(t, h, http.MethodGet, "/v1/fleet", ""))
+	if snapshot.Devices[0].LastSeenAt.Equal(*clock) {
+		t.Fatalf("lastSeenAt refreshed by rejected batch to %s", *clock)
+	}
+	if snapshot.Devices[0].LastTelemetry["temperature"] != 0 {
+		t.Fatalf("lastTelemetry = %+v, want the earlier real zero", snapshot.Devices[0].LastTelemetry)
+	}
+
+	// A null sample reusing the event id that already recorded a real 0 is 400,
+	// not a duplicate-success: null never compares equal to stored content.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/replay",
+		replayBody("batch-c", sample("e0", "2024-01-02T09:00:00Z", `{"temperature":null}`))); r.Code != http.StatusBadRequest {
+		t.Fatalf("null reusing a known event id status = %d, want 400", r.Code)
+	}
+
+	// Same batchId and event ids with the null replaced by a legal number:
+	// accepted as a first submission (202, not 409 from a stored failed
+	// receipt), and the new sequences continue after the pre-rejection max (1).
+	retry := replayBody("batch-b",
+		sample("e1", "2024-01-02T10:01:00Z", `{"temperature":1}`),
+		sample("e2", "2024-01-02T10:02:00Z", `{"temperature":2}`),
+	)
+	r = doRequest(t, h, http.MethodPost, "/v1/devices/gw/replay", retry)
+	if r.Code != http.StatusAccepted {
+		t.Fatalf("corrected batch status = %d, want 202: %s", r.Code, r.Body.String())
+	}
+	receipt := decodeBody[receiptResponse](t, r)
+	if receipt.NewCount != 2 || receipt.DuplicateCount != 0 {
+		t.Fatalf("receipt counts = %d/%d, want 2/0 (no dedup records from the failed try)", receipt.NewCount, receipt.DuplicateCount)
+	}
+	if receipt.Samples[0].Sequence != 2 || receipt.Samples[1].Sequence != 3 {
+		t.Fatalf("sequences = %+v, want 2 and 3 continuing from the pre-rejection max", receipt.Samples)
+	}
+	events = allEvents(t, h, "gw")
+	if len(events) != 3 || events[1].Values["temperature"] != 1 || events[2].Values["temperature"] != 2 {
+		t.Fatalf("history after retry = %+v", events)
 	}
 }
 

@@ -366,19 +366,39 @@ func TestAlertTriggerSustainRecoverRetrigger(t *testing.T) {
 		t.Fatalf("missing metric changed alert: %+v", alerts[0])
 	}
 
-	// Recover at seq 5.
-	doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":24}`)
-	alerts = listAlerts(t, h, "gw", "")
-	if len(alerts) != 1 || alerts[0].Status != alertStatusEnded {
-		t.Fatalf("alerts = %+v", alerts)
+	// Explicit null is not a zero reading: the request is rejected and must not
+	// recover the alert, consume a sequence or overwrite trigger evidence.
+	nullResult := doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":null}`)
+	if nullResult.Code != http.StatusBadRequest {
+		t.Fatalf("null telemetry status = %d, want 400: %s", nullResult.Code, nullResult.Body.String())
 	}
-	if alerts[0].EndReason != endReasonRecovered || alerts[0].RecoverSequence == nil ||
-		*alerts[0].RecoverSequence != 5 || alerts[0].RecoverValue == nil ||
-		*alerts[0].RecoverValue != 24 || alerts[0].RecoverObservedAt == nil {
-		t.Fatalf("recovery fields = %+v", alerts[0])
+	alerts = listAlerts(t, h, "gw", "")
+	if len(alerts) != 1 || alerts[0].Status != alertStatusActive ||
+		alerts[0].TriggerSequence != 1 || alerts[0].TriggerValue != 32 ||
+		alerts[0].RecoverSequence != nil || alerts[0].RecoverValue != nil {
+		t.Fatalf("null reading disturbed the active alert: %+v", alerts[0])
+	}
+
+	// A real zero (finite number at/below the 25 recovery threshold) recovers
+	// under the ordinary rule, at the next contiguous sequence (5).
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/telemetry", `{"temperature":0}`); r.Code != http.StatusAccepted {
+		t.Fatalf("real zero status = %d, want 202", r.Code)
+	}
+	alerts = listAlerts(t, h, "gw", "")
+	if len(alerts) != 1 || alerts[0].Status != alertStatusEnded ||
+		alerts[0].EndReason != endReasonRecovered ||
+		alerts[0].RecoverSequence == nil || *alerts[0].RecoverSequence != 5 ||
+		alerts[0].RecoverValue == nil || *alerts[0].RecoverValue != 0 {
+		t.Fatalf("real zero should recover with sequence 5 and value 0: %+v", alerts[0])
+	}
+	if alerts[0].RecoverObservedAt == nil {
+		t.Fatalf("recovery evidence missing recoverObservedAt: %+v", alerts[0])
 	}
 	if alerts[0].EndedAt != nil {
 		t.Fatalf("recovered alert should not have endedAt: %+v", alerts[0])
+	}
+	if events := allEvents(t, h, "gw"); len(events) != 5 {
+		t.Fatalf("history length = %d, want 5 (null consumed no sequence)", len(events))
 	}
 
 	// Re-trigger produces a new alert id.
