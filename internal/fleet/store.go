@@ -597,6 +597,10 @@ func (s *Store) UpdateRule(id, ruleID string, update ruleUpdate, version int64) 
 	}
 
 	// End the active alert of the old version before publishing the new one.
+	// Everything is computed from copies first and applied to live state only
+	// after the durable commit below, so a write failure (503) leaves the old
+	// rule, its active-alert pointer and the alert itself untouched; later
+	// samples keep judging against the pre-update rule.
 	var ended []*Alert
 	if rs.activeAlertID != 0 {
 		alert := cloneAlert(*state.alerts[rs.activeAlertID-1])
@@ -605,7 +609,6 @@ func (s *Store) UpdateRule(id, ruleID string, update ruleUpdate, version int64) 
 		now := s.now().UTC()
 		alert.EndedAt = &now
 		ended = append(ended, &alert)
-		rs.activeAlertID = 0
 	}
 
 	updated.Version++
@@ -616,6 +619,9 @@ func (s *Store) UpdateRule(id, ruleID string, update ruleUpdate, version int64) 
 			return Rule{}, nil, storageUnavailable(err)
 		}
 	}
+	// Commit point passed: publish the new rule, clear the rule's active-alert
+	// pointer and end its alert as one commit unit.
+	rs.activeAlertID = 0
 	rs.rule = updated
 	for _, alert := range ended {
 		state.alerts[alert.ID-1] = alert
