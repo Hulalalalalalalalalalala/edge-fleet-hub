@@ -384,6 +384,132 @@ func TestConfigPublishValidationFailures(t *testing.T) {
 	publishConfig(t, h, "gw", `{"requestId":"ok","baseVersion":0,"config":{"o":{"x":[1,"s",true,false,null,3.5]}}}`, http.StatusCreated)
 }
 
+// Numbers outside the finite float64 range are still legal JSON numbers: they
+// must be accepted and kept as the exact literals that were submitted, in the
+// publish result, history and the simulated device's pending read.
+func TestConfigPublishPreservesOutOfRangeJSONNumbers(t *testing.T) {
+	h := NewHandler(NewStore())
+	mustRegister(t, h, "gw")
+
+	content := `{"range":1e309,"nested":{"steps":[-1e309,1e-400]}}`
+	first := publishConfig(t, h, "gw", publishBody("req-huge", 0, content), http.StatusCreated)
+	if first.Version != 1 || first.RequestID != "req-huge" {
+		t.Fatalf("first = %+v", first)
+	}
+	// The result carries the exact submitted literals: not Infinity, not 0 and
+	// not a rounded approximation.
+	if !sameJSON(first.Config, json.RawMessage(content)) || string(first.Config) != content {
+		t.Fatalf("echoed content = %s, want exact %s", first.Config, content)
+	}
+	status := getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 1 || status.AppliedVersion != 0 {
+		t.Fatalf("status after publish = %+v", status)
+	}
+
+	// History keeps the same bytes.
+	configs := listConfigs(t, h, "gw")
+	if len(configs) != 1 || string(configs[0].Config) != content {
+		t.Fatalf("history content = %+v, want %s", configs, content)
+	}
+
+	// The simulated device reads the submitted values verbatim.
+	r := getPending(t, h, "gw")
+	if r.Code != http.StatusOK {
+		t.Fatalf("pending = %d, want 200", r.Code)
+	}
+	pending := decodeBody[configViewResponse](t, r)
+	if pending.Version != 1 || string(pending.Config) != content {
+		t.Fatalf("pending content = %+v, want %s", pending, content)
+	}
+}
+
+// Dedup over out-of-range numbers keeps the exact decimal comparison: a value
+// rewrite that is the same mathematical number is a 200 retry, while a
+// different one conflicts without creating a version.
+func TestConfigDedupOutOfRangeNumbersComparesExactly(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	first := publishConfig(t, h, "gw", publishBody("req-huge", 0, `{"range":1e309}`), http.StatusCreated)
+	firstTime := first.PublishedAt
+	*clock = clock.Add(time.Hour)
+
+	// 10e308 is the same value as 1e309: idempotent retry, 200, first result.
+	retry := publishConfig(t, h, "gw", publishBody("req-huge", 0, `{ "range" : 10e308 }`), http.StatusOK)
+	if retry.Version != 1 || !retry.PublishedAt.Equal(firstTime) {
+		t.Fatalf("equal-value retry = %+v, want v1 at %s", retry, firstTime)
+	}
+	if string(retry.Config) != `{"range":1e309}` {
+		t.Fatalf("retry must keep first content, got %s", retry.Config)
+	}
+
+	// 2e309 is a different number: 409, no new version, first content intact.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("req-huge", 0, `{"range":2e309}`)); r.Code != http.StatusConflict {
+		t.Fatalf("different value = %d, want 409", r.Code)
+	}
+	status := getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 1 {
+		t.Fatalf("conflict created a version: %+v", status)
+	}
+	if configs := listConfigs(t, h, "gw"); len(configs) != 1 ||
+		string(configs[0].Config) != `{"range":1e309}` ||
+		!configs[0].PublishedAt.Equal(firstTime) {
+		t.Fatalf("conflict rewrote history: %+v", configs)
+	}
+
+	// The rejected requestId is not consumed by the failed rewrite: a corrected
+	// request under a fresh requestId publishes normally as the next version.
+	second := publishConfig(t, h, "gw", publishBody("req-next", 1, `{"range":2e309}`), http.StatusCreated)
+	if second.Version != 2 {
+		t.Fatalf("next publish version = %d, want 2", second.Version)
+	}
+}
+
+// Out-of-range numbers never make non-object or malformed configs acceptable,
+// and non-finite numeric spellings stay invalid JSON. Rejections change
+// nothing, and the requestId remains usable afterwards.
+func TestConfigOutOfRangeNumbersStillRejectInvalidShapes(t *testing.T) {
+	h := NewHandler(NewStore())
+	mustRegister(t, h, "gw")
+	cases := map[string]string{
+		"NaN":                 `{"requestId":"r","baseVersion":0,"config":{"x":NaN}}`,
+		"negative NaN":        `{"requestId":"r","baseVersion":0,"config":{"x":-NaN}}`,
+		"Infinity":            `{"requestId":"r","baseVersion":0,"config":{"x":Infinity}}`,
+		"negative Infinity":   `{"requestId":"r","baseVersion":0,"config":{"x":-Infinity}}`,
+		"nested Infinity":     `{"requestId":"r","baseVersion":0,"config":{"a":[Infinity]}}`,
+		"empty object":        `{"requestId":"r","baseVersion":0,"config":{}}`,
+		"array config":        `{"requestId":"r","baseVersion":0,"config":[1e309]}`,
+		"null config":         `{"requestId":"r","baseVersion":0,"config":null}`,
+		"huge scalar config":  `{"requestId":"r","baseVersion":0,"config":1e309}`,
+		"huge empty-ish body": `{"requestId":"r","baseVersion":0,"config":{"x":1e309}} {"x":2}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs", body); r.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", r.Code, r.Body.String())
+			}
+		})
+	}
+
+	// Nothing was published...
+	status := getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 0 || status.AppliedVersion != 0 {
+		t.Fatalf("rejections changed status: %+v", status)
+	}
+	if configs := listConfigs(t, h, "gw"); len(configs) != 0 {
+		t.Fatalf("rejections created history: %+v", configs)
+	}
+	if r := getPending(t, h, "gw"); r.Code != http.StatusNoContent {
+		t.Fatalf("pending after rejections = %d, want 204", r.Code)
+	}
+
+	// ...and the requestId from a rejected attempt is free for a valid publish.
+	publishConfig(t, h, "gw",
+		`{"requestId":"r","baseVersion":0,"config":{"x":1e309}}`, http.StatusCreated)
+}
+
 func TestConfigUnknownDeviceIs404(t *testing.T) {
 	h := NewHandler(NewStore())
 	if r := doRequest(t, h, http.MethodPost, "/v1/devices/ghost/configs",

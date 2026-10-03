@@ -93,7 +93,6 @@ func TestPersistentRestartRestoresConfigState(t *testing.T) {
 }
 
 // --- recovered configs and dedup records keep exact numbers ------------------
-
 func TestPersistentRestartKeepsConfigNumbersExact(t *testing.T) {
 	dir := t.TempDir()
 	store := openPersistent(t, dir)
@@ -138,8 +137,6 @@ func TestPersistentRestartKeepsConfigNumbersExact(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-
-
 
 func TestPersistentConfigWriteFailureReturns503(t *testing.T) {
 	dir := t.TempDir()
@@ -196,6 +193,68 @@ func TestPersistentConfigWriteFailureReturns503(t *testing.T) {
 	status = getConfigStatus(t, h, "gw")
 	if status.AppliedVersion != 1 {
 		t.Fatalf("applied after retry = %d, want 1", status.AppliedVersion)
+	}
+}
+
+// Numbers beyond the finite float64 range survive a restart exactly as
+// submitted: recovery must not reject them (valid on the way in, valid on the
+// way back out) and must not turn them into Infinity, zero or rounded values.
+func TestPersistentRestartKeepsOutOfRangeConfigNumbers(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	content := `{"range":1e309,"nested":{"steps":[-1e309,1e-400]}}`
+	first := publishConfig(t, h, "gw", publishBody("r-huge", 0, content), http.StatusCreated)
+	if first.Version != 1 {
+		t.Fatalf("first = %+v", first)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	// Target/applied state and the exact content are restored.
+	status := getConfigStatus(t, h2, "gw")
+	if status.TargetVersion != 1 || status.AppliedVersion != 0 {
+		t.Fatalf("status after restart = %+v", status)
+	}
+	configs := listConfigs(t, h2, "gw")
+	if len(configs) != 1 || string(configs[0].Config) != content {
+		t.Fatalf("recovered content = %+v, want exact %s", configs, content)
+	}
+	r := doRequest(t, h2, http.MethodGet, "/v1/devices/gw/configs/pending", "")
+	if r.Code != http.StatusOK {
+		t.Fatalf("pending after restart = %d, want 200", r.Code)
+	}
+	pending := decodeBody[configViewResponse](t, r)
+	if string(pending.Config) != content {
+		t.Fatalf("pending after restart = %s, want %s", pending.Config, content)
+	}
+
+	// The recovered dedup record still uses exact decimal comparison: the same
+	// mathematical value in different notation retries as 200 with the first
+	// result; a different value conflicts without a new version.
+	retry := publishConfig(t, h2, "gw",
+		publishBody("r-huge", 0, `{"range":10e308,"nested":{"steps":[-10e308,10e-401]}}`), http.StatusOK)
+	if retry.Version != 1 || !retry.PublishedAt.Equal(first.PublishedAt) {
+		t.Fatalf("retry after restart = %+v, want v1 at %s", retry, first.PublishedAt)
+	}
+	if string(retry.Config) != content {
+		t.Fatalf("retry rewrote stored content: %s", retry.Config)
+	}
+	if r := doRequest(t, h2, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("r-huge", 0, `{"range":2e309}`)); r.Code != http.StatusConflict {
+		t.Fatalf("different value after restart = %d, want 409", r.Code)
+	}
+	if status := getConfigStatus(t, h2, "gw"); status.TargetVersion != 1 {
+		t.Fatalf("conflict after restart created a version: %+v", status)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
