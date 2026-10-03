@@ -675,6 +675,157 @@ func TestConfigReceiptDedup(t *testing.T) {
 	postReceipt(t, h, "gw", receiptBody("rc-f", 1, false, "boom"), http.StatusOK)
 }
 
+// --- failure reason reflects the most recently received failure that still
+// concerns an unapplied version ----------------------------------------------
+
+// TestConfigFailureReasonTracksLatestStillUnappliedReceipt walks the full
+// regression scenario: receipts may arrive out of version order, an applied
+// version's failure must stop mattering (without wiping newer failures), and
+// clearing the current reason never deletes the receipt history.
+func TestConfigFailureReasonTracksLatestStillUnappliedReceipt(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	publishConfig(t, h, "gw", publishBody("r1", 0, `{"v":1}`), http.StatusCreated)
+	publishConfig(t, h, "gw", publishBody("r2", 1, `{"v":2}`), http.StatusCreated)
+	publishConfig(t, h, "gw", publishBody("r3", 2, `{"v":3}`), http.StatusCreated)
+
+	// Nothing applied yet. The v3 failure arrives first: receipt order, not
+	// version order, decides the displayed reason.
+	failV3 := postReceipt(t, h, "gw", receiptBody("rc-fail-3", 3, false, "存储空间不足"), http.StatusCreated)
+	if s := getConfigStatus(t, h, "gw"); s.TargetVersion != 3 || s.AppliedVersion != 0 || s.FailureReason != "存储空间不足" {
+		t.Fatalf("after v3 failure status = %+v, want target=3 applied=0 reason=存储空间不足", s)
+	}
+
+	// A later-received failure for the lower, still-unapplied v2 wins. It must
+	// not be chosen by highest version.
+	*clock = clock.Add(time.Minute)
+	failV2 := postReceipt(t, h, "gw", receiptBody("rc-fail-2", 2, false, "配置校验失败"), http.StatusCreated)
+	if s := getConfigStatus(t, h, "gw"); s.TargetVersion != 3 || s.AppliedVersion != 0 || s.FailureReason != "配置校验失败" {
+		t.Fatalf("after v2 failure status = %+v, want reason=配置校验失败 (most recently received)", s)
+	}
+
+	// Re-submitting an already-received failure: 200 with the FIRST receive
+	// time, no new entry, and its receive-order position must not move. So the
+	// current reason stays the v2 failure even though the v3 receipt was resent.
+	*clock = clock.Add(time.Minute)
+	retryV3 := postReceipt(t, h, "gw", receiptBody("rc-fail-3", 3, false, "存储空间不足"), http.StatusOK)
+	if !retryV3.ReceivedAt.Equal(failV3.ReceivedAt) {
+		t.Fatalf("v3 retry receivedAt = %s, want first %s", retryV3.ReceivedAt, failV3.ReceivedAt)
+	}
+	if s := getConfigStatus(t, h, "gw"); s.AppliedVersion != 0 || s.FailureReason != "配置校验失败" {
+		t.Fatalf("v3 retry changed reason: %+v", s)
+	}
+	receipts := listConfigReceipts(t, h, "gw")
+	if len(receipts) != 2 || receipts[0].ReceiptID != "rc-fail-3" || receipts[1].ReceiptID != "rc-fail-2" {
+		t.Fatalf("v3 retry changed receive order: %+v", receipts)
+	}
+
+	// v2 applies successfully. Its failure becomes irrelevant and the reason
+	// falls back to the still-pending v3 failure; one success must not clear
+	// every failure. Target stays 3 and the device can still pull v3.
+	*clock = clock.Add(time.Minute)
+	postReceipt(t, h, "gw", receiptBody("rc-ok-2", 2, true, ""), http.StatusCreated)
+	if s := getConfigStatus(t, h, "gw"); s.TargetVersion != 3 || s.AppliedVersion != 2 || s.FailureReason != "存储空间不足" {
+		t.Fatalf("after v2 applied status = %+v, want target=3 applied=2 reason=存储空间不足", s)
+	}
+	r := getPending(t, h, "gw")
+	if r.Code != http.StatusOK {
+		t.Fatalf("pending = %d, want 200 (v3 still pending)", r.Code)
+	}
+	if pending := decodeBody[configViewResponse](t, r); pending.Version != 3 || string(pending.Config) != `{"v":3}` {
+		t.Fatalf("pending view = %+v, want v3", pending)
+	}
+
+	// After v2 succeeded, replaying its old failure receipt is still the
+	// idempotent 200: a stale reason must not reappear in the status.
+	*clock = clock.Add(time.Minute)
+	retryV2 := postReceipt(t, h, "gw", receiptBody("rc-fail-2", 2, false, "配置校验失败"), http.StatusOK)
+	if !retryV2.ReceivedAt.Equal(failV2.ReceivedAt) {
+		t.Fatalf("v2 retry receivedAt = %s, want first %s", retryV2.ReceivedAt, failV2.ReceivedAt)
+	}
+	if s := getConfigStatus(t, h, "gw"); s.AppliedVersion != 2 || s.FailureReason != "存储空间不足" {
+		t.Fatalf("stale v2 failure resurfaced: %+v", s)
+	}
+
+	// A NEW receiptId reporting a failure for the already-applied v2 is 409 and
+	// changes neither applied version, current reason nor stored receipts.
+	conflict := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs/receipts",
+		receiptBody("rc-fail-2-new", 2, false, "配置校验失败"))
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("new failure for applied v2 = %d, want 409: %s", conflict.Code, conflict.Body.String())
+	}
+	if s := getConfigStatus(t, h, "gw"); s.TargetVersion != 3 || s.AppliedVersion != 2 || s.FailureReason != "存储空间不足" {
+		t.Fatalf("409 receipt changed status: %+v", s)
+	}
+	if receipts := listConfigReceipts(t, h, "gw"); len(receipts) != 3 {
+		t.Fatalf("409 receipt was stored: %+v", receipts)
+	}
+
+	// v3 applies: the reason clears and pending goes 204 with an empty body.
+	postReceipt(t, h, "gw", receiptBody("rc-ok-3", 3, true, ""), http.StatusCreated)
+	if s := getConfigStatus(t, h, "gw"); s.TargetVersion != 3 || s.AppliedVersion != 3 || s.FailureReason != "" {
+		t.Fatalf("after v3 applied status = %+v, want target=3 applied=3 empty reason", s)
+	}
+	if r := getPending(t, h, "gw"); r.Code != http.StatusNoContent || r.Body.Len() != 0 {
+		t.Fatalf("pending = %d body=%q, want 204 empty", r.Code, r.Body.String())
+	}
+
+	// Clearing the current reason does not delete history: every receipt,
+	// including the two failures, is still listed in first-receive order.
+	receipts = listConfigReceipts(t, h, "gw")
+	wantIDs := []string{"rc-fail-3", "rc-fail-2", "rc-ok-2", "rc-ok-3"}
+	if len(receipts) != len(wantIDs) {
+		t.Fatalf("receipts = %+v, want %v", receipts, wantIDs)
+	}
+	for i, id := range wantIDs {
+		if receipts[i].ReceiptID != id {
+			t.Fatalf("receipt order[%d] = %s, want %s (full: %+v)", i, receipts[i].ReceiptID, id, receipts)
+		}
+	}
+}
+
+// TestConfigFailureReasonIgnoredWhenVersionAppliedBeforeReceiptArrives pins
+// the receive-order-vs-version-order rule from the other direction: a failure
+// for a version that succeeds first must never surface, while a failure for a
+// newer version keeps the reason even though it was received earlier.
+func TestConfigFailureReasonIgnoredWhenVersionAppliedBeforeReceiptArrives(t *testing.T) {
+	h := NewHandler(NewStore())
+	mustRegister(t, h, "gw")
+	publishConfig(t, h, "gw", publishBody("r1", 0, `{"v":1}`), http.StatusCreated)
+	publishConfig(t, h, "gw", publishBody("r2", 1, `{"v":2}`), http.StatusCreated)
+
+	// v2 fails first (received earliest), then v1 applies. The v2 failure
+	// remains relevant because v2 is still unapplied.
+	postReceipt(t, h, "gw", receiptBody("rc-fail-2", 2, false, "v2 broke"), http.StatusCreated)
+	postReceipt(t, h, "gw", receiptBody("rc-ok-1", 1, true, ""), http.StatusCreated)
+	if s := getConfigStatus(t, h, "gw"); s.TargetVersion != 2 || s.AppliedVersion != 1 || s.FailureReason != "v2 broke" {
+		t.Fatalf("status = %+v, want applied=1 reason=v2 broke", s)
+	}
+
+	// A late new failure for the already-applied v1 conflicts and must not
+	// replace the v2 reason.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs/receipts",
+		receiptBody("rc-fail-1-late", 1, false, "v1 old")); r.Code != http.StatusConflict {
+		t.Fatalf("late v1 failure = %d, want 409", r.Code)
+	}
+	if s := getConfigStatus(t, h, "gw"); s.AppliedVersion != 1 || s.FailureReason != "v2 broke" {
+		t.Fatalf("409 receipt changed status: %+v", s)
+	}
+
+	// v2 applying clears the reason outright even though its failure receipt
+	// was the oldest one in the list.
+	postReceipt(t, h, "gw", receiptBody("rc-ok-2", 2, true, ""), http.StatusCreated)
+	if s := getConfigStatus(t, h, "gw"); s.AppliedVersion != 2 || s.FailureReason != "" {
+		t.Fatalf("status after v2 applied = %+v, want empty reason", s)
+	}
+	// The failure remains in history.
+	receipts := listConfigReceipts(t, h, "gw")
+	if len(receipts) != 3 || receipts[0].ReceiptID != "rc-fail-2" {
+		t.Fatalf("history changed: %+v", receipts)
+	}
+}
+
 // --- isolation and ordering --------------------------------------------------
 
 func TestConfigVersionsAndDedupArePerDevice(t *testing.T) {
