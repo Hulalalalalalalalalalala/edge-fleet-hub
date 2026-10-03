@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 )
@@ -89,6 +90,75 @@ func TestPersistentRestartRestoresConfigState(t *testing.T) {
 	status = getConfigStatus(t, h3, "gw")
 	if status.TargetVersion != 2 || status.AppliedVersion != 2 || status.FailureReason != "" {
 		t.Fatalf("status after second restart = %+v", status)
+	}
+}
+
+// --- restart keeps exact numeric content and dedup semantics ------------------
+
+func TestPersistentRestartPreservesExactNumbersAndDedup(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	// Numbers chosen so float64 decoding would merge them or round them away:
+	// two distinct integers above 2^53, and a nonzero value below float64's
+	// smallest positive number.
+	first := publishConfig(t, h, "gw", publishBody("r1", 0,
+		`{"big":9007199254740993,"tiny":1e-400,"nested":{"a":[9007199254740992,0.1]}}`), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	// Stored digits must come back byte-for-byte: nothing may be reparsed
+	// through float64 and rounded on the way out.
+	configs := listConfigs(t, h2, "gw")
+	if len(configs) != 1 {
+		t.Fatalf("configs after restart = %+v", configs)
+	}
+	wantContent := `{"big":9007199254740993,"tiny":1e-400,"nested":{"a":[9007199254740992,0.1]}}`
+	if !sameJSON(configs[0].Config, json.RawMessage(wantContent)) {
+		t.Fatalf("content after restart = %s, want %s", configs[0].Config, wantContent)
+	}
+	if string(configs[0].Config) != wantContent {
+		t.Fatalf("digits were rewritten on save: %s", configs[0].Config)
+	}
+
+	// An equivalent spelling retried after restart still returns the first
+	// result (200, original version/time) ...
+	retry := publishConfig(t, h2, "gw", publishBody("r1", 0,
+		`{"big":9.007199254740993e15,"tiny":0.01e-398,"nested":{"a":[9007199254740992.0,0.10000000000000000]}}`), http.StatusOK)
+	if retry.Version != first.Version || !retry.PublishedAt.Equal(configs[0].PublishedAt) {
+		t.Fatalf("retry = %+v, want first v%d at %s", retry, first.Version, configs[0].PublishedAt)
+	}
+	// ... while any actually different number conflicts even after recovery.
+	for _, changed := range []string{
+		`{"big":9007199254740992,"tiny":1e-400,"nested":{"a":[9007199254740992,0.1]}}`,
+		`{"big":9007199254740993,"tiny":0,"nested":{"a":[9007199254740992,0.1]}}`,
+		`{"big":9007199254740993,"tiny":1e-400,"nested":{"a":[9007199254740992,0.10000000000000001]}}`,
+	} {
+		if r := doRequest(t, h2, http.MethodPost, "/v1/devices/gw/configs",
+			publishBody("r1", 0, changed)); r.Code != http.StatusConflict {
+			t.Fatalf("changed number after restart => %d, want 409: %s", r.Code, changed)
+		}
+	}
+	// Same requestId with another baseVersion still conflicts.
+	if r := doRequest(t, h2, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("r1", 1, wantContent)); r.Code != http.StatusConflict {
+		t.Fatalf("changed base after restart => %d, want 409", r.Code)
+	}
+	// The rejected retries must not have created a version or moved the target.
+	if status := getConfigStatus(t, h2, "gw"); status.TargetVersion != 1 || status.AppliedVersion != 0 {
+		t.Fatalf("state changed by rejected retries: %+v", status)
+	}
+	if configs := listConfigs(t, h2, "gw"); len(configs) != 1 {
+		t.Fatalf("a rejected retry created a version: %+v", configs)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

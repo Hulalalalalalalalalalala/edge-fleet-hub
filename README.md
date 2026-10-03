@@ -234,7 +234,10 @@ curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/configs \
   `requestId` with the same base and content returns `200` with the first
   result, never a new version. Same id but a different base or content is
   `409`. Equality ignores object key order and whitespace, compares numbers by
-  value, and keeps array order significant.
+  their exact mathematical value as written in decimal (so `1`, `1.0`, `1e0`
+  and `-0` are equal, but distinct integers beyond `2^53` and a nonzero value
+  below float64 range such as `1e-400` are never rounded into another number),
+  and keeps array order significant.
 
 The simulated device reads only the newest target — old versions are never
 delivered one by one:

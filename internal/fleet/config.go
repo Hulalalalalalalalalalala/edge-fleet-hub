@@ -1,8 +1,11 @@
 package fleet
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"math/big"
 	"time"
 )
 
@@ -339,14 +342,42 @@ func isNonEmptyJSONObject(raw json.RawMessage) bool {
 }
 
 // sameJSON compares two JSON documents semantically: object key order and
-// insignificant whitespace are ignored, numbers compare by value, and array
-// element order is significant.
+// insignificant whitespace are ignored, array element order is significant,
+// and numbers compare by their exact mathematical value. Numbers are decoded
+// as json.Number and compared through math/big, so distinct integers above
+// 2^53 and a subnormal value such as 1e-400 never collapse together through
+// float64 rounding, while equivalent spellings of one value (1, 1.0, 1e0,
+// -0) remain equal.
 func sameJSON(a, b json.RawMessage) bool {
-	var av, bv any
-	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+	av, err := decodeJSONValue(a)
+	if err != nil {
+		return false
+	}
+	bv, err := decodeJSONValue(b)
+	if err != nil {
 		return false
 	}
 	return jsonValueEqual(av, bv)
+}
+
+// decodeJSONValue decodes exactly one JSON value, preserving number literals
+// instead of coercing them to float64. Trailing bytes after the value are an
+// error, matching json.Unmarshal.
+func decodeJSONValue(raw json.RawMessage) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("document contains more than one JSON value")
+		}
+		return nil, err
+	}
+	return value, nil
 }
 
 func jsonValueEqual(a, b any) bool {
@@ -374,11 +405,12 @@ func jsonValueEqual(a, b any) bool {
 			}
 		}
 		return true
-	case float64:
-		// Both sides decode through encoding/json, so every JSON number is a
-		// float64; == is the numeric value comparison.
-		bv, ok := b.(float64)
-		return ok && av == bv
+	case json.Number:
+		// Numbers keep their exact decimal literal (UseNumber), so compare the
+		// rational values precisely: no float64 precision loss or underflow,
+		// while 1, 1.0 and 1e0 stay equal.
+		bv, ok := b.(json.Number)
+		return ok && jsonNumbersEqual(av, bv)
 	case string:
 		bv, ok := b.(string)
 		return ok && av == bv
@@ -390,4 +422,13 @@ func jsonValueEqual(a, b any) bool {
 	default:
 		return false
 	}
+}
+
+// jsonNumbersEqual reports whether two JSON number literals name the same
+// mathematical value. math/big accepts every JSON number form (integer,
+// fraction and exponent, including magnitudes far outside float64 range).
+func jsonNumbersEqual(a, b json.Number) bool {
+	ra, okA := new(big.Rat).SetString(string(a))
+	rb, okB := new(big.Rat).SetString(string(b))
+	return okA && okB && ra.Cmp(rb) == 0
 }

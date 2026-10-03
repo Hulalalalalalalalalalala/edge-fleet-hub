@@ -510,6 +510,150 @@ func TestConfigReceiptDedup(t *testing.T) {
 	postReceipt(t, h, "gw", receiptBody("rc-f", 1, false, "boom"), http.StatusOK)
 }
 
+// --- exact numeric equality for publish dedup --------------------------------
+
+func TestConfigDedupDistinguishesNumbersByExactDecimalValue(t *testing.T) {
+	h := NewHandler(NewStore())
+	mustRegister(t, h, "gw")
+
+	changed := []struct {
+		name  string
+		base  string
+		retry string
+	}{
+		{"integers above 2^53 swapped", `{"n":[9007199254740992,9007199254740993]}`, `{"n":[9007199254740993,9007199254740992]}`},
+		{"integers above 2^53 in nested object", `{"o":{"n":9007199254740992}}`, `{"o":{"n":9007199254740993}}`},
+		{"0.1 gains a trailing ulp", `{"x":0.1}`, `{"x":0.10000000000000001}`},
+		{"zero becomes a subnormal", `{"x":0}`, `{"x":1e-400}`},
+		{"subnormal becomes zero", `{"x":1e-400}`, `{"x":0}`},
+		{"deeply nested tiny fraction", `{"a":[{"b":[{"c":0}]}]}`, `{"a":[{"b":[{"c":1e-400}]}]}`},
+		{"number versus string of the same digits", `{"x":1}`, `{"x":"1"}`},
+		{"large integer versus the float64 it rounds to", `{"x":9007199254740993}`, `{"x":9007199254740992}`},
+	}
+	for i, tc := range changed {
+		t.Run(tc.name, func(t *testing.T) {
+			reqID := fmt.Sprintf("change-%d", i)
+			publishConfig(t, h, "gw", publishBody(reqID, int64(i), tc.base), http.StatusCreated)
+			if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+				publishBody(reqID, int64(i), tc.retry)); r.Code != http.StatusConflict {
+				t.Fatalf("changed number status = %d, want 409: %s", r.Code, r.Body.String())
+			}
+			// The rejected reuse must not replace stored content: a real retry
+			// of the original body still succeeds with 200.
+			publishConfig(t, h, "gw", publishBody(reqID, int64(i), tc.base), http.StatusOK)
+		})
+	}
+
+	// Every rejected attempt above shared its request's version, so exactly one
+	// version per case exists and no 409 consumed a version.
+	configs := listConfigs(t, h, "gw")
+	if len(configs) != len(changed) {
+		t.Fatalf("versions = %d, want %d (409 retries must not create versions)", len(configs), len(changed))
+	}
+
+	// Equivalent spellings of the same mathematical value are still retries.
+	equivalents := []struct {
+		name  string
+		first string
+		retry string
+	}{
+		{"integer decimal point and exponent", `{"x":1}`, `{"x":1.0}`},
+		{"integer exponent", `{"x":1}`, `{"x":1e0}`},
+		{"signed zero", `{"x":0}`, `{"x":-0}`},
+		{"zero trailing fraction", `{"x":0}`, `{"x":0.000}`},
+		{"large integer as exponent", `{"x":9007199254740993}`, `{"x":9.007199254740993e15}`},
+		{"mixed forms inside array", `{"n":[1,0,2.5]}`, `{"n":[1e0,-0,2.5000]}`},
+	}
+	for i, tc := range equivalents {
+		t.Run("equivalent/"+tc.name, func(t *testing.T) {
+			reqID := fmt.Sprintf("equal-%d", i)
+			base := int64(len(changed) + i)
+			first := publishConfig(t, h, "gw", publishBody(reqID, base, tc.first), http.StatusCreated)
+			retry := publishConfig(t, h, "gw", publishBody(reqID, base, tc.retry), http.StatusOK)
+			if retry.Version != first.Version || !retry.PublishedAt.Equal(first.PublishedAt) {
+				t.Fatalf("retry = %+v, want first result %+v", retry, first)
+			}
+			// The stored content keeps the ORIGINAL spelling; the retry must not
+			// rewrite history.
+			got := listConfigs(t, h, "gw")[retry.Version-1]
+			if !sameJSON(got.Config, json.RawMessage(tc.first)) {
+				t.Fatalf("stored content = %s, want original %s", got.Config, tc.first)
+			}
+		})
+	}
+}
+
+func TestConfigDedupConflictLeavesVersionContentAndTimeUntouched(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+
+	first := publishConfig(t, h, "gw", publishBody("req-1", 0, `{"x":9007199254740992}`), http.StatusCreated)
+	firstTime := clock.UTC()
+
+	*clock = clock.Add(2 * time.Hour)
+	// Same requestId, changed number: 409 and no state change whatsoever.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("req-1", 0, `{"x":9007199254740993}`)); r.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", r.Code, r.Body.String())
+	}
+	status := getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 1 || status.AppliedVersion != 0 {
+		t.Fatalf("status after conflict = %+v, want target 1 applied 0", status)
+	}
+	configs := listConfigs(t, h, "gw")
+	if len(configs) != 1 || string(configs[0].Config) != `{"x":9007199254740992}` ||
+		!configs[0].PublishedAt.Equal(firstTime) {
+		t.Fatalf("stored v1 altered by conflict: %+v", configs)
+	}
+	// Apply v1, then try the conflicting number again; application state must
+	// not move.
+	postReceipt(t, h, "gw", receiptBody("rc-1", 1, true, ""), http.StatusCreated)
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("req-1", 0, `{"x":9007199254740993}`)); r.Code != http.StatusConflict {
+		t.Fatalf("status after apply = %d, want 409", r.Code)
+	}
+	status = getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 1 || status.AppliedVersion != 1 {
+		t.Fatalf("status = %+v, want target/applied 1/1", status)
+	}
+
+	// A legitimate retry still returns the first version, content and time.
+	retry := publishConfig(t, h, "gw", publishBody("req-1", 0, `{ "x" : 9007199254740992.0 }`), http.StatusOK)
+	if retry.Version != first.Version || string(retry.Config) != `{"x":9007199254740992}` ||
+		!retry.PublishedAt.Equal(firstTime) {
+		t.Fatalf("retry result = %+v, want first v1 at %s", retry, firstTime)
+	}
+}
+
+func TestConfigDedupRetryOfOldRequestReturnsFirstResultAfterNewerVersions(t *testing.T) {
+	h := NewHandler(NewStore())
+	mustRegister(t, h, "gw")
+
+	first := publishConfig(t, h, "gw", publishBody("req-1", 0, `{"x":1e-400}`), http.StatusCreated)
+	publishConfig(t, h, "gw", publishBody("req-2", 1, `{"x":2}`), http.StatusCreated)
+	postReceipt(t, h, "gw", receiptBody("rc-1", 1, true, ""), http.StatusCreated)
+	postReceipt(t, h, "gw", receiptBody("rc-2", 2, true, ""), http.StatusCreated)
+
+	// The device has since moved to v2; retrying the original request (same
+	// requestId and baseVersion 0) must still answer with the FIRST result and
+	// not publish anything or roll the target back.
+	retry := publishConfig(t, h, "gw", publishBody("req-1", 0, `{"x":0.001e-397}`), http.StatusOK)
+	if retry.Version != first.Version || !retry.PublishedAt.Equal(first.PublishedAt) ||
+		string(retry.Config) != `{"x":1e-400}` {
+		t.Fatalf("old retry = %+v, want first result %+v", retry, first)
+	}
+	status := getConfigStatus(t, h, "gw")
+	if status.TargetVersion != 2 || status.AppliedVersion != 2 {
+		t.Fatalf("old retry moved state: %+v, want target/applied 2/2", status)
+	}
+	// Same requestId with a changed baseVersion conflicts even with same content.
+	if r := doRequest(t, h, http.MethodPost, "/v1/devices/gw/configs",
+		publishBody("req-1", 1, `{"x":1e-400}`)); r.Code != http.StatusConflict {
+		t.Fatalf("changed base = %d, want 409", r.Code)
+	}
+}
+
 // --- isolation and ordering --------------------------------------------------
 
 func TestConfigVersionsAndDedupArePerDevice(t *testing.T) {
