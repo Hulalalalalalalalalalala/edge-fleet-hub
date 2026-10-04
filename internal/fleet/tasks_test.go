@@ -724,6 +724,132 @@ func TestTaskClaimConcurrent(t *testing.T) {
 	}
 }
 
+// Legal JSON numbers beyond the float64 range (1e309, -1e309, 1e-400),
+// including inside nested objects and arrays, are accepted on a success
+// report, kept byte-for-byte in both the receipt and the task detail, and
+// compared by exact decimal value on retries.
+func TestTaskReportResultNumbersBeyondFloatRange(t *testing.T) {
+	store, clock := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+
+	const result = `{"scale":1e309,"detail":{"offset":1e-400},"neg":-1e309,"samples":[1e309,1e-400,{}]}`
+	report := reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", result), http.StatusCreated)
+	if string(report.Result) != result {
+		t.Fatalf("receipt result = %s, want exact %s", report.Result, result)
+	}
+	if !report.ReceivedAt.Equal(clock.UTC()) {
+		t.Fatalf("receivedAt = %s, want %s", report.ReceivedAt, clock.UTC())
+	}
+
+	task := getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "succeeded" || task.CompletedAt == nil {
+		t.Fatalf("task after success: %+v", task)
+	}
+	if string(task.Result) != result {
+		t.Fatalf("stored task result = %s, want exact %s", task.Result, result)
+	}
+
+	// Same receiptId: key order, insignificant whitespace and an equal-valued
+	// spelling (10e308 == 1e309) are not a different report -> 200 with the
+	// first saved receipt and receivedAt.
+	*clock = clock.Add(time.Second)
+	retry := reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-1", claim.Credential, true, "",
+			`{ "samples" : [ 1e309 , 1e-400 , {} ] , "neg": -10e308, "scale": 10e308, "detail": {"offset": 1e-400}}`),
+		http.StatusOK)
+	if string(retry.Result) != result || !retry.ReceivedAt.Equal(report.ReceivedAt) {
+		t.Fatalf("retry = %+v, want first receipt %+v", retry, report)
+	}
+
+	// A different out-of-range magnitude -> 409 and the saved result stands.
+	reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"scale":2e309,"detail":{"offset":1e-400}}`),
+		http.StatusConflict)
+	// A tiny-but-nonzero value must not be conflated with zero -> 409.
+	reportTask(t, h, "dev-1", 1,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"scale":1e309,"detail":{"offset":0}}`),
+		http.StatusConflict)
+	if got := getTask(t, h, "dev-1", 1, http.StatusOK); string(got.Result) != result {
+		t.Fatalf("conflict changed stored result to %s", got.Result)
+	}
+	// Neither the replay nor the conflicts completed the task a second time.
+	if got := joinEvents(eventsOf(listAudit(t, h, "dev-1", 1))); got != "created,claimed,succeeded" {
+		t.Fatalf("audit = %s, want created,claimed,succeeded", got)
+	}
+
+	// Array element order stays significant even for beyond-range values.
+	createTask(t, h, "dev-1", taskBody("req-order", 30), http.StatusCreated)
+	claim2 := claimTask(t, h, "dev-1", http.StatusOK)
+	reportTask(t, h, "dev-1", claim2.Task.ID,
+		reportBody("rcpt-order", claim2.Credential, true, "", `{"a":[1e309,2e309]}`), http.StatusCreated)
+	reportTask(t, h, "dev-1", claim2.Task.ID,
+		reportBody("rcpt-order", claim2.Credential, true, "", `{"a":[2e309,1e309]}`), http.StatusConflict)
+	reportTask(t, h, "dev-1", claim2.Task.ID,
+		reportBody("rcpt-order", claim2.Credential, true, "", `{"a":[1e309,2e309]}`), http.StatusOK)
+
+	// The empty object remains a valid success result.
+	createTask(t, h, "dev-1", taskBody("req-empty", 30), http.StatusCreated)
+	claim3 := claimTask(t, h, "dev-1", http.StatusOK)
+	reportTask(t, h, "dev-1", claim3.Task.ID,
+		reportBody("rcpt-empty", claim3.Credential, true, "", `{}`), http.StatusCreated)
+	if task := getTask(t, h, "dev-1", claim3.Task.ID, http.StatusOK); task.Status != "succeeded" || string(task.Result) != "{}" {
+		t.Fatalf("empty-object success: %+v", task)
+	}
+}
+
+// Results that are not exactly one JSON object stay rejected: missing result,
+// a top-level array or null, and non-JSON NaN/Infinity tokens all return 400,
+// complete nothing and do not occupy the receiptId. With the credential and
+// deadline still valid, the corrected report is then accepted.
+func TestTaskReportInvalidResultRejected(t *testing.T) {
+	store, _ := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+
+	path := fmt.Sprintf("/v1/devices/dev-1/tasks/%d/reports", claim.Task.ID)
+	invalid := []string{
+		// Missing result.
+		fmt.Sprintf(`{"receiptId":"rcpt-1","credential":%q,"success":true}`, claim.Credential),
+		// Top-level array.
+		reportBody("rcpt-1", claim.Credential, true, "", "[]"),
+		// Top-level null.
+		reportBody("rcpt-1", claim.Credential, true, "", "null"),
+		// NaN / Infinity are not JSON, including nested inside the object.
+		fmt.Sprintf(`{"receiptId":"rcpt-1","credential":%q,"success":true,"result":{"x":NaN}}`, claim.Credential),
+		fmt.Sprintf(`{"receiptId":"rcpt-1","credential":%q,"success":true,"result":{"x":Infinity}}`, claim.Credential),
+		fmt.Sprintf(`{"receiptId":"rcpt-1","credential":%q,"success":true,"result":-Infinity}`, claim.Credential),
+	}
+	for _, body := range invalid {
+		if r := doRequest(t, h, http.MethodPost, path, body); r.Code != http.StatusBadRequest {
+			t.Fatalf("invalid report %q: status = %d, want 400: %s", body, r.Code, r.Body.String())
+		}
+	}
+
+	// The rejected submissions changed nothing: the attempt is still live with
+	// its credential and deadline, and no audit record was appended.
+	task := getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "in_progress" || task.Deadline == nil || task.CompletedAt != nil {
+		t.Fatalf("invalid reports disturbed the task: %+v", task)
+	}
+	if got := joinEvents(eventsOf(listAudit(t, h, "dev-1", claim.Task.ID))); got != "created,claimed" {
+		t.Fatalf("audit after invalid reports = %s, want created,claimed", got)
+	}
+
+	// The receiptId was not occupied: corrected content on the still-valid
+	// attempt is accepted as the first report.
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"scale":1e309}`), http.StatusCreated)
+	if task := getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK); task.Status != "succeeded" {
+		t.Fatalf("corrected report did not succeed: %+v", task)
+	}
+}
+
 func TestTaskReportCredentialChecks(t *testing.T) {
 	store, _ := newClockStore()
 	h := NewHandler(store)

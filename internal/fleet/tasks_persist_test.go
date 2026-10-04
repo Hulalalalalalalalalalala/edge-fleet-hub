@@ -132,6 +132,68 @@ func TestPersistentTaskReportRestores(t *testing.T) {
 	}
 }
 
+// A success result carrying legal numbers beyond the float64 range (1e309,
+// -1e309, 1e-400, also nested) is persisted byte-for-byte and recovered
+// exactly. After reopening the directory the receipt retry/conflict rules
+// still compare by exact decimal value and the task detail keeps the result.
+func TestPersistentTaskReportOutOfRangeNumbersRestores(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createTask(t, h, "gw", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "gw", http.StatusOK)
+	const result = `{"scale":1e309,"detail":{"offset":1e-400},"neg":-1e309,"samples":[1e309,1e-400]}`
+	first := reportTask(t, h, "gw", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", result), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	// The task and its result recover exactly, with no float conversion.
+	task := getTask(t, h2, "gw", 1, http.StatusOK)
+	if task.Status != "succeeded" || task.CompletedAt == nil {
+		t.Fatalf("task after restart = %+v", task)
+	}
+	if string(task.Result) != result {
+		t.Fatalf("result after restart = %s, want exact %s", task.Result, result)
+	}
+
+	// Equal-valued spelling and key order replay the first receipt with its
+	// original receivedAt; a changed out-of-range magnitude or a subnormal
+	// value equated with zero still conflict and do not overwrite the result.
+	retry := reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", "stale-credential", true, "",
+			`{"samples":[10e308,10e-401],"neg":-1e309,"detail":{"offset":1e-400},"scale":1e309}`),
+		http.StatusOK)
+	if string(retry.Result) != result || !retry.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("retry after restart = %+v, want first receipt %+v", retry, first)
+	}
+	reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", "stale-credential", true, "", `{"scale":2e309}`), http.StatusConflict)
+	reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", "stale-credential", true, "",
+			`{"scale":1e309,"detail":{"offset":0}}`), http.StatusConflict)
+	if got := getTask(t, h2, "gw", 1, http.StatusOK); string(got.Result) != result {
+		t.Fatalf("conflict after restart overwrote result: %s", got.Result)
+	}
+
+	// Closing and reopening once more still yields the exact saved result.
+	if err := store2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store3 := reopenPersistent(t, dir)
+	h3 := NewHandler(store3)
+	if got := getTask(t, h3, "gw", 1, http.StatusOK); string(got.Result) != result {
+		t.Fatalf("result after second restart = %s, want exact %s", got.Result, result)
+	}
+	reportTask(t, h3, "gw", 1,
+		reportBody("rcpt-1", "stale-credential", true, "", result), http.StatusOK)
+}
+
 func TestPersistentTaskFailureRestores(t *testing.T) {
 	dir := t.TempDir()
 	store := openPersistent(t, dir)
