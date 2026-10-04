@@ -614,6 +614,210 @@ Task creation has its own validation: a blank `requestId`, a missing
 `requestId` with the same duration is an idempotent retry (`200`, first task
 returned) and with a different duration is `409`.
 
+### When an attempt runs past its deadline
+
+A claim that never reports a result is not retried for the device: once the
+attempt passes its `deadline`, the execution credential is invalidated and the
+task sits in `waiting` until the simulated device claims it again. Deadline
+expiry is applied lazily — the first task detail, list, audit, claim or report
+call after the deadline makes it visible — but it is attributed to the deadline
+instant itself, so checking back much later never restarts the wait. Timeouts
+and device-reported failures (`success:false`) draw on one shared failure
+count: the first two failures each put the task back to `waiting` with a
+one-second and then a two-second wait, and the third ends it as `failed`.
+
+One registered device and one fresh five-second task walk through every state.
+Create it just like the task above and note the returned `id`; on a server that
+has already run the earlier examples the succeeded task keeps id 1 and this one
+is 2, while on a fresh server it is 1 — substitute the id from the response
+everywhere `2` appears below:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"diag-2026-10-04-2","durationSeconds":5}'
+# 201 ->
+# {"id":2,"requestId":"diag-2026-10-04-2","durationSeconds":5,
+#  "status":"pending","attempts":0,"createdAt":"...","nextClaimableAt":"..."}
+```
+
+A claim only ever returns a `pending` or `waiting` task, so the already
+succeeded task 1 is never handed out again. Save four values from the claim
+response — `task.id`, `credential`, `deadline` and `attempt`:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# 200 ->
+# {"task":{"id":2,"requestId":"diag-2026-10-04-2","durationSeconds":5,
+#    "status":"in_progress","attempts":1,"createdAt":"...",
+#    "claimedAt":"2026-10-04T10:00:00Z","deadline":"2026-10-04T10:00:05Z"},
+#  "attempt":1,
+#  "credential":"74402d3fd861b02d5465416c610536e0",
+#  "deadline":"2026-10-04T10:00:05Z"}
+```
+
+Do not send a report. Once the deadline is strictly past, read the task:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/2
+# 200 ->
+# {"id":2,"requestId":"diag-2026-10-04-2","durationSeconds":5,
+#  "status":"waiting","attempts":1,"createdAt":"...",
+#  "nextClaimableAt":"2026-10-04T10:00:06Z",
+#  "failureReason":"deadline exceeded"}
+```
+
+- `status` is `waiting`: the attempt is over and the device is free to take
+  work again. The view no longer carries `claimedAt` or `deadline`, and the
+  credential is gone — it can never be presented again.
+- `failureReason` is `deadline exceeded`.
+- `attempts` is still 1 — it counts claims, and this task has been claimed
+  once.
+- `nextClaimableAt` is the original deadline plus one second
+  (`10:00:05Z` → `10:00:06Z`). The wait runs from the deadline, not from this
+  query; the call only reveals an expiry that has already happened. Querying
+  hours later shows the same instant instead of restarting the wait, and
+  repeating detail, list or audit queries never records the timeout twice or
+  adds another audit record.
+
+The audit trail gains one `timed_out` record stamped at the deadline itself:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/2/audit
+# 200 ->
+# {"audit":[
+#   {"seq":1,"event":"created","toStatus":"pending", ...},
+#   {"seq":2,"event":"claimed","fromStatus":"pending",
+#    "toStatus":"in_progress","attempt":1,"at":"2026-10-04T10:00:00Z"},
+#   {"seq":3,"event":"timed_out","fromStatus":"in_progress",
+#    "toStatus":"waiting","attempt":1,"at":"2026-10-04T10:00:05Z",
+#    "reason":"deadline exceeded"}]}
+```
+
+`GET /v1/devices/{id}/tasks` shows the same `waiting` object inside its
+`{"tasks":[...]}` envelope.
+
+#### Re-claiming after the wait
+
+While the clock is still before `nextClaimableAt`, a claim answers `204 No
+Content` — the task exists, it is simply not claimable yet:
+
+```bash
+# while still before 2026-10-04T10:00:06Z
+curl -sS -w '\nHTTP %{http_code}\n' -X POST \
+  http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# HTTP 204
+```
+
+From `nextClaimableAt` on, the device must actively claim the same task again;
+nothing delivers it automatically. The second claim returns `200` with a
+brand-new credential and deadline, and `attempts`/`attempt` are now 2:
+
+```bash
+# at or after 2026-10-04T10:00:06Z
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# 200 ->
+# {"task":{"id":2,...,"status":"in_progress","attempts":2,
+#    "claimedAt":"2026-10-04T10:00:06Z","deadline":"2026-10-04T10:00:11Z",
+#    "failureReason":"deadline exceeded"},
+#  "attempt":2,
+#  "credential":"2594411ed720295a3045ccd25ac69f7f",
+#  "deadline":"2026-10-04T10:00:11Z"}
+```
+
+The embedded task still shows the previous failure's `failureReason`; it is
+replaced when this attempt ends. If the device's first post-deadline action
+happens after `nextClaimableAt` (it never queried during the wait), this claim
+returns `200` immediately — the backoff is never measured from query time. The
+next result must be submitted with this attempt's credential; the attempt-1
+credential is permanently invalid.
+
+#### Old credentials and the deadline boundary
+
+A first-time report presented with the old, timed-out credential — even one
+carrying a result that was never accepted — is rejected with `409`; no result
+is saved and the `receiptId` is not occupied:
+
+```bash
+curl -sS -w '\nHTTP %{http_code}\n' -X POST \
+  http://127.0.0.1:8080/v1/devices/gateway-01/tasks/2/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rc-retry-1",
+       "credential":"74402d3fd861b02d5465416c610536e0",
+       "success":true,"result":{"ok":true}}'
+# 409 -> {"error":"diagnostic task conflict"}
+```
+
+Because the request failed the credential/deadline check, the number was never
+bound, so the same `receiptId` remains usable on a later, valid attempt (see
+below). The deadline instant itself is inclusive, not past: a **first** report
+carrying the live credential exactly at `deadline` is still accepted with
+`201` — only a strictly later instant counts as expired. An already-accepted
+receipt instead keeps replaying after the deadline, as described under
+[Retrying after a lost response](#retrying-after-a-lost-response).
+
+#### Three failures end the task
+
+Timeouts and `success:false` reports accumulate into one failure count. On
+attempt 2 the device reports a failure of its own rather than going quiet; the
+reused `diag-rc-retry-1` is accepted because the earlier rejection never bound
+it:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/2/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rc-retry-1",
+       "credential":"2594411ed720295a3045ccd25ac69f7f",
+       "success":false,"reason":"sensor unreachable"}'
+# 201 ->
+# {"receiptId":"diag-rc-retry-1","success":false,
+#  "reason":"sensor unreachable",
+#  "receivedAt":"2026-10-04T10:00:07Z"}
+
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/2
+# 200 ->
+# {"id":2,...,"status":"waiting","attempts":2,
+#  "nextClaimableAt":"2026-10-04T10:00:09Z",
+#  "failureReason":"sensor unreachable"}
+```
+
+This is failure 2 (the timeout was failure 1), so the wait is two seconds
+measured from the report's `receivedAt` (`10:00:07Z` → `10:00:09Z`), and the
+device's own reason replaces `deadline exceeded`. The matching audit record is
+`failed` rather than `timed_out` and carries no `fromStatus`:
+
+```bash
+# {"seq":5,"event":"failed","toStatus":"waiting","attempt":2,
+#  "at":"2026-10-04T10:00:07Z","reason":"sensor unreachable"}
+```
+
+Claim attempt 3 at or after `10:00:09Z` — `attempts` becomes 3 with yet
+another credential and deadline — and let it expire too:
+
+```bash
+# at or after 2026-10-04T10:00:09Z
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# 200 ->
+# {"task":{"id":2,...,"status":"in_progress","attempts":3,
+#    "claimedAt":"2026-10-04T10:00:09Z","deadline":"2026-10-04T10:00:14Z"},
+#  "attempt":3,"credential":"99abf8c35dbf8798eccb964f0bb9a9d9",
+#  "deadline":"2026-10-04T10:00:14Z"}
+
+# after 2026-10-04T10:00:14Z
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/2
+# 200 ->
+# {"id":2,...,"status":"failed","attempts":3,
+#  "failureReason":"deadline exceeded",
+#  "completedAt":"2026-10-04T10:00:14Z"}
+```
+
+The third failure ends the task. A timeout-caused completion takes that
+attempt's deadline as `completedAt`, not the query time; a device-reported
+third failure would instead take its report time. The final audit record is
+`timed_out` or `failed` with `toStatus` `failed`. From then on the task is no
+longer claimable — every later claim answers `204` — and reports against it
+conflict with `409`.
+
 ## Persistence and restart
 
 Without `EDGE_FLEET_DATA_DIR`, everything (devices, events, sequences, batch
