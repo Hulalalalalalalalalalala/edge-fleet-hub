@@ -84,3 +84,27 @@ Usage:
 
 缺少 `--output`、路径为空、重复指定 `--output` 或出现不支持的参数时，
 报用法错误（退出码 2）且不生成任何文件。
+
+## 回归测试
+
+`tests/` 提供 `keygen` 的自动化回归保障，覆盖：成功生成（恰好 32 字节
+原始数据、权限 0600——即使在宽松的 umask 下、路径含空格、密钥内容不进入
+标准输出/标准错误/测试报告）、各类已存在目标的拒绝（普通文件、零长度
+文件、目录、符号链接、悬空符号链接，且目标内容与权限保持原样），以及
+创建后写入/同步/关闭失败时的报错与不完整文件清理（经 LD_PRELOAD 故障
+注入模拟；部分写入后补齐仍应得到完整密钥）。
+
+构建后通过 CTest 运行：
+
+```sh
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+也可以直接运行测试驱动脚本：
+
+```sh
+python3 tests/run_keygen_regression.py \
+    --binary build/envelopefile \
+    --fault-inject build/libkeygen_fault_inject.so
+```
