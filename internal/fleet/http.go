@@ -194,7 +194,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "from must be RFC3339 formatted"})
 			return
 		}
-		filter.From = from.UTC()
+		filter.From = utcTimePtr(from)
 	}
 	if raw := strings.TrimSpace(query.Get("to")); raw != "" {
 		to, err := time.Parse(time.RFC3339, raw)
@@ -202,9 +202,9 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to must be RFC3339 formatted"})
 			return
 		}
-		filter.To = to.UTC()
+		filter.To = utcTimePtr(to)
 	}
-	if !filter.From.IsZero() && !filter.To.IsZero() && filter.From.After(filter.To) {
+	if filter.From != nil && filter.To != nil && filter.From.After(*filter.To) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "from must not be after to"})
 		return
 	}
@@ -230,7 +230,7 @@ func (h *handler) history(w http.ResponseWriter, r *http.Request) {
 		}
 		cursor, err := decodeCursor(rawCursor)
 		if err != nil || cursor.DeviceID != id ||
-			!cursor.From.Equal(filter.From) || !cursor.To.Equal(filter.To) ||
+			!sameTimePtr(cursor.From, filter.From) || !sameTimePtr(cursor.To, filter.To) ||
 			!bytes.Equal(cursor.IID, h.store.instanceID()) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 			return

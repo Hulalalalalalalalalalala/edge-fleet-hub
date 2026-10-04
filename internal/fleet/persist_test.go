@@ -547,7 +547,7 @@ func TestPersistentReplayIsOneCommitUnit(t *testing.T) {
 		DeviceID: "gw",
 		BatchID:  "lost",
 		Samples: []walSample{
-			{EventID: "l1", ObservedAt: time.Date(2024, 1, 4, 0, 0, 0, 0, time.UTC), Values: map[string]float64{"v": 4}},
+			{EventID: "l1", ObservedAt: utcTimePtr(time.Date(2024, 1, 4, 0, 0, 0, 0, time.UTC)), Values: map[string]float64{"v": 4}},
 		},
 		Receipt: ReplayReceipt{
 			BatchID:      "lost",

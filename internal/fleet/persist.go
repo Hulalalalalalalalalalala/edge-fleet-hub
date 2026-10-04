@@ -100,14 +100,121 @@ type walTelemetry struct {
 	// Alerts and Ended carry the alert changes judged from this sample, in the
 	// same commit unit as the sample itself. Absent in records written before
 	// alerting existed.
-	Alerts []*Alert `json:"alerts,omitempty"`
-	Ended  []*Alert `json:"ended,omitempty"`
+	Alerts []*walAlert `json:"alerts,omitempty"`
+	Ended  []*walAlert `json:"ended,omitempty"`
 }
 
+// walSample is the on-disk form of one replayed sample. ObservedAt is a
+// pointer so recovery can tell a present time equal to time.Time's zero value
+// (0001-01-01T00:00:00Z, a valid RFC3339 instant) apart from a missing or null
+// field: a committed sample always carries a non-nil time, while a damaged
+// record missing the field decodes to nil and is rejected. A malformed string
+// already fails JSON decoding.
 type walSample struct {
 	EventID    string             `json:"eventId"`
-	ObservedAt time.Time          `json:"observedAt"`
+	ObservedAt *time.Time         `json:"observedAt"`
 	Values     map[string]float64 `json:"values"`
+}
+
+// walAlert is the on-disk form of an Alert. TriggerObservedAt is a pointer for
+// the same presence-versus-year-one reason as walSample.ObservedAt: a stored
+// alert always carries the triggering sample's captured time. The optional
+// recovery/end times are already pointers (nil when the alert is still open).
+type walAlert struct {
+	ID                int64      `json:"id"`
+	RuleID            string     `json:"ruleId"`
+	RuleVersion       int64      `json:"ruleVersion"`
+	Metric            string     `json:"metric"`
+	Trigger           float64    `json:"trigger"`
+	Recover           float64    `json:"recover"`
+	Status            string     `json:"status"`
+	TriggerSequence   int64      `json:"triggerSequence"`
+	TriggerValue      float64    `json:"triggerValue"`
+	TriggerObservedAt *time.Time `json:"triggerObservedAt"`
+	RecoverSequence   *int64     `json:"recoverSequence,omitempty"`
+	RecoverValue      *float64   `json:"recoverValue,omitempty"`
+	RecoverObservedAt *time.Time `json:"recoverObservedAt,omitempty"`
+	EndedAt           *time.Time `json:"endedAt,omitempty"`
+	EndReason         string     `json:"endReason,omitempty"`
+	AcknowledgedAt    *time.Time `json:"acknowledgedAt,omitempty"`
+}
+
+func utcTimePtr(t time.Time) *time.Time {
+	u := t.UTC()
+	return &u
+}
+
+func utcPtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	return utcTimePtr(*t)
+}
+
+// alertsToWal converts domain alerts to their presence-aware on-disk form.
+func alertsToWal(alerts []*Alert) []*walAlert {
+	if alerts == nil {
+		return nil
+	}
+	out := make([]*walAlert, len(alerts))
+	for i, alert := range alerts {
+		if alert == nil {
+			continue
+		}
+		out[i] = &walAlert{
+			ID:                alert.ID,
+			RuleID:            alert.RuleID,
+			RuleVersion:       alert.RuleVersion,
+			Metric:            alert.Metric,
+			Trigger:           alert.Trigger,
+			Recover:           alert.Recover,
+			Status:            alert.Status,
+			TriggerSequence:   alert.TriggerSequence,
+			TriggerValue:      alert.TriggerValue,
+			TriggerObservedAt: utcTimePtr(alert.TriggerObservedAt),
+			RecoverSequence:   alert.RecoverSequence,
+			RecoverValue:      alert.RecoverValue,
+			RecoverObservedAt: utcPtr(alert.RecoverObservedAt),
+			EndedAt:           utcPtr(alert.EndedAt),
+			EndReason:         alert.EndReason,
+			AcknowledgedAt:    utcPtr(alert.AcknowledgedAt),
+		}
+	}
+	return out
+}
+
+// toAlert converts an on-disk alert to the domain form. The trigger time
+// pointer is dereferenced; callers must have validated it as non-nil.
+func (w *walAlert) toAlert() *Alert {
+	return &Alert{
+		ID:                w.ID,
+		RuleID:            w.RuleID,
+		RuleVersion:       w.RuleVersion,
+		Metric:            w.Metric,
+		Trigger:           w.Trigger,
+		Recover:           w.Recover,
+		Status:            w.Status,
+		TriggerSequence:   w.TriggerSequence,
+		TriggerValue:      w.TriggerValue,
+		TriggerObservedAt: w.TriggerObservedAt.UTC(),
+		RecoverSequence:   w.RecoverSequence,
+		RecoverValue:      w.RecoverValue,
+		RecoverObservedAt: utcPtr(w.RecoverObservedAt),
+		EndedAt:           utcPtr(w.EndedAt),
+		EndReason:         w.EndReason,
+		AcknowledgedAt:    utcPtr(w.AcknowledgedAt),
+	}
+}
+
+func walAlertsToAlerts(alerts []*walAlert) []*Alert {
+	if alerts == nil {
+		return nil
+	}
+	out := make([]*Alert, len(alerts))
+	for i, alert := range alerts {
+		out[i] = alert.toAlert()
+	}
+	return out
 }
 
 // walReplay is one committed batch. Samples holds the full ordered batch
@@ -123,8 +230,8 @@ type walReplay struct {
 	TrimThrough   int64              `json:"trimThrough,omitempty"`
 	LastSeenAt    *time.Time         `json:"lastSeenAt,omitempty"`
 	LastTelemetry map[string]float64 `json:"lastTelemetry,omitempty"`
-	Alerts        []*Alert           `json:"alerts,omitempty"`
-	Ended         []*Alert           `json:"ended,omitempty"`
+	Alerts        []*walAlert        `json:"alerts,omitempty"`
+	Ended         []*walAlert        `json:"ended,omitempty"`
 }
 
 // walRetention is one committed retention setting. TrimThrough is the
@@ -139,9 +246,9 @@ type walRetention struct {
 // walRule is one committed rule create or update. Ended holds the alerts the
 // update terminated with reason rule_changed, in the same commit unit.
 type walRule struct {
-	DeviceID string   `json:"deviceId"`
-	Rule     Rule     `json:"rule"`
-	Ended    []*Alert `json:"ended,omitempty"`
+	DeviceID string      `json:"deviceId"`
+	Rule     Rule        `json:"rule"`
+	Ended    []*walAlert `json:"ended,omitempty"`
 }
 
 // walAlertAck is one committed alert acknowledgment.
@@ -600,8 +707,10 @@ func validateTrim(state *deviceState, trimThrough, recordMaxSeq, limit int64) er
 
 // applyAlertRecord validates and applies the alert changes carried by a
 // telemetry or replay record. It rejects relational inconsistency so a damaged
-// WAL fails startup rather than producing broken alert state.
-func applyAlertRecord(state *deviceState, created, ended []*Alert) error {
+// WAL fails startup rather than producing broken alert state. A present
+// trigger time equal to the zero instant (0001-01-01T00:00:00Z) is valid;
+// only a missing or null one is rejected.
+func applyAlertRecord(state *deviceState, created, ended []*walAlert) error {
 	wantID := int64(len(state.alerts)) + 1
 	for _, alert := range created {
 		if alert == nil {
@@ -611,7 +720,7 @@ func applyAlertRecord(state *deviceState, created, ended []*Alert) error {
 			return fmt.Errorf("alert create id mismatch: got %d, want %d", alert.ID, wantID)
 		}
 		if alert.Status != alertStatusActive || alert.RuleID == "" || alert.Metric == "" ||
-			alert.TriggerSequence <= 0 || alert.TriggerObservedAt.IsZero() {
+			alert.TriggerSequence <= 0 || alert.TriggerObservedAt == nil {
 			return fmt.Errorf("alert %d create is incomplete", alert.ID)
 		}
 		wantID++
@@ -627,8 +736,12 @@ func applyAlertRecord(state *deviceState, created, ended []*Alert) error {
 		if alert.Status != alertStatusEnded || alert.EndReason != endReasonRecovered {
 			return fmt.Errorf("alert %d end is malformed", alert.ID)
 		}
+		if alert.TriggerObservedAt == nil || alert.RecoverSequence == nil ||
+			alert.RecoverObservedAt == nil {
+			return fmt.Errorf("alert %d recovery is missing trigger or recovery evidence", alert.ID)
+		}
 	}
-	applyAlertChanges(state, created, ended)
+	applyAlertChanges(state, walAlertsToAlerts(created), walAlertsToAlerts(ended))
 	return nil
 }
 
@@ -716,19 +829,20 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 		lastNew := -1
 		for i, entry := range rec.Samples {
 			status := rec.Receipt.SampleStatus[i]
-			if entry.EventID == "" || entry.ObservedAt.IsZero() || len(entry.Values) == 0 {
+			if entry.EventID == "" || entry.ObservedAt == nil || len(entry.Values) == 0 {
 				return fmt.Errorf("device %q batch %q sample %d is incomplete", rec.DeviceID, rec.BatchID, i)
 			}
 			if status.EventID != entry.EventID {
 				return fmt.Errorf("device %q batch %q receipt/sample eventId mismatch at %d", rec.DeviceID, rec.BatchID, i)
 			}
+			observedAt := entry.ObservedAt.UTC()
 			samples[i] = Sample{
 				EventID:    entry.EventID,
-				ObservedAt: entry.ObservedAt.UTC(),
+				ObservedAt: observedAt,
 				Values:     cloneTelemetry(entry.Values),
 			}
 			if known, seen := state.known[entry.EventID]; seen {
-				if !sameInstant(known.observedAt, entry.ObservedAt) || !sameValues(known.values, entry.Values) {
+				if !sameInstant(known.observedAt, observedAt) || !sameValues(known.values, entry.Values) {
 					return fmt.Errorf("device %q dedupe record for %q disagrees with stored sample", rec.DeviceID, entry.EventID)
 				}
 				if !status.Duplicate || status.Sequence != known.sequence {
@@ -746,12 +860,12 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			}
 			state.events = append(state.events, Event{
 				Sequence:   status.Sequence,
-				ObservedAt: entry.ObservedAt.UTC(),
+				ObservedAt: observedAt,
 				Values:     cloneTelemetry(entry.Values),
 			})
 			state.known[entry.EventID] = knownSample{
 				sequence:   status.Sequence,
-				observedAt: entry.ObservedAt.UTC(),
+				observedAt: observedAt,
 				values:     cloneTelemetry(entry.Values),
 			}
 			newCount++
@@ -832,13 +946,17 @@ func applyRecord(s *Store, recType byte, payload []byte) error {
 			state.rules[rec.Rule.ID] = &ruleState{rule: rec.Rule}
 		}
 		for _, alert := range rec.Ended {
-			if alert == nil || alert.ID < 1 || int(alert.ID) > len(state.alerts) {
+			if alert == nil {
+				return fmt.Errorf("device %q rule %q ends a null alert", rec.DeviceID, rec.Rule.ID)
+			}
+			if alert.ID < 1 || int(alert.ID) > len(state.alerts) {
 				return fmt.Errorf("device %q rule %q ends unknown alert", rec.DeviceID, rec.Rule.ID)
 			}
-			if alert.Status != alertStatusEnded || alert.EndReason != endReasonRuleChanged || alert.EndedAt == nil {
+			if alert.Status != alertStatusEnded || alert.EndReason != endReasonRuleChanged || alert.EndedAt == nil ||
+				alert.TriggerObservedAt == nil {
 				return fmt.Errorf("device %q rule %q end of alert %d is malformed", rec.DeviceID, rec.Rule.ID, alert.ID)
 			}
-			state.alerts[alert.ID-1] = alert
+			state.alerts[alert.ID-1] = alert.toAlert()
 			if rs, ok := state.rules[alert.RuleID]; ok && rs.activeAlertID == alert.ID {
 				rs.activeAlertID = 0
 			}

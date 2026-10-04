@@ -122,11 +122,13 @@ type SampleStatus struct {
 	Duplicate bool   `json:"duplicate"`
 }
 
-// HistoryFilter narrows a history query by observed-time range. Zero times mean
-// the bound is open.
+// HistoryFilter narrows a history query by observed-time range. Nil bounds are
+// open. A pointer to time.Time's zero value (0001-01-01T00:00:00Z) is a real
+// bound, not an open one, so captured times at the earliest RFC3339 instant
+// can still be filtered exactly.
 type HistoryFilter struct {
-	From time.Time
-	To   time.Time
+	From *time.Time
+	To   *time.Time
 }
 
 // StoredBatch records the ordered samples an accepted batchId committed along
@@ -342,8 +344,8 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 			ObservedAt:  now,
 			Values:      values,
 			TrimThrough: trimThrough,
-			Alerts:      eval.created,
-			Ended:       eval.ended,
+			Alerts:      alertsToWal(eval.created),
+			Ended:       alertsToWal(eval.ended),
 		}); err != nil {
 			return Device{}, storageUnavailable(err)
 		}
@@ -454,13 +456,13 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 			Samples:     make([]walSample, len(samples)),
 			Receipt:     receipt,
 			TrimThrough: trimThrough,
-			Alerts:      eval.created,
-			Ended:       eval.ended,
+			Alerts:      alertsToWal(eval.created),
+			Ended:       alertsToWal(eval.ended),
 		}
 		for i, sample := range samples {
 			record.Samples[i] = walSample{
 				EventID:    sample.EventID,
-				ObservedAt: sample.ObservedAt,
+				ObservedAt: utcTimePtr(sample.ObservedAt),
 				Values:     sample.Values,
 			}
 		}
@@ -621,7 +623,7 @@ func (s *Store) UpdateRule(id, ruleID string, update ruleUpdate, version int64) 
 	updated.UpdatedAt = s.now().UTC()
 
 	if s.wal != nil {
-		if err := s.wal.appendRecord(recRule, walRule{DeviceID: id, Rule: updated, Ended: ended}); err != nil {
+		if err := s.wal.appendRecord(recRule, walRule{DeviceID: id, Rule: updated, Ended: alertsToWal(ended)}); err != nil {
 			return Rule{}, nil, storageUnavailable(err)
 		}
 	}
@@ -911,10 +913,10 @@ func (s *Store) History(id string, filter HistoryFilter, startSeq, bound int64, 
 	events = make([]Event, 0, limit)
 	for seq := startSeq; seq <= bound; seq++ {
 		event := state.events[seq-1-state.eventBase]
-		if !filter.From.IsZero() && event.ObservedAt.Before(filter.From) {
+		if filter.From != nil && event.ObservedAt.Before(*filter.From) {
 			continue
 		}
-		if !filter.To.IsZero() && event.ObservedAt.After(filter.To) {
+		if filter.To != nil && event.ObservedAt.After(*filter.To) {
 			continue
 		}
 		if len(events) < limit {
@@ -962,6 +964,15 @@ func cloneTelemetry(values map[string]float64) map[string]float64 {
 
 // sameInstant compares times as UTC instants.
 func sameInstant(a, b time.Time) bool {
+	return a.UTC().Equal(b.UTC())
+}
+
+// sameTimePtr compares optional times: nil equals nil, otherwise UTC instants
+// must match.
+func sameTimePtr(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
 	return a.UTC().Equal(b.UTC())
 }
 

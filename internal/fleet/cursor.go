@@ -14,13 +14,13 @@ import (
 // history endpoint. It pins the device, filter and first-page high-water mark
 // so a paged walk cannot see rows written after the first page.
 type pageCursor struct {
-	DeviceID  string    `json:"d"`
-	From      time.Time `json:"f,omitempty"`
-	To        time.Time `json:"t,omitempty"`
-	HighWater int64     `json:"h"`
-	StartSeq  int64     `json:"s"`           // first receive sequence the next page scans
-	IID       []byte    `json:"i,omitempty"` // data-directory instance scope
-	Version   int       `json:"v,omitempty"` // cursor format version; 0 = legacy index cursor
+	DeviceID  string     `json:"d"`
+	From      *time.Time `json:"f,omitempty"`
+	To        *time.Time `json:"t,omitempty"`
+	HighWater int64      `json:"h"`
+	StartSeq  int64      `json:"s"`           // first receive sequence the next page scans
+	IID       []byte     `json:"i,omitempty"` // data-directory instance scope
+	Version   int        `json:"v,omitempty"` // cursor format version; 0 = legacy index cursor
 }
 
 var cursorSecret = []byte("edge-fleet-hub-history-cursor-v1")
@@ -58,12 +58,12 @@ func decodeCursor(raw string) (pageCursor, error) {
 		// Those predate trimming, so event base was 0 and index p maps to
 		// sequence p+1.
 		var legacy struct {
-			DeviceID  string    `json:"d"`
-			From      time.Time `json:"f,omitempty"`
-			To        time.Time `json:"t,omitempty"`
-			HighWater int64     `json:"h"`
-			ScanPos   int64     `json:"p"`
-			IID       []byte    `json:"i,omitempty"`
+			DeviceID  string     `json:"d"`
+			From      *time.Time `json:"f,omitempty"`
+			To        *time.Time `json:"t,omitempty"`
+			HighWater int64      `json:"h"`
+			ScanPos   int64      `json:"p"`
+			IID       []byte     `json:"i,omitempty"`
 		}
 		if err := json.Unmarshal(payload, &legacy); err != nil {
 			return pageCursor{}, errors.New("invalid cursor")
