@@ -339,11 +339,11 @@ func (s *Store) RecordTelemetry(id string, values map[string]float64) (Device, e
 		if err := s.wal.appendRecord(recTelemetry, walTelemetry{
 			DeviceID:    id,
 			Sequence:    sequence,
-			ObservedAt:  now,
+			ObservedAt:  newWalTime(now),
 			Values:      values,
 			TrimThrough: trimThrough,
-			Alerts:      eval.created,
-			Ended:       eval.ended,
+			Alerts:      toWALAlerts(eval.created),
+			Ended:       toWALAlerts(eval.ended),
 		}); err != nil {
 			return Device{}, storageUnavailable(err)
 		}
@@ -454,13 +454,13 @@ func (s *Store) Replay(id, batchID string, samples []Sample) (receipt ReplayRece
 			Samples:     make([]walSample, len(samples)),
 			Receipt:     receipt,
 			TrimThrough: trimThrough,
-			Alerts:      eval.created,
-			Ended:       eval.ended,
+			Alerts:      toWALAlerts(eval.created),
+			Ended:       toWALAlerts(eval.ended),
 		}
 		for i, sample := range samples {
 			record.Samples[i] = walSample{
 				EventID:    sample.EventID,
-				ObservedAt: sample.ObservedAt,
+				ObservedAt: newWalTime(sample.ObservedAt),
 				Values:     sample.Values,
 			}
 		}
