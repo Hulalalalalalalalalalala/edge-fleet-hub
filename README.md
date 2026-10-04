@@ -818,6 +818,160 @@ third failure would instead take its report time. The final audit record is
 longer claimable — every later claim answers `204` — and reports against it
 conflict with `409`.
 
+### Canceling a task
+
+A task that is no longer needed can be ended actively instead of waiting for a
+result or for its deadline. `POST /v1/devices/{id}/tasks/{taskId}/cancel`
+ends the task immediately. It is an operator action, not a device report: the
+request needs **no execution credential and no request body** — the task
+number in the URL is enough. Canceling also releases the device's single
+execution slot, so another claimable task can be taken immediately without
+waiting for the canceled attempt's deadline.
+
+The walk below uses the already-registered `gateway-01` and two fresh tasks.
+On a server that has already run the earlier examples the succeeded and failed
+tasks keep ids 1 and 2, so these two are 3 and 4; on a fresh server they are
+1 and 2. Take every number from the create or claim response and substitute
+it wherever `3` or `4` appears below — do not assume a task is id 1 and do
+not reuse a task that has already ended.
+
+Create a task and claim it, noting `task.id` and the claim's `deadline`
+(which shows how long the execution stays valid):
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"diag-2026-10-04-3","durationSeconds":30}'
+# 201 ->
+# {"id":3,"requestId":"diag-2026-10-04-3","durationSeconds":30,
+#  "status":"pending","attempts":0,"createdAt":"...","nextClaimableAt":"..."}
+
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# 200 ->
+# {"task":{"id":3,"requestId":"diag-2026-10-04-3","durationSeconds":30,
+#    "status":"in_progress","attempts":1,"createdAt":"...",
+#    "claimedAt":"2026-10-04T10:02:00Z","deadline":"2026-10-04T10:02:30Z"},
+#  "attempt":1,
+#  "credential":"5f2c8a91e04b4d63b1c7f9a2e6d40cb8",
+#  "deadline":"2026-10-04T10:02:30Z"}
+```
+
+The claim returns the new task — the already ended tasks are never handed out
+again. Prepare a second task on the same device while the first is executing:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"diag-2026-10-04-4","durationSeconds":30}'
+# 201 ->
+# {"id":4,"requestId":"diag-2026-10-04-4","durationSeconds":30,
+#  "status":"pending","attempts":0,"createdAt":"...","nextClaimableAt":"..."}
+```
+
+Task 4 already satisfies the claim conditions on its own, but only one task
+per device can be in progress, so a claim while task 3 is still running
+answers `204 No Content`:
+
+```bash
+# while task 3 is still in progress
+curl -sS -w '\nHTTP %{http_code}\n' -X POST \
+  http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# HTTP 204
+```
+
+While task 3 is still inside its execution period (before `10:02:30Z`),
+cancel it using the id returned by the claim — no body and no credential:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/3/cancel
+# 200 ->
+# {"id":3,"requestId":"diag-2026-10-04-3","durationSeconds":30,
+#  "status":"canceled","attempts":1,"createdAt":"...",
+#  "completedAt":"2026-10-04T10:02:05Z"}
+```
+
+- `status` is `canceled` and `completedAt` is the server time of the
+  successful cancel.
+- `attempts` keeps its previous value (1) — canceling is not a claim and adds
+  no attempt.
+- The view no longer carries `claimedAt` or `deadline`, and the claim
+  credential is invalidated.
+
+The detail endpoint returns the same canceled view, and the audit trail gains
+one `canceled` record after the earlier create and claim records:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/3
+# 200 -> the same {"status":"canceled",...,"completedAt":"..."} object
+
+curl -sS http://127.0.0.1:8080/v1/devices/gateway-01/tasks/3/audit
+# 200 ->
+# {"audit":[
+#   {"seq":1,"event":"created","toStatus":"pending", ...},
+#   {"seq":2,"event":"claimed","fromStatus":"pending",
+#    "toStatus":"in_progress","attempt":1,"at":"2026-10-04T10:02:00Z"},
+#   {"seq":3,"event":"canceled","fromStatus":"in_progress",
+#    "toStatus":"canceled","at":"2026-10-04T10:02:05Z"}]}
+```
+
+Canceling released the device, so the next claim immediately delivers task 4,
+the other task whose claim conditions were already met. The canceled task 3 is
+terminal and is never handed out again:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/claim
+# 200 ->
+# {"task":{"id":4,"requestId":"diag-2026-10-04-4","durationSeconds":30,
+#    "status":"in_progress","attempts":1, ...},
+#  "attempt":1,
+#  "credential":"7d9e0f3a6b2c41e8a5d9f0c1b3e7246a",
+#  "deadline":"..."}
+```
+
+Which tasks can be canceled, and the failure branches:
+
+- `pending`, `waiting` and `in_progress` tasks can all be canceled — before
+  the first claim, between two attempts, or mid-execution.
+- Canceling an already `canceled` task is an idempotent retry: it returns
+  `200` with the original result. The original `completedAt` is kept and no
+  second `canceled` audit record is added:
+
+  ```bash
+  curl -sS -X POST http://127.0.0.1:8080/v1/devices/gateway-01/tasks/3/cancel
+  # 200 -> the same canceled view with the same completedAt
+  ```
+- Canceling a task that already ended `succeeded` or `failed` returns
+  `409 {"error":"diagnostic task conflict"}`; the final status, completion
+  time, result and audit trail are unchanged.
+- An unknown device or task id returns `404`.
+
+The credential of a canceled execution is dead: a **new** report submitted to
+the canceled task with that original claim credential — even inside what was
+its deadline — is rejected with `409`, and the task keeps its canceled status
+with no result saved and no extra audit record:
+
+```bash
+curl -sS -w '\nHTTP %{http_code}\n' -X POST \
+  http://127.0.0.1:8080/v1/devices/gateway-01/tasks/3/reports \
+  -H 'Content-Type: application/json' \
+  -d '{"receiptId":"diag-rc-cancel-1",
+       "credential":"5f2c8a91e04b4d63b1c7f9a2e6d40cb8",
+       "success":true,"result":{"ok":true}}'
+# 409 -> {"error":"diagnostic task conflict"}
+```
+
+With local persistence enabled (`EDGE_FLEET_DATA_DIR`), the cancel is
+committed to the write-ahead log before the `200` is returned. If a cancel of
+a task that is still within its execution period cannot be saved, the response
+is `503` and **the cancel has not taken effect**: the task stays
+`in_progress` with its original `attempts`, `claimedAt`, `deadline` and
+credential (a report presented with that credential before the deadline is
+still accepted), it gains no `completedAt` or `canceled` audit record, and
+the device stays occupied — the other claimable task still cannot be taken,
+so claims keep returning `204`. Retry the same cancel once storage is
+healthy; while the original deadline is still open it then returns `200` and
+cancels exactly as shown above.
+
 ## Persistence and restart
 
 Without `EDGE_FLEET_DATA_DIR`, everything (devices, events, sequences, batch
