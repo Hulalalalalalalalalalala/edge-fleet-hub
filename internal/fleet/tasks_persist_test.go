@@ -132,6 +132,55 @@ func TestPersistentTaskReportRestores(t *testing.T) {
 	}
 }
 
+// A success result carrying numbers outside the float64 range is stored raw and
+// recovered exactly: the task detail and the saved receipt keep the original
+// literals, and the receipt's idempotent/conflict rules survive the restart.
+func TestPersistentTaskReportOutOfRangeNumbersRestore(t *testing.T) {
+	dir := t.TempDir()
+	store := openPersistent(t, dir)
+	h := NewHandler(store)
+	mustRegister(t, h, "gw")
+	createTask(t, h, "gw", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "gw", http.StatusOK)
+	large := `{"scale":1e309,"detail":{"offset":1e-400,"steps":[-1e309]}}`
+	first := reportTask(t, h, "gw", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", large), http.StatusCreated)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2 := reopenPersistent(t, dir)
+	h2 := NewHandler(store2)
+
+	task := getTask(t, h2, "gw", 1, http.StatusOK)
+	if task.Status != "succeeded" || task.CompletedAt == nil {
+		t.Fatalf("task after restart = %+v", task)
+	}
+	if string(task.Result) != large {
+		t.Fatalf("result after restart = %s, want %s", task.Result, large)
+	}
+
+	// The original receipt keeps replaying with its first receive time under
+	// equivalent notation...
+	retry := reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", "stale-credential", true, "",
+			`{ "detail" : { "steps" : [ -10e308 ] , "offset" : 10e-401 } , "scale" : 10e308 }`), http.StatusOK)
+	if string(retry.Result) != large || !retry.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("retry after restart = %+v, want first receipt %+v", retry, first)
+	}
+	// ...while a changed out-of-range value conflicts and leaves the stored
+	// result untouched (1e-400 is not zero).
+	reportTask(t, h2, "gw", 1,
+		reportBody("rcpt-1", "stale-credential", true, "",
+			`{"scale":1e309,"detail":{"offset":0,"steps":[-1e309]}}`), http.StatusConflict)
+	if task = getTask(t, h2, "gw", 1, http.StatusOK); string(task.Result) != large {
+		t.Fatalf("conflict after restart rewrote result: %s", task.Result)
+	}
+	if got := joinEvents(eventsOf(listAudit(t, h2, "gw", 1))); got != "created,claimed,succeeded" {
+		t.Fatalf("audit after restart = %s", got)
+	}
+}
+
 func TestPersistentTaskFailureRestores(t *testing.T) {
 	dir := t.TempDir()
 	store := openPersistent(t, dir)

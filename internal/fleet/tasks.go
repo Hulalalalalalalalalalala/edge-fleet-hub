@@ -682,12 +682,16 @@ func sameReportResult(a, b json.RawMessage) bool {
 }
 
 // isJSONObject reports whether raw is exactly one JSON object. It is shared by
-// HTTP validation and WAL recovery.
+// HTTP validation and WAL recovery. Numbers stay json.Number literals (via
+// decodeJSONValue) so legal values beyond the float64 range, such as 1e309 or
+// 1e-400, validate and survive recovery instead of being rejected as
+// unrepresentable floats; spellings like NaN or Infinity are not JSON and are
+// still rejected by the decoder.
 func isJSONObject(raw json.RawMessage) bool {
-	var value any
-	if json.Unmarshal(raw, &value) != nil {
+	value, ok := decodeJSONValue(raw)
+	if !ok {
 		return false
 	}
-	_, ok := value.(map[string]any)
+	_, ok = value.(map[string]any)
 	return ok
 }

@@ -220,6 +220,121 @@ func TestTaskClaimAndReportSuccess(t *testing.T) {
 		reportBody("rcpt-2", claim.Credential, true, "", `{"ok":true}`), http.StatusConflict)
 }
 
+// Legal JSON numbers outside the float64 range must be accepted on a success
+// report at any nesting depth and come back byte-for-byte, never as Infinity,
+// zero, a string or a rounded value. The idempotent retry rule compares them by
+// exact decimal value, while malformed JSON or a non-object result stays a 400
+// that neither completes the task nor occupies the receiptId.
+func TestTaskReportSuccessKeepsOutOfRangeNumbersExact(t *testing.T) {
+	store, _ := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+
+	// A legal number larger than MaxFloat64 and one smaller than the smallest
+	// positive subnormal, one nested inside an object, are both accepted.
+	large := `{"scale":1e309,"detail":{"offset":1e-400}}`
+	first := reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", large), http.StatusCreated)
+	if string(first.Result) != large {
+		t.Fatalf("receipt changed number: %s", first.Result)
+	}
+	task := getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK)
+	if task.Status != "succeeded" || task.CompletedAt == nil {
+		t.Fatalf("task after success: %+v", task)
+	}
+	if string(task.Result) != large {
+		t.Fatalf("task detail changed number: %s", task.Result)
+	}
+
+	// Same values in a different notation, key order and whitespace:
+	// 10e308 == 1e309 and 10e-401 == 1e-400 exactly, so it is an idempotent
+	// replay returning the first receipt and its receive time.
+	retry := reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "",
+			`{ "detail" : { "offset" : 10e-401 } , "scale" : 10e308 }`), http.StatusOK)
+	if string(retry.Result) != large || !retry.ReceivedAt.Equal(first.ReceivedAt) {
+		t.Fatalf("equal-value retry = %+v, want first receipt %+v", retry, first)
+	}
+
+	// A genuinely different out-of-range value conflicts and leaves the stored
+	// result untouched.
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"scale":2e309,"detail":{"offset":1e-400}}`),
+		http.StatusConflict)
+	// A tiny positive number is not zero.
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "", `{"scale":1e309,"detail":{"offset":0}}`),
+		http.StatusConflict)
+	// Array element order stays significant even with out-of-range elements.
+	reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-1", claim.Credential, true, "",
+			`{"scale":1e309,"detail":{"offset":1e-400},"steps":[1e309,-1e309]}`), http.StatusConflict)
+	if task = getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK); string(task.Result) != large {
+		t.Fatalf("conflict rewrote stored result: %s", task.Result)
+	}
+	if got := joinEvents(eventsOf(listAudit(t, h, "dev-1", claim.Task.ID))); got != "created,claimed,succeeded" {
+		t.Fatalf("conflicts appended audit: %s", got)
+	}
+
+	// An empty object is a valid success result on a fresh task.
+	createTask(t, h, "dev-1", taskBody("req-2", 30), http.StatusCreated)
+	claim2 := claimTask(t, h, "dev-1", http.StatusOK)
+	empty := reportTask(t, h, "dev-1", claim2.Task.ID,
+		reportBody("rcpt-empty", claim2.Credential, true, "", `{}`), http.StatusCreated)
+	if string(empty.Result) != `{}` {
+		t.Fatalf("empty result receipt = %s", empty.Result)
+	}
+	if task = getTask(t, h, "dev-1", claim2.Task.ID, http.StatusOK); task.Status != "succeeded" || string(task.Result) != `{}` {
+		t.Fatalf("empty object task: %+v", task)
+	}
+}
+
+// Malformed success payloads are rejected with 400 before the store runs: the
+// task stays in progress under the same credential and deadline, the receiptId
+// is not occupied, and a corrected submission with the same number is accepted
+// while the credential and deadline are still valid.
+func TestTaskReportSuccessRejectsInvalidResultWithoutOccupyingReceipt(t *testing.T) {
+	store, _ := newClockStore()
+	h := NewHandler(store)
+	mustRegister(t, h, "dev-1")
+	createTask(t, h, "dev-1", taskBody("req-1", 30), http.StatusCreated)
+	claim := claimTask(t, h, "dev-1", http.StatusOK)
+
+	for _, body := range []string{
+		// Missing result.
+		`{"receiptId":"rcpt-fix","credential":` + fmt.Sprintf("%q", claim.Credential) + `,"success":true}`,
+		// Top-level array or null instead of an object.
+		reportBody("rcpt-fix", claim.Credential, true, "", `[1e309]`),
+		reportBody("rcpt-fix", claim.Credential, true, "", `null`),
+		// Non-finite spellings are not JSON, including when nested.
+		reportBody("rcpt-fix", claim.Credential, true, "", `{"scale":NaN}`),
+		reportBody("rcpt-fix", claim.Credential, true, "", `{"scale":Infinity}`),
+		reportBody("rcpt-fix", claim.Credential, true, "", `{"scale":-Infinity}`),
+		reportBody("rcpt-fix", claim.Credential, true, "", `{"nested":{"steps":[1e309,NaN]}}`),
+	} {
+		if r := doRequest(t, h, http.MethodPost, fmt.Sprintf("/v1/devices/dev-1/tasks/%d/reports", claim.Task.ID), body); r.Code != http.StatusBadRequest {
+			t.Fatalf("body %s => %d, want 400: %s", body, r.Code, r.Body.String())
+		}
+		if task := getTask(t, h, "dev-1", claim.Task.ID, http.StatusOK); task.Status != "in_progress" || task.CompletedAt != nil {
+			t.Fatalf("400 completed the task: %+v", task)
+		}
+	}
+
+	// The number was never bound and the credential/deadline still stand, so
+	// the corrected report with the same receiptId succeeds exactly once.
+	report := reportTask(t, h, "dev-1", claim.Task.ID,
+		reportBody("rcpt-fix", claim.Credential, true, "", `{"scale":1e309,"detail":{"offset":1e-400}}`),
+		http.StatusCreated)
+	if !report.Success || report.ReceiptID != "rcpt-fix" {
+		t.Fatalf("corrected report: %+v", report)
+	}
+	if got := joinEvents(eventsOf(listAudit(t, h, "dev-1", claim.Task.ID))); got != "created,claimed,succeeded" {
+		t.Fatalf("audit = %s, want created,claimed,succeeded", got)
+	}
+}
+
 func TestTaskReportFailureAndBackoff(t *testing.T) {
 	store, clock := newClockStore()
 	h := NewHandler(store)
