@@ -10,3 +10,31 @@ add_executable(envelopefile src/main.cpp)
 target_compile_features(envelopefile PRIVATE cxx_std_20)
 set_target_properties(envelopefile PROPERTIES CXX_EXTENSIONS OFF)
 target_link_libraries(envelopefile PRIVATE OpenSSL::Crypto)
+
+# Regression tests for `keygen`: the same product source is linked a second
+# time with syscall-wrapping shims (see tests/fault_inject.cpp) so the test
+# driver can simulate write/fsync/close failures and partial writes without
+# touching the production binary.
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+    add_executable(envelopefile_testable src/main.cpp tests/fault_inject.cpp)
+    target_compile_features(envelopefile_testable PRIVATE cxx_std_20)
+    set_target_properties(envelopefile_testable PROPERTIES CXX_EXTENSIONS OFF)
+    target_link_libraries(envelopefile_testable PRIVATE OpenSSL::Crypto)
+    target_link_options(envelopefile_testable PRIVATE
+        "LINKER:--wrap=open"
+        "LINKER:--wrap=write"
+        "LINKER:--wrap=fsync"
+        "LINKER:--wrap=close")
+
+    add_test(
+        NAME keygen_regression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/keygen_regression.py
+            --binary $<TARGET_FILE:envelopefile>
+            --testable-binary $<TARGET_FILE:envelopefile_testable>
+            --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
+endif()
