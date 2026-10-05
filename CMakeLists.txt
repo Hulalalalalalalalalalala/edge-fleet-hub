@@ -26,6 +26,7 @@ if(BUILD_TESTING)
     target_link_options(envelopefile_testable PRIVATE
         "LINKER:--wrap=open"
         "LINKER:--wrap=fchmod"
+        "LINKER:--wrap=fstat"
         "LINKER:--wrap=write"
         "LINKER:--wrap=fsync"
         "LINKER:--wrap=close"

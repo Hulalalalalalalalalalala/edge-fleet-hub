@@ -20,6 +20,16 @@
 //                           POSIX guarantee that close() releases the fd).
 //   EF_TEST_FAIL_FCHMOD=1   fchmod() on the key file fails with EPERM, so the
 //                           0600 permission guarantee cannot be established.
+//   EF_TEST_FAIL_FSTAT=1    fstat() on the key file fails with EIO even though
+//                           fchmod() reported success: the post-set permission
+//                           verification cannot read the file's metadata.
+//   EF_TEST_FSTAT_MODE=mmm  fstat() succeeds but the permission bits reported
+//                           back are replaced with the octal mode mmm (only the
+//                           low 12 bits are taken; file type bits are kept),
+//                           simulating a filesystem where fchmod() reports
+//                           success but the effective mode differs, e.g. 0644
+//                           (group/other can still read) or 0400 (owner write
+//                           was stripped).
 //
 // For deterministic coverage of the write loop itself, a per-call script can
 // be supplied:
@@ -112,6 +122,7 @@ extern "C" {
 // Real libc/libcrypto entry points provided by the --wrap linker mechanism.
 int __real_open(const char* path, int flags, ...);
 int __real_fchmod(int fd, mode_t mode);
+int __real_fstat(int fd, struct stat* info);
 ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
@@ -347,6 +358,34 @@ int __wrap_fchmod(int fd, mode_t mode) {
         return -1;
     }
     return __real_fchmod(fd, mode);
+}
+
+int __wrap_fstat(int fd, struct stat* info) {
+    if (!isKeyFd(fd)) {
+        return __real_fstat(fd, info);
+    }
+    // This is the post-fchmod verification read: fchmod itself already
+    // reported success for the key fd when the code reaches fstat.
+    if (envFlagSet("EF_TEST_FAIL_FSTAT")) {
+        errno = EIO;
+        return -1;
+    }
+    const int result = __real_fstat(fd, info);
+    if (result == 0) {
+        const char* forced = std::getenv("EF_TEST_FSTAT_MODE");
+        if (forced != nullptr && forced[0] != '\0') {
+            char* end = nullptr;
+            const unsigned long forcedMode = std::strtoul(forced, &end, 8);
+            if (end != forced && *end == '\0') {
+                // Keep the file-type bits; replace only the permission bits
+                // the product code verifies against exactly 0600.
+                info->st_mode =
+                    (info->st_mode & static_cast<mode_t>(~07777)) |
+                    (static_cast<mode_t>(forcedMode) & 07777);
+            }
+        }
+    }
+    return result;
 }
 
 ssize_t __wrap_write(int fd, const void* buffer, size_t count) {

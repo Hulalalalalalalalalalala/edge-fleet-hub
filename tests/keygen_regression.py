@@ -9,7 +9,16 @@ Covers the guarantees around the user-chosen key file location:
 * when the 0600 permission guarantee cannot be established for the new
   file, the run fails with exit 1, names the path and the permission
   problem on stderr, prints no completion message, and removes the file
-  it created;
+  it created; this covers both fchmod() failing outright and the final
+  verification after fchmod() reported success — fstat() failing to read
+  the file's metadata ("cannot verify") as well as fstat() succeeding but
+  reporting permissions other than exactly 0600, whether group/other still
+  have access (e.g. 0644) or the owner lacks full read/write (e.g. 0400;
+  "cannot guarantee 0600"). In the verification cases the program stops
+  before the first key byte is written (proven via the write trace never
+  being created, not just by the target being gone), still wipes the full
+  32-byte generated key, and leaves neighbouring files' content and modes
+  untouched;
 * an already-existing target (regular file, empty file, directory, symlink,
   dangling symlink) is rejected with a non-zero status, an explanation on
   stderr, and the pre-existing target left byte-for-byte untouched;
@@ -432,6 +441,122 @@ def test_fchmod_failure_cleans_up(ctx, workdir):
               "key file with unguaranteed permissions left behind")
     ctx.check(read_bytes(bystander) == b"do not touch",
               "unrelated file changed during cleanup")
+
+
+# ---------------------------------------------------------------------------
+# Final permission verification: fchmod() reported success, but the follow-up
+# fstat() check cannot confirm exactly 0600. A successful chmod must not be
+# taken as proof: the program has to stop BEFORE any key byte is written.
+# ---------------------------------------------------------------------------
+
+# Modes that are not exactly 0600 in both directions: bits still granted to
+# group/other (0644/0640/0004), owner bits short of full read+write (0400
+# lacks owner write, 0200 lacks owner read), and an owner-only mode that
+# nevertheless carries an execute bit (0700).
+_NON_0600_MODES = (0o644, 0o640, 0o004, 0o400, 0o200, 0o700)
+
+
+def _assert_verification_classified_correctly(ctx, err, kind):
+    # A verification failure is its own failure class (exit 1 with a
+    # permissions message), never a usage error, random-source failure,
+    # existing-target refusal, or file I/O failure — and not the earlier
+    # "cannot set" message, since fchmod() reported success here.
+    ctx.check(b"Usage:" not in err, f"{kind}: reported as a usage error")
+    ctx.check(RAND_FAILURE_MARKER.encode() not in err,
+              f"{kind}: reported as a secure random source failure")
+    ctx.check(b"cannot set key file permissions" not in err,
+              f"{kind}: reported as an fchmod() failure even though the "
+              "permission-setting call reported success")
+    ctx.check(b"already exists" not in err,
+              f"{kind}: reported as an existing-target refusal")
+    ctx.check(b"cannot create key file" not in err,
+              f"{kind}: reported as a file creation failure")
+    for phrase in (b"failed writing", b"short write",
+                   b"failed syncing", b"failed closing"):
+        ctx.check(phrase not in err,
+                  f"{kind}: verification failure misreported as "
+                  f"{phrase.decode()!r}")
+
+
+def _check_verification_failure(ctx, dirpath, env_overrides, expected, kind):
+    """Run one post-set verification failure scenario and assert the contract.
+
+    `expected` is the exact stderr line after the 'envelopefile: ' prefix.
+    The write trace is created by the shim on the FIRST key-file write, so its
+    absence proves no key byte reached the kernel — merely seeing the target
+    gone would not prove that on its own."""
+    path = os.path.join(dirpath, "envelope.key")
+    bystander = os.path.join(dirpath, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    os.chmod(bystander, 0o644)
+    write_log = os.path.join(dirpath, "write.log")
+    key_log = os.path.join(dirpath, "key.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_WRITE_LOG=write_log,
+                             EF_TEST_KEY_LOG=key_log,
+                             **env_overrides),
+        use_testable=True)
+
+    ctx.check(rc == 1,
+              f"{kind}: expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"",
+              f"{kind}: stdout not empty: {out!r:.200}")
+    ctx.check(err == ("envelopefile: " + expected + "\n").encode(),
+              f"{kind}: unexpected stderr: {err!r:.200}")
+    ctx.check(str(path).encode() in err,
+              f"{kind}: stderr does not name the user-specified path")
+    _assert_verification_classified_correctly(ctx, err, kind)
+
+    # The file created by this run is removed before exit...
+    ctx.check(not os.path.lexists(path),
+              f"{kind}: the file created by this run was left behind")
+    # ...and everything else in the directory keeps both content and mode.
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              f"{kind}: neighbouring file content changed")
+    bystander_mode = stat.S_IMODE(os.stat(bystander).st_mode)
+    ctx.check(bystander_mode == 0o644,
+              f"{kind}: neighbouring file mode changed to "
+              f"{oct(bystander_mode)}")
+
+    # Stronger than "the target is gone": the write shim opens its trace on
+    # the first key-file write, so the trace must never have been created.
+    ctx.check(not os.path.exists(write_log),
+              f"{kind}: write() reached the key file before the failed "
+              "verification stopped the run (key bytes may have been saved)")
+
+    # The generated key is never saved, yet the full 32-byte buffer is still
+    # wiped once — failure before the first write must not skip the wipe.
+    events = parse_key_log(ctx, key_log)
+    assert_key_buffer_wiped(ctx, events, kind, expect_writes=0)
+
+
+def test_permission_verify_failure_when_metadata_unreadable(ctx, workdir):
+    # fchmod() reports success, but reading the file metadata back (fstat)
+    # fails: the permissions cannot be verified, so the key cannot be saved.
+    path = os.path.join(workdir, "envelope.key")
+    message = (f"cannot verify key file permissions on '{path}': "
+               f"{os.strerror(errno.EIO)}")
+    _check_verification_failure(ctx, workdir,
+                                {"EF_TEST_FAIL_FSTAT": "1"},
+                                message,
+                                "unreadable permission metadata")
+
+
+def test_permission_verify_failure_when_mode_not_0600(ctx, workdir):
+    # fchmod() reports success and the metadata is readable, but the reported
+    # permissions are not exactly 0600 — whether group/other can still read,
+    # or the owner lacks full read/write. The 0600 guarantee cannot be made.
+    for mode in _NON_0600_MODES:
+        subdir = os.path.join(workdir, f"mode-{mode:03o}")
+        os.mkdir(subdir)
+        path = os.path.join(subdir, "envelope.key")
+        message = f"cannot guarantee key file permissions 0600 on '{path}'"
+        _check_verification_failure(ctx, subdir,
+                                    {"EF_TEST_FSTAT_MODE": f"{mode:03o}"},
+                                    message,
+                                    f"reported mode {mode:03o}")
 
 
 def test_partial_write_completes(ctx, workdir):
@@ -870,6 +995,8 @@ ALL_TESTS = [
     test_fsync_failure_cleans_up,
     test_close_failure_cleans_up,
     test_fchmod_failure_cleans_up,
+    test_permission_verify_failure_when_metadata_unreadable,
+    test_permission_verify_failure_when_mode_not_0600,
     test_partial_write_completes,
     test_interrupted_write_resumes_same_key,
     test_interleaved_short_writes_and_interrupts,
