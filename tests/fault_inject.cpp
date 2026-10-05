@@ -50,9 +50,38 @@
 //                           line and aborts the process, since it means the
 //                           product code violated its own write contract.
 //
+// The secure random source can be made to fail deterministically:
+//
+//   EF_TEST_FAIL_RAND=1       RAND_bytes reports failure (returns 0).
+//   EF_TEST_RAND_PARTIAL=N    before failing, N marker bytes (0xA5) are
+//                             written into the caller's key buffer,
+//                             simulating a CSPRNG that dies mid-fill. The
+//                             marker lets the test driver prove the partial
+//                             data is neither saved nor leaked.
+//   EF_TEST_RAND_ERROR_DETAIL=1
+//                             leave a descriptive OpenSSL error on the
+//                             thread's error queue so the failure carries
+//                             detail text; when unset the queue is cleared
+//                             instead, exercising the no-detail message.
+//
+// Key-buffer lifecycle events are recorded when requested:
+//
+//   EF_TEST_KEY_LOG=path      one line per event:
+//                               RAND <requested> partial=<N> result=<ok|fail>
+//                               CLEANSED-KEY <len>
+//                             The CLEANSED-KEY line is emitted when the
+//                             buffer previously handed to RAND_bytes is
+//                             wiped via OPENSSL_cleanse, proving the key
+//                             (including any partial bytes) does not survive
+//                             the operation in memory.
+//
 // Only the file descriptor opened for the key file is instrumented; all
 // other I/O (stdout, stderr, OpenSSL internals, the log file itself) passes
 // through untouched.
+
+#include <openssl/err.h>
+#include <openssl/opensslv.h>
+#include <openssl/rand.h>
 
 #include <cerrno>
 #include <cstdarg>
@@ -65,11 +94,13 @@
 
 extern "C" {
 
-// Real libc entry points provided by the --wrap linker mechanism.
+// Real libc/libcrypto entry points provided by the --wrap linker mechanism.
 int __real_open(const char* path, int flags, ...);
 ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
+int __real_RAND_bytes(unsigned char* buf, int num);
+void __real_OPENSSL_cleanse(void* ptr, size_t len);
 
 namespace {
 
@@ -77,6 +108,11 @@ constexpr std::size_t kKeyBytes = 32;
 
 // Descriptor currently known to belong to the key file under test, or -1.
 int g_keyFd = -1;
+
+// Key buffer most recently handed to RAND_bytes, so the OPENSSL_cleanse
+// wrapper can recognise (and log) its wipe.
+unsigned char* g_randBuf = nullptr;
+int g_randBufSize = 0;
 
 // Continuity bookkeeping for EF_TEST_WRITE_LOG.
 unsigned char g_keySnapshot[kKeyBytes];
@@ -108,8 +144,8 @@ private:
     int saved_;
 };
 
-void logLine(const char* mode, const char* text) {
-    const char* logPath = std::getenv("EF_TEST_WRITE_LOG");
+void logLine(const char* pathEnv, const char* mode, const char* text) {
+    const char* logPath = std::getenv(pathEnv);
     if (logPath == nullptr || logPath[0] == '\0') {
         return;
     }
@@ -121,6 +157,10 @@ void logLine(const char* mode, const char* text) {
     std::fputs(text, file);
     std::fputc('\n', file);
     std::fclose(file);
+}
+
+void logKeyLine(const char* text) {
+    logLine("EF_TEST_KEY_LOG", "a", text);
 }
 
 void logVerifyHeader(const unsigned char* buffer) {
@@ -135,7 +175,7 @@ void logVerifyHeader(const unsigned char* buffer) {
         *out++ = hex[buffer[i] & 0x0f];
     }
     *out = '\0';
-    logLine("w", line);
+    logLine("EF_TEST_WRITE_LOG", "w", line);
 }
 
 void logCall(std::size_t offset, std::size_t requested,
@@ -148,13 +188,13 @@ void logCall(std::size_t offset, std::size_t requested,
         std::snprintf(line, sizeof(line), "CALL %zu %zu %zd",
                       offset, requested, returned);
     }
-    logLine("a", line);
+    logLine("EF_TEST_WRITE_LOG", "a", line);
 }
 
 void logVerifyFailed(const char* reason) {
     char line[160];
     std::snprintf(line, sizeof(line), "VERIFY-FAILED %s", reason);
-    logLine("a", line);
+    logLine("EF_TEST_WRITE_LOG", "a", line);
 }
 
 // On the first key-file write, snapshot the key; afterwards confirm that the
@@ -355,6 +395,71 @@ int __wrap_close(int fd) {
         }
     }
     return result;
+}
+
+int __wrap_RAND_bytes(unsigned char* buf, int num) {
+    if (!envFlagSet("EF_TEST_FAIL_RAND")) {
+        const int result = __real_RAND_bytes(buf, num);
+        if (result == 1) {
+            g_randBuf = buf;
+            g_randBufSize = num;
+            char line[96];
+            std::snprintf(line, sizeof(line),
+                          "RAND %d partial=0 result=ok", num);
+            logKeyLine(line);
+        }
+        return result;
+    }
+
+    g_randBuf = buf;
+    g_randBufSize = num;
+
+    // Simulate a CSPRNG that wrote some bytes before dying: the caller must
+    // not mistake the partial fill for a valid key.
+    long partial = 0;
+    const char* raw = std::getenv("EF_TEST_RAND_PARTIAL");
+    if (raw != nullptr) {
+        partial = std::atol(raw);
+        if (partial < 0) {
+            partial = 0;
+        }
+        if (partial > num) {
+            partial = num;
+        }
+    }
+    for (long i = 0; i < partial; ++i) {
+        buf[i] = 0xA5;
+    }
+
+    // Start from an empty error queue, then optionally leave a descriptive
+    // OpenSSL error so the "detail" and "no detail" messages are both
+    // exercised deterministically.
+    ERR_clear_error();
+    if (envFlagSet("EF_TEST_RAND_ERROR_DETAIL")) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        ERR_raise(ERR_LIB_RAND, 0x7f);
+#else
+        ERR_put_error(ERR_LIB_RAND, 0, 0x7f, __FILE__, __LINE__);
+#endif
+    }
+
+    char line[96];
+    std::snprintf(line, sizeof(line), "RAND %d partial=%ld result=fail",
+                  num, partial);
+    logKeyLine(line);
+    return 0;
+}
+
+void __wrap_OPENSSL_cleanse(void* ptr, size_t len) {
+    if (ptr != nullptr && ptr == g_randBuf) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "CLEANSED-KEY %zu", len);
+        logKeyLine(line);
+        // The buffer is about to be released; do not match a stale address.
+        g_randBuf = nullptr;
+        g_randBufSize = 0;
+    }
+    __real_OPENSSL_cleanse(ptr, len);
 }
 
 }  // extern "C"

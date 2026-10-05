@@ -18,6 +18,11 @@ Covers the guarantees around the user-chosen key file location:
   generated; an irrecoverable mid-write error and a zero-byte write (whether
   on the first call or after partial bytes) fail, explain themselves, remove
   the incomplete file, and do not spin retrying;
+* a failing secure random source (with or without OpenSSL error detail, and
+  even after the CSPRNG wrote partial bytes into the key buffer) exits 1
+  with an empty stdout, names the random source failure on stderr, creates
+  no output file, leaks no partial key material, leaves pre-existing targets
+  and neighbouring files untouched, and still wipes the key buffer;
 * `--version` and the usage text keep working.
 
 The report printed by this script contains only test names and status —
@@ -35,6 +40,10 @@ import tempfile
 KEY_SIZE = 32
 KEY_MODE = 0o600
 SUCCESS_MARKER = "key generated and saved to"
+RAND_FAILURE_MARKER = "secure random source failed"
+# Distinctive byte pattern the fault shim writes into the key buffer before
+# reporting a random-source failure (EF_TEST_RAND_PARTIAL).
+PARTIAL_FILL_BYTE = 0xA5
 
 
 class Failure(Exception):
@@ -558,6 +567,123 @@ def test_error_messages_distinguishable(ctx, workdir):
               "existing target misreported as write failure")
 
 
+# ---------------------------------------------------------------------------
+# Secure random source failures (deterministic via EF_TEST_FAIL_RAND).
+# ---------------------------------------------------------------------------
+
+def _rand_fault_env(**overrides):
+    env = _fault_env(EF_TEST_FAIL_RAND="1", EF_TEST_RAND_ERROR_DETAIL="0")
+    env.update(overrides)
+    return env
+
+
+def assert_rand_failure(ctx, rc, out, err):
+    """Common assertions for a run where the secure random source failed."""
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"",
+              f"stdout not empty on random-source failure: {out!r:.200}")
+    ctx.check(RAND_FAILURE_MARKER.encode() in err,
+              f"stderr does not name the random-source failure: {err!r:.200}")
+    ctx.check(b"failed writing" not in err,
+              f"random-source failure misreported as file write failure: "
+              f"{err!r:.200}")
+
+
+def parse_key_log(ctx, log_path):
+    """Return the lifecycle events recorded by the fault shim."""
+    ctx.check(os.path.isfile(log_path),
+              f"key-buffer log {log_path!r} was not produced")
+    with open(log_path, "r", encoding="ascii") as handle:
+        return [line.strip() for line in handle if line.strip()]
+
+
+def test_rand_failure_no_detail(ctx, workdir):
+    # The CSPRNG fails without leaving any OpenSSL error detail: the command
+    # must still say clearly that the secure random source failed.
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_rand_fault_env(),
+                       use_testable=True)
+    assert_rand_failure(ctx, rc, out, err)
+    ctx.check(err == f"envelopefile: {RAND_FAILURE_MARKER}\n".encode(),
+              f"no-detail stderr should be the bare failure, got: {err!r:.200}")
+    ctx.check(not os.path.lexists(path),
+              "output file created despite random-source failure")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed during random-source failure")
+
+
+def test_rand_failure_with_detail(ctx, workdir):
+    # When OpenSSL provides error detail, the message keeps it so the user
+    # can tell why the random source failed.
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_rand_fault_env(EF_TEST_RAND_ERROR_DETAIL="1"),
+        use_testable=True)
+    assert_rand_failure(ctx, rc, out, err)
+    bare = f"envelopefile: {RAND_FAILURE_MARKER}\n".encode()
+    ctx.check(len(err) > len(bare),
+              f"OpenSSL error detail missing from stderr: {err!r:.200}")
+    ctx.check(err.startswith(b"envelopefile: " + RAND_FAILURE_MARKER.encode()),
+              f"detail message lost the failure cause: {err!r:.200}")
+    ctx.check(not os.path.lexists(path),
+              "output file created despite random-source failure")
+
+
+def test_rand_failure_after_partial_fill(ctx, workdir):
+    # The CSPRNG wrote 16 marker bytes into the key buffer and only then
+    # reported failure. The partial data must not be saved as a key, must
+    # not leak into either stream, and the buffer must still be wiped.
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    key_log = os.path.join(workdir, "key.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_rand_fault_env(EF_TEST_RAND_PARTIAL="16",
+                                  EF_TEST_KEY_LOG=key_log),
+        use_testable=True)
+    assert_rand_failure(ctx, rc, out, err)
+    marker = bytes([PARTIAL_FILL_BYTE]) * 16
+    ctx.check(marker not in out, "partial key material leaked into stdout")
+    ctx.check(marker not in err, "partial key material leaked into stderr")
+    ctx.check(not os.path.lexists(path),
+              "partial key was saved as a key file")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed during random-source failure")
+    events = parse_key_log(ctx, key_log)
+    ctx.check("RAND 32 partial=16 result=fail" in events,
+              f"shim did not record the failing RAND_bytes call: {events!r}")
+    ctx.check(f"CLEANSED-KEY {KEY_SIZE}" in events,
+              f"key buffer (with partial bytes) was not wiped: {events!r}")
+
+
+def test_rand_failure_leaves_existing_target(ctx, workdir):
+    # A pre-existing target keeps its content and permissions when the
+    # random source fails; the failure is reported as a random-source
+    # problem, not as an existing-path refusal.
+    path = os.path.join(workdir, "existing.key")
+    original = b"pre-existing content that must survive\x00\x01"
+    with open(path, "wb") as handle:
+        handle.write(original)
+    os.chmod(path, 0o640)
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_rand_fault_env(),
+                       use_testable=True)
+    assert_rand_failure(ctx, rc, out, err)
+    ctx.check(b"already exists" not in err,
+              f"random-source failure misreported as existing target: "
+              f"{err!r:.200}")
+    ctx.check(read_bytes(path) == original, "existing file content changed")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    ctx.check(mode == 0o640, f"existing file mode changed to {oct(mode)}")
+
+
 ALL_TESTS = [
     test_version,
     test_usage_no_args,
@@ -581,6 +707,10 @@ ALL_TESTS = [
     test_zero_byte_write_fails_without_retry,
     test_write_failure_does_not_touch_existing_target,
     test_error_messages_distinguishable,
+    test_rand_failure_no_detail,
+    test_rand_failure_with_detail,
+    test_rand_failure_after_partial_fill,
+    test_rand_failure_leaves_existing_target,
 ]
 
 

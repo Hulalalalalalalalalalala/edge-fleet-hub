@@ -13,8 +13,8 @@ target_link_libraries(envelopefile PRIVATE OpenSSL::Crypto)
 
 # Regression tests for `keygen`: the same product source is linked a second
 # time with syscall-wrapping shims (see tests/fault_inject.cpp) so the test
-# driver can simulate write/fsync/close failures and partial writes without
-# touching the production binary.
+# driver can simulate write/fsync/close failures, partial writes, and secure
+# random source failures without touching the production binary.
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -27,7 +27,9 @@ if(BUILD_TESTING)
         "LINKER:--wrap=open"
         "LINKER:--wrap=write"
         "LINKER:--wrap=fsync"
-        "LINKER:--wrap=close")
+        "LINKER:--wrap=close"
+        "LINKER:--wrap=RAND_bytes"
+        "LINKER:--wrap=OPENSSL_cleanse")
 
     add_test(
         NAME keygen_regression
