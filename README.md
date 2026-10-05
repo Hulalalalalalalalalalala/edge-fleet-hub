@@ -10,27 +10,89 @@
 
 ### 依赖与构建准备
 
-`keygen` 的安全随机字节来自成熟密码库 **OpenSSL**（`libcrypto` 的
-`RAND_bytes`，底层由操作系统的安全随机源 `/dev/urandom`/`getrandom(2)`
-提供，不会基于时间、路径或普通伪随机数生成）。
+**产品（`envelopefile` 本体）依赖：**
 
-构建前需安装 OpenSSL 开发文件：
+- 支持 **C++20** 的 C++ 编译器（如 GCC 10+、Clang 10+、Xcode 自带 clang）；
+- **CMake 3.20** 或更新版本；
+- **OpenSSL 开发文件**（`libcrypto`）。`keygen` 的安全随机字节来自
+  `RAND_bytes`，底层由操作系统的安全随机源
+  `/dev/urandom`/`getrandom(2)` 提供，不会基于时间、路径或普通伪随机数
+  生成。OpenSSL 是密钥生成功能的必要依赖，缺失时配置会直接失败并明确
+  指出缺少 OpenSSL。
+
+**回归测试依赖（仅运行测试时需要，产品构建不强制）：**
+
+- **Python 3**：用于驱动 `tests/keygen_regression.py`；
+- 支持 GNU 风格 **`--wrap` 链接选项**的链接器（如 GNU ld、GNU gold、
+  lld，常见于 Linux）。故障注入二进制 `envelopefile_testable` 靠它把
+  `open`/`write`/`RAND_bytes` 等调用替换为故障注入版本。
+
+安装产品依赖：
 
 ```sh
 # Debian / Ubuntu
-sudo apt install libssl-dev
+sudo apt install libssl-dev cmake
 
 # Fedora / RHEL
-sudo dnf install openssl-devel
+sudo dnf install openssl-devel cmake
 
-# macOS（Homebrew）
+# macOS（Homebrew，使用系统自带 clang 即可）
 brew install openssl
 ```
 
-现有的构建方式保持不变：
+### 默认构建
+
+Linux 等同时具备上述测试条件的环境，默认配置会同时构建正式程序与故障
+注入测试程序：
 
 ```sh
 cmake -S . -B build
+cmake --build build
+```
+
+配置结束时会看到类似下面的说明，明确测试是否可用：
+
+```text
+envelopefile: fault-injection regression tests enabled (linker '--wrap'
+supported; Python 3.x found). ...
+```
+
+### macOS（系统默认工具链）
+
+macOS 系统自带的链接器（ld64）不支持 GNU 风格的 `--wrap` 选项，因此
+故障注入测试程序在默认工具链下无法链接。构建系统会自动探测链接器
+能力：默认配置与构建仍然成功，只构建 `envelopefile` 产品，**不会**
+生成无法链接的测试程序，并在配置输出中明确说明：
+
+```text
+envelopefile: fault-injection regression tests NOT PROVIDED: the active
+linker does not support the GNU-style '--wrap' option ...
+```
+
+这是“该环境未提供此项回归”的说明，**不是回归通过**；它也不影响
+产品功能——`--version` 版本查询与 `keygen` 密钥生成（文件格式、
+`0600` 权限、拒绝覆盖已有路径等全部行为）在 macOS 默认工具链下均可
+正常使用。
+
+Homebrew 的 OpenSSL 不在系统默认搜索路径中时，用 `OPENSSL_ROOT_DIR`
+指明位置即可：
+
+```sh
+cmake -S . -B build -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+cmake --build build
+```
+
+若平台链接器支持 `--wrap` 但未安装 Python 3，配置输出同样会说明
+测试因缺少 Python 3 而未提供；安装 Python 3 后重新配置即可恢复测试。
+
+### 只构建产品
+
+不需要测试时，显式关闭测试即可独立构建产品；此模式下不会探测
+`--wrap`、不要求安装 Python 3，也不会尝试生成或链接
+`envelopefile_testable`：
+
+```sh
+cmake -S . -B build -DBUILD_TESTING=OFF
 cmake --build build
 ```
 
@@ -90,6 +152,14 @@ Usage:
 报用法错误（退出码 2）且不生成任何文件。
 
 ## 回归测试
+
+> 仅在链接器支持 GNU 风格 `--wrap` 选项且已安装 Python 3 的环境提供
+> （典型为 Linux + GNU ld/gold/lld）。配置阶段会自动探测这两个条件：
+> 条件不满足时默认构建照常成功，但不构建测试程序，配置输出会以
+> `NOT PROVIDED` 明确说明故障注入回归未提供及其原因（这是跳过说明，
+> 不代表回归通过）。这不影响产品本身的任何功能。需要在这类环境中运行
+> 回归时，可换用支持 `--wrap` 的链接器（如 lld）重新配置，或在具备
+> 条件的环境中运行。
 
 `keygen` 的密钥文件创建与失败处理由自动化回归测试保障（`tests/`）：
 
@@ -158,8 +228,13 @@ Usage:
 完成之后。只有清除的指针与长度都和交给 `RAND_bytes` 的缓冲区完全一致
 才会被记录，因此跳过清除、只清除部分密钥或清除无关数据都会被回归
 识别；产品与回归报告都不会打印完整或部分密钥。
-构建后运行：
+构建后运行（仅在测试已提供时；配置输出的 `enabled` 说明确认了
+`envelopefile_testable` 已构建）：
 
 ```sh
 ctest --test-dir build --output-on-failure
 ```
+
+若配置输出为 `NOT PROVIDED`（链接器不支持 `--wrap` 或缺少 Python 3），
+`ctest` 会显示 0 个测试——这表示该环境未提供回归，而非回归通过；
+正式程序的 `--version` 与 `keygen` 功能不受影响，可照常构建和使用。
