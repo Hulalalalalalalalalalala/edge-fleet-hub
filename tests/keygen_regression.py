@@ -12,6 +12,17 @@ Covers the guarantees around the user-chosen key file location:
   success, return non-zero, clean up the incomplete key file, and leave
   neighbouring files alone; a partially-written file that is completed by
   later writes still yields a full success;
+* a retryable write interruption (EINTR), including several interruptions
+  alternating with short writes, is resumed with the very same key bytes:
+  bytes already saved are neither lost nor duplicated and no second key is
+  generated (the testable binary's write-stream watchdog aborts the run if
+  the product ever presents conflicting bytes at an offset);
+* an unrecoverable write error after some bytes landed, and a write() that
+  returns zero bytes (on the first attempt or after a partial write), end
+  the run with a write-failure report instead of success, without retrying
+  forever or treating a partial file as a complete key;
+* fault injection never weakens the existing-target rejection or touches
+  other files in the directory;
 * `--version` and the usage text keep working.
 
 The report printed by this script contains only test names and status —
@@ -28,6 +39,12 @@ import tempfile
 KEY_SIZE = 32
 KEY_MODE = 0o600
 SUCCESS_MARKER = "key generated and saved to"
+# A zero-byte write must terminate the command rather than spin; a hang means
+# the product is retrying a non-progressing write forever.
+RUN_TIMEOUT_SECONDS = 15
+# Emitted by the testable shim's write-stream watchdog; never appears on a
+# correct run, so its presence always means a test failure.
+STREAM_MISMATCH_MARKER = b"write stream inconsistent"
 
 
 class Failure(Exception):
@@ -57,13 +74,20 @@ def run(ctx, args, env_extra=None, use_testable=False, umask=None):
             os.umask(umask)
         kwargs["preexec_fn"] = set_umask
     binary = ctx.testable_binary if use_testable else ctx.binary
-    proc = subprocess.run(
-        [binary, *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        **kwargs,
-    )
+    try:
+        proc = subprocess.run(
+            [binary, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=RUN_TIMEOUT_SECONDS,
+            **kwargs,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise Failure(
+            f"command hung (>{RUN_TIMEOUT_SECONDS}s), likely retrying a "
+            f"non-progressing write forever: {' '.join(args)}"
+        ) from exc
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -80,6 +104,9 @@ def assert_success(ctx, rc, out, err, path):
     ctx.check(str(path).encode() in out,
               "completion message does not contain the save path")
     ctx.check(err == b"", f"stderr not empty on success: {err!r:.200}")
+    ctx.check(STREAM_MISMATCH_MARKER not in out and
+              STREAM_MISMATCH_MARKER not in err,
+              "shim watchdog flagged an inconsistent write stream")
 
 
 def assert_key_file(ctx, path):
@@ -106,6 +133,8 @@ def assert_rejected(ctx, rc, out, err, reason=None):
     ctx.check(SUCCESS_MARKER.encode() not in out,
               f"success message printed for rejected run: {out!r:.200}")
     ctx.check(len(err) > 0, "stderr empty: rejection reason not reported")
+    ctx.check(STREAM_MISMATCH_MARKER not in err,
+              "shim watchdog flagged an inconsistent write stream")
     if reason is not None:
         ctx.check(reason.encode() in err,
                   f"stderr does not mention {reason!r}: {err!r:.200}")
@@ -287,6 +316,126 @@ def test_partial_write_completes(ctx, workdir):
     assert_no_key_leak(ctx, key, out, err)
 
 
+def _write_script_env(script, **overrides):
+    env = _fault_env(**overrides)
+    env["EF_TEST_WRITE_SCRIPT"] = script
+    return env
+
+
+def test_interrupted_write_resumes(ctx, workdir):
+    # The first write attempt reports a retryable interruption before any
+    # byte landed; after "recovery" the run completes with the exact key
+    # originally generated (the shim watchdog verifies the retried slice
+    # presents identical bytes, so a regenerated key would abort the run).
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_write_script_env("i,p7"),
+                       use_testable=True)
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+
+
+def test_repeated_interruptions_before_progress(ctx, workdir):
+    # Several interruptions in a row, all before the first byte is saved,
+    # must not count as failure nor cause a fresh key to be generated.
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_write_script_env("i,i,i"),
+                       use_testable=True)
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+
+
+def test_short_writes_alternating_with_interruptions(ctx, workdir):
+    # Bytes saved, then an interruption, then more bytes, then another
+    # interruption: already-saved bytes are neither lost nor duplicated and
+    # the finished file holds exactly one contiguous 32-byte key.
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_write_script_env("p7,i,p7,i,p7"),
+        use_testable=True)
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+
+
+def test_write_error_after_partial_cleans_up(ctx, workdir):
+    # Some bytes have already landed when an unrecoverable write error
+    # occurs: no completion message, non-zero exit with a write-failure
+    # reason, the brand-new incomplete file removed, neighbours untouched.
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_write_script_env("p10,e"),
+                       use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="failed writing")
+    ctx.check(not os.path.lexists(path),
+              "incomplete key file left behind after late write failure")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed during cleanup")
+
+
+def test_zero_write_first_attempt_fails(ctx, workdir):
+    # write() returning 0 with bytes still pending is a write failure, even
+    # on the very first attempt: report it and stop instead of looping
+    # forever (the run timeout catches such a loop as a hang).
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"keep me")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_write_script_env("z"),
+                       use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="short write")
+    ctx.check(not os.path.lexists(path),
+              "empty key file left behind after zero-byte write")
+    ctx.check(read_bytes(bystander) == b"keep me",
+              "unrelated file changed during cleanup")
+
+
+def test_zero_write_after_partial_fails(ctx, workdir):
+    # The same outcome once part of the key is already on disk: the partial
+    # content must not be mistaken for a complete key and no busy retry loop
+    # may occur.
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "also-unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"leave me alone")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_write_script_env("p10,z"),
+                       use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="short write")
+    ctx.check(not os.path.lexists(path),
+              "incomplete key file left behind after late zero-byte write")
+    ctx.check(read_bytes(bystander) == b"leave me alone",
+              "unrelated file changed during cleanup")
+
+
+def test_existing_target_rejected_while_injection_active(ctx, workdir):
+    # Scripted write faults do not weaken the pre-creation rejection: a
+    # target that already exists is refused (open with O_EXCL fails before
+    # any write), with its content and permissions preserved exactly.
+    path = os.path.join(workdir, "existing.key")
+    original = b"already here, faults or not\x00\xff"
+    with open(path, "wb") as handle:
+        handle.write(original)
+    os.chmod(path, 0o640)
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_write_script_env("z,e,p3"),
+                       use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="already exists")
+    ctx.check(read_bytes(path) == original,
+              "existing file content changed despite rejection")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    ctx.check(mode == 0o640,
+              f"existing file mode changed to {oct(mode)}")
+
+
 def test_error_messages_distinguishable(ctx, workdir):
     # "Target already exists" and "write failed after creation" must read
     # differently so the user can tell whether to pick another path or to
@@ -326,6 +475,13 @@ ALL_TESTS = [
     test_fsync_failure_cleans_up,
     test_close_failure_cleans_up,
     test_partial_write_completes,
+    test_interrupted_write_resumes,
+    test_repeated_interruptions_before_progress,
+    test_short_writes_alternating_with_interruptions,
+    test_write_error_after_partial_cleans_up,
+    test_zero_write_first_attempt_fails,
+    test_zero_write_after_partial_fails,
+    test_existing_target_rejected_while_injection_active,
     test_error_messages_distinguishable,
 ]
 
