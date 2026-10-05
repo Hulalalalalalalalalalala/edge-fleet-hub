@@ -45,7 +45,18 @@ Covers the guarantees around the user-chosen key file location:
   saved yet is still wiped), and an irrecoverable mid-write error (the
   incomplete file is removed and the whole 32-byte key is wiped, not just
   the tail that was never written);
-* `--version` and the usage text keep working.
+* `--version` and the usage text keep working;
+* command-line argument validation rejects the whole invocation before any
+  key is generated or saved: a missing `--output`, a missing or empty path
+  value, a repeated `--output` (whether or not both paths are the same), or
+  an unsupported argument (whether it appears before the output option or
+  after its path) all exit 2 with an empty stdout and a stderr that names
+  the argument problem and prints the keygen usage — never misreported as a
+  file-creation, permission, or random-source failure, and never masked by
+  an existing target. No new file appears at any candidate location,
+  pre-existing candidate files keep their bytes and permissions, and
+  neighbouring files are untouched. Paths made of or padded with spaces
+  remain valid file names and still succeed.
 
 The report printed by this script contains only test names and status —
 key bytes are never written to stdout/stderr by these tests.
@@ -746,6 +757,224 @@ def test_error_messages_distinguishable(ctx, workdir):
 
 
 # ---------------------------------------------------------------------------
+# Command-line argument validation: the whole argument list must be valid
+# before any key is generated or saved. A usage error exits 2 with an empty
+# stdout and a stderr that names the argument problem plus the keygen usage;
+# it never leaves a key file behind, never touches existing files, and is
+# never misreported as an operational (file/permission/random-source)
+# failure — the user must be able to tell "fix the command line" apart from
+# "saving the key failed".
+# ---------------------------------------------------------------------------
+
+KEYGEN_USAGE_LINE = b"Usage: envelopefile keygen --output <path>"
+
+
+def assert_usage_error(ctx, rc, out, err, kind, phrase=None):
+    """Common assertions for a run rejected as a usage error (exit 2)."""
+    ctx.check(rc == 2,
+              f"{kind}: expected exit 2, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"",
+              f"{kind}: stdout not empty on usage error: {out!r:.200}")
+    ctx.check(KEYGEN_USAGE_LINE in err,
+              f"{kind}: keygen usage text missing from stderr: {err!r:.200}")
+    if phrase is not None:
+        ctx.check(phrase.encode() in err,
+                  f"{kind}: stderr does not mention {phrase!r}: {err!r:.200}")
+    # A usage problem must never be misreported as an operational failure.
+    for marker in (b"already exists", b"cannot create key file",
+                   b"permissions", RAND_FAILURE_MARKER.encode(),
+                   b"failed writing", b"short write",
+                   b"failed syncing", b"failed closing"):
+        ctx.check(marker not in err,
+                  f"{kind}: usage error misreported as {marker.decode()!r}: "
+                  f"{err!r:.200}")
+
+
+def test_usage_missing_output_option(ctx, workdir):
+    rc, out, err = run(ctx, ["keygen"])
+    assert_usage_error(ctx, rc, out, err, "missing --output",
+                       phrase="missing required option '--output'")
+    ctx.check(os.listdir(workdir) == [],
+              "usage error left files behind")
+
+
+def test_usage_output_option_without_path(ctx, workdir):
+    # `--output` is given but no path argument follows it.
+    rc, out, err = run(ctx, ["keygen", "--output"])
+    assert_usage_error(ctx, rc, out, err, "--output without a path",
+                       phrase="requires a non-empty path")
+    ctx.check(os.listdir(workdir) == [],
+              "usage error left files behind")
+
+
+def test_usage_output_empty_path(ctx, workdir):
+    # An explicitly empty path is not a valid output location.
+    rc, out, err = run(ctx, ["keygen", "--output", ""])
+    assert_usage_error(ctx, rc, out, err, "empty --output path",
+                       phrase="requires a non-empty path")
+    ctx.check(os.listdir(workdir) == [],
+              "usage error left files behind")
+
+
+def test_usage_duplicate_output_same_path(ctx, workdir):
+    # Repeating --output is a usage error even when both paths are identical:
+    # the run must not silently accept one of them and generate a key.
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(ctx, ["keygen", "--output", path, "--output", path])
+    assert_usage_error(ctx, rc, out, err, "duplicate --output (same path)",
+                       phrase="more than once")
+    ctx.check(not os.path.lexists(path),
+              "key file created despite duplicate --output")
+
+
+def test_usage_duplicate_output_different_paths(ctx, workdir):
+    # Two different candidate locations: neither may be used, and the other
+    # files in the same directory stay untouched.
+    first = os.path.join(workdir, "first.key")
+    second = os.path.join(workdir, "second.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    os.chmod(bystander, 0o644)
+    rc, out, err = run(ctx, ["keygen", "--output", first, "--output", second])
+    assert_usage_error(ctx, rc, out, err,
+                       "duplicate --output (different paths)",
+                       phrase="more than once")
+    ctx.check(not os.path.lexists(first),
+              "first candidate path created despite duplicate --output")
+    ctx.check(not os.path.lexists(second),
+              "second candidate path created despite duplicate --output")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed during rejected run")
+    mode = stat.S_IMODE(os.stat(bystander).st_mode)
+    ctx.check(mode == 0o644, f"unrelated file mode changed to {oct(mode)}")
+
+
+def test_usage_duplicate_output_protects_both_locations(ctx, workdir):
+    # One candidate location already exists and the other does not: both are
+    # protected regardless of the order the duplicates appear in.
+    existing = os.path.join(workdir, "existing.key")
+    original = b"pre-existing content that must survive\x00\x01"
+    with open(existing, "wb") as handle:
+        handle.write(original)
+    os.chmod(existing, 0o640)
+    fresh = os.path.join(workdir, "fresh.key")
+    for first, second in ((existing, fresh), (fresh, existing)):
+        kind = f"duplicate --output ({os.path.basename(first)!r} first)"
+        rc, out, err = run(ctx, ["keygen", "--output", first,
+                                 "--output", second])
+        assert_usage_error(ctx, rc, out, err, kind, phrase="more than once")
+        ctx.check(read_bytes(existing) == original,
+                  f"{kind}: existing file content changed")
+        mode = stat.S_IMODE(os.stat(existing).st_mode)
+        ctx.check(mode == 0o640,
+                  f"{kind}: existing file mode changed to {oct(mode)}")
+        ctx.check(not os.path.lexists(fresh),
+                  f"{kind}: fresh candidate path created despite usage error")
+
+
+def test_usage_unsupported_argument_before_output(ctx, workdir):
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(ctx, ["keygen", "--verbose", "--output", path])
+    assert_usage_error(ctx, rc, out, err, "unsupported argument before "
+                       "--output", phrase="unsupported argument")
+    ctx.check(not os.path.lexists(path),
+              "key file created despite the unsupported argument")
+
+
+def test_usage_unsupported_argument_after_path(ctx, workdir):
+    # The unsupported argument comes AFTER a complete, valid --output pair:
+    # the run must still be rejected as a whole. Generating and saving the
+    # key first and only then complaining would leave a key file behind.
+    path = os.path.join(workdir, "envelope.key")
+    key_log = os.path.join(workdir, "key.log")
+    write_log = os.path.join(workdir, "write.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path, "extra"],
+        env_extra=_fault_env(EF_TEST_KEY_LOG=key_log,
+                             EF_TEST_WRITE_LOG=write_log),
+        use_testable=True)
+    assert_usage_error(ctx, rc, out, err, "unsupported argument after the "
+                       "output path", phrase="unsupported argument")
+    ctx.check(not os.path.lexists(path),
+              "key file saved before the usage error was reported")
+    # Stronger than "no file": the shims prove RAND_bytes never ran and no
+    # write ever happened — the argument list was fully validated first.
+    ctx.check(not os.path.exists(key_log),
+              "a key was generated before the argument list was validated")
+    ctx.check(not os.path.exists(write_log),
+              "a write occurred before the argument list was validated")
+
+
+def test_usage_error_not_masked_by_existing_target(ctx, workdir):
+    # The candidate output already exists, so a VALID call would fail with
+    # "already exists" — but these calls also carry a usage error, and the
+    # usage error is what must be reported (assert_usage_error forbids the
+    # "already exists" wording in stderr).
+    existing = os.path.join(workdir, "existing.key")
+    original = b"pre-existing content that must survive\x00\x01"
+    with open(existing, "wb") as handle:
+        handle.write(original)
+    os.chmod(existing, 0o640)
+    variants = (
+        ("trailing unsupported argument",
+         ["keygen", "--output", existing, "unexpected"]),
+        ("duplicate --output onto the existing path",
+         ["keygen", "--output", existing, "--output", existing]),
+    )
+    for kind, args in variants:
+        rc, out, err = run(ctx, args)
+        assert_usage_error(ctx, rc, out, err, kind)
+        ctx.check(read_bytes(existing) == original,
+                  f"{kind}: existing file content changed")
+        mode = stat.S_IMODE(os.stat(existing).st_mode)
+        ctx.check(mode == 0o640,
+                  f"{kind}: existing file mode changed to {oct(mode)}")
+
+
+def test_usage_error_takes_precedence_over_random_failure(ctx, workdir):
+    # Even with the secure random source forced to fail, a usage error is
+    # still reported as a usage error: argument validation happens before
+    # key generation, so the random source is never consulted.
+    key_log = os.path.join(workdir, "key.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output"],
+        env_extra=_rand_fault_env(EF_TEST_KEY_LOG=key_log),
+        use_testable=True)
+    assert_usage_error(ctx, rc, out, err,
+                       "usage error with failing random source",
+                       phrase="requires a non-empty path")
+    ctx.check(not os.path.exists(key_log),
+              "random source was consulted before the argument list was "
+              "validated")
+
+
+def test_success_space_only_path(ctx, workdir):
+    # A path made only of spaces is not an empty path: the spaces ARE the
+    # file name and must not be trimmed away.
+    path = os.path.join(workdir, " ")
+    rc, out, err = run(ctx, ["keygen", "--output", path])
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+    ctx.check(os.listdir(workdir) == [" "],
+              f"unexpected directory entries: {os.listdir(workdir)!r}")
+
+
+def test_success_path_with_surrounding_spaces(ctx, workdir):
+    # Leading and trailing spaces are part of the file name, not padding to
+    # be stripped.
+    name = "  envelope key  "
+    path = os.path.join(workdir, name)
+    rc, out, err = run(ctx, ["keygen", "--output", path])
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+    ctx.check(os.listdir(workdir) == [name],
+              f"unexpected directory entries: {os.listdir(workdir)!r}")
+
+
+# ---------------------------------------------------------------------------
 # Secure random source failures (deterministic via EF_TEST_FAIL_RAND).
 # ---------------------------------------------------------------------------
 
@@ -1005,6 +1234,18 @@ ALL_TESTS = [
     test_zero_byte_write_fails_without_retry,
     test_write_failure_does_not_touch_existing_target,
     test_error_messages_distinguishable,
+    test_usage_missing_output_option,
+    test_usage_output_option_without_path,
+    test_usage_output_empty_path,
+    test_usage_duplicate_output_same_path,
+    test_usage_duplicate_output_different_paths,
+    test_usage_duplicate_output_protects_both_locations,
+    test_usage_unsupported_argument_before_output,
+    test_usage_unsupported_argument_after_path,
+    test_usage_error_not_masked_by_existing_target,
+    test_usage_error_takes_precedence_over_random_failure,
+    test_success_space_only_path,
+    test_success_path_with_surrounding_spaces,
     test_rand_failure_no_detail,
     test_rand_failure_with_detail,
     test_rand_failure_after_partial_fill,
