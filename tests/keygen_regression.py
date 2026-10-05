@@ -18,6 +18,12 @@ Covers the guarantees around the user-chosen key file location:
   generated; an irrecoverable mid-write error and a zero-byte write (whether
   on the first call or after partial bytes) fail, explain themselves, remove
   the incomplete file, and do not spin retrying;
+* a failing secure random source (the crypto library reports failure, with
+  or without an error detail, and even after partially filling the key
+  buffer) ends the command with exit 1, an empty stdout, and a stderr
+  message naming the random source as the cause; no key file is created or
+  modified, the partially filled buffer bytes are never saved or printed,
+  and an already-existing target keeps its content and permissions;
 * `--version` and the usage text keep working.
 
 The report printed by this script contains only test names and status —
@@ -35,6 +41,11 @@ import tempfile
 KEY_SIZE = 32
 KEY_MODE = 0o600
 SUCCESS_MARKER = "key generated and saved to"
+RAND_FAILURE_MARKER = b"secure random source failed"
+# Deterministic byte the fault shim writes into the key buffer before
+# reporting a random-source failure (EF_TEST_FAIL_RAND_PARTIAL). It must
+# never be treated as key material: not saved, not printed.
+RAND_PARTIAL_BYTE = b"\xa5"
 
 
 class Failure(Exception):
@@ -241,10 +252,22 @@ def _fault_env(**overrides):
         "EF_TEST_FAIL_WRITE": "0",
         "EF_TEST_FAIL_FSYNC": "0",
         "EF_TEST_FAIL_CLOSE": "0",
+        "EF_TEST_FAIL_RAND": "0",
+        "EF_TEST_FAIL_RAND_DETAIL": "0",
     }
     env.update({key: value for key, value in overrides.items()
                 if value is not None})
     return env
+
+
+def _rand_fail_env(partial=None, detail=False):
+    """Environment that makes the shim's RAND_bytes fail deterministically."""
+    overrides = {"EF_TEST_FAIL_RAND": "1"}
+    if partial is not None:
+        overrides["EF_TEST_FAIL_RAND_PARTIAL"] = str(partial)
+    if detail:
+        overrides["EF_TEST_FAIL_RAND_DETAIL"] = "1"
+    return _fault_env(**overrides)
 
 
 # Error numbers reported by the fault shim, matching <errno.h> on Linux.
@@ -558,6 +581,140 @@ def test_error_messages_distinguishable(ctx, workdir):
               "existing target misreported as write failure")
 
 
+# ---------------------------------------------------------------------------
+# Secure random source failures (injected via the shim's RAND_bytes wrap).
+# ---------------------------------------------------------------------------
+
+def assert_rand_failure(ctx, rc, out, err):
+    """Common assertions for a run where the secure random source failed."""
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"",
+              f"stdout not empty on random-source failure: {out!r:.200}")
+    ctx.check(SUCCESS_MARKER.encode() not in out,
+              "completion message printed despite random-source failure")
+    ctx.check(RAND_FAILURE_MARKER in err,
+              "stderr does not name the secure random source as the cause: "
+              f"{err!r:.200}")
+
+
+def test_rand_failure_no_detail(ctx, workdir):
+    # The crypto library reports failure with an empty error queue: the
+    # message must still state clearly that the secure random source failed
+    # (not an empty error, not a file-writing complaint).
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_rand_fail_env(), use_testable=True)
+    assert_rand_failure(ctx, rc, out, err)
+    ctx.check(err == b"envelopefile: secure random source failed\n",
+              f"unexpected stderr without library detail: {err!r:.200}")
+    ctx.check(b"failed writing" not in err,
+              "random-source failure misreported as a file-writing failure")
+    ctx.check(not os.path.lexists(path),
+              "key file created despite random-source failure")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed during random-source failure")
+
+
+def test_rand_failure_with_detail(ctx, workdir):
+    # The crypto library additionally leaves a reason on the OpenSSL error
+    # queue: that detail must be preserved so the user can judge the cause.
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_rand_fail_env(detail=True),
+                       use_testable=True)
+    assert_rand_failure(ctx, rc, out, err)
+    prefix = b"envelopefile: secure random source failed: "
+    ctx.check(err.startswith(prefix),
+              f"library error detail missing from stderr: {err!r:.200}")
+    detail = err[len(prefix):].strip()
+    ctx.check(len(detail) > 0,
+              "error detail is empty even though the library provided one")
+    ctx.check(not os.path.lexists(path),
+              "key file created despite random-source failure")
+
+
+def test_rand_failure_partial_buffer_not_saved(ctx, workdir):
+    # The crypto library fails AFTER writing part of the key buffer. Those
+    # bytes are not a key: nothing may be saved (no empty, partial, or
+    # full-looking 32-byte file), the run must not fall back to an ordinary
+    # PRNG, and the partially written bytes must not appear on stdout/stderr.
+    partial_len = 13
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_rand_fail_env(partial=partial_len),
+                       use_testable=True)
+    assert_rand_failure(ctx, rc, out, err)
+    ctx.check(not os.path.lexists(path),
+              "a file was left behind even though no valid key was generated")
+    ctx.check(os.listdir(workdir) == ["unrelated.txt"],
+              f"unexpected files appeared: {sorted(os.listdir(workdir))!r}")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed during random-source failure")
+    # Deliberately do not echo the streams in these messages: they must not
+    # carry the partial buffer bytes into the regression report either.
+    ctx.check(RAND_PARTIAL_BYTE * 4 not in out,
+              "partial key-buffer bytes leaked into stdout")
+    ctx.check(RAND_PARTIAL_BYTE * 4 not in err,
+              "partial key-buffer bytes leaked into stderr")
+    hex_form = (RAND_PARTIAL_BYTE.hex() * 4).encode()
+    ctx.check(hex_form not in out and hex_form not in err,
+              "partial key-buffer bytes leaked as hex into the output")
+
+
+def test_rand_failure_preserves_existing_target(ctx, workdir):
+    # With the random source failing, an already-existing target must keep
+    # its content and permissions exactly; the reported cause is the random
+    # source, not the pre-existing path.
+    path = os.path.join(workdir, "existing.key")
+    original = b"pre-existing content that must survive\x00\x01"
+    with open(path, "wb") as handle:
+        handle.write(original)
+    os.chmod(path, 0o640)
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_rand_fail_env(partial=20),
+                       use_testable=True)
+    assert_rand_failure(ctx, rc, out, err)
+    ctx.check(read_bytes(path) == original,
+              "existing target content changed by random-source failure")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    ctx.check(mode == 0o640, f"existing target mode changed to {oct(mode)}")
+
+
+def test_rand_failure_message_distinguishable(ctx, workdir):
+    # The random-source failure must read differently from the other failure
+    # causes so the user knows no file operation was even attempted.
+    rand_path = os.path.join(workdir, "rand.key")
+    _, _, err_rand = run(ctx, ["keygen", "--output", rand_path],
+                         env_extra=_rand_fail_env(), use_testable=True)
+
+    write_path = os.path.join(workdir, "write.key")
+    _, _, err_write = run(ctx, ["keygen", "--output", write_path],
+                          env_extra=_fault_env(EF_TEST_FAIL_WRITE="1"),
+                          use_testable=True)
+
+    exists_path = os.path.join(workdir, "taken.key")
+    with open(exists_path, "wb") as handle:
+        handle.write(b"occupied")
+    _, _, err_exists = run(ctx, ["keygen", "--output", exists_path])
+
+    ctx.check(RAND_FAILURE_MARKER in err_rand,
+              f"random-source failure not identified as such: {err_rand!r:.200}")
+    for label, other in (("write failure", err_write),
+                         ("existing target", err_exists)):
+        ctx.check(RAND_FAILURE_MARKER not in other,
+                  f"{label} misreported as random-source failure")
+    ctx.check(b"failed writing" not in err_rand,
+              "random-source failure misreported as a file-writing failure")
+    ctx.check(b"already exists" not in err_rand,
+              "random-source failure misreported as an existing target")
+
+
 ALL_TESTS = [
     test_version,
     test_usage_no_args,
@@ -581,6 +738,11 @@ ALL_TESTS = [
     test_zero_byte_write_fails_without_retry,
     test_write_failure_does_not_touch_existing_target,
     test_error_messages_distinguishable,
+    test_rand_failure_no_detail,
+    test_rand_failure_with_detail,
+    test_rand_failure_partial_buffer_not_saved,
+    test_rand_failure_preserves_existing_target,
+    test_rand_failure_message_distinguishable,
 ]
 
 

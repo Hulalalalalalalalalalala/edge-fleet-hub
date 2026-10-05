@@ -19,6 +19,25 @@
 //                           descriptor is still really closed, matching the
 //                           POSIX guarantee that close() releases the fd).
 //
+// The secure random source itself can be made to fail deterministically:
+//
+//   EF_TEST_FAIL_RAND=1     RAND_bytes() reports failure (returns 0) instead
+//                           of producing key material.
+//   EF_TEST_FAIL_RAND_PARTIAL=N
+//                           Before reporting failure, the shim writes N bytes
+//                           of a fixed, recognisable pattern (0xA5) into the
+//                           caller's key buffer, simulating a crypto library
+//                           that fails after partially filling it. The test
+//                           driver can then prove those bytes are never saved
+//                           or printed. The pattern is NOT a key source; it
+//                           only exists so leaks are detectable.
+//   EF_TEST_FAIL_RAND_DETAIL=1
+//                           Additionally push a detail entry onto the OpenSSL
+//                           error queue so the product's error message
+//                           includes the library-provided reason. When unset,
+//                           the queue is explicitly cleared so the "no detail
+//                           available" branch is exercised deterministically.
+//
 // For deterministic coverage of the write loop itself, a per-call script can
 // be supplied:
 //
@@ -61,6 +80,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
 #include <unistd.h>
 
 extern "C" {
@@ -71,9 +92,16 @@ ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
 
+// Real OpenSSL entry point, likewise routed through --wrap.
+int __real_RAND_bytes(unsigned char* buf, int num);
+
 namespace {
 
 constexpr std::size_t kKeyBytes = 32;
+
+// Byte pattern used for EF_TEST_FAIL_RAND_PARTIAL fills. Chosen to be easily
+// recognisable and never mistaken for real key material.
+constexpr unsigned char kRandPartialPattern = 0xA5;
 
 // Descriptor currently known to belong to the key file under test, or -1.
 int g_keyFd = -1;
@@ -355,6 +383,37 @@ int __wrap_close(int fd) {
         }
     }
     return result;
+}
+
+int __wrap_RAND_bytes(unsigned char* buf, int num) {
+    if (!envFlagSet("EF_TEST_FAIL_RAND")) {
+        return __real_RAND_bytes(buf, num);
+    }
+    // Simulate a crypto library that reports failure after having already
+    // written part of the caller's buffer. The fill is a fixed, recognisable
+    // pattern (never a real or pseudo-random "key"): it exists only so the
+    // test driver can prove these bytes are neither saved nor printed.
+    const char* partial = std::getenv("EF_TEST_FAIL_RAND_PARTIAL");
+    if (partial != nullptr) {
+        long count = std::atol(partial);
+        if (count < 0) {
+            count = 0;
+        }
+        if (count > num) {
+            count = num;
+        }
+        std::memset(buf, kRandPartialPattern, static_cast<std::size_t>(count));
+    }
+    if (envFlagSet("EF_TEST_FAIL_RAND_DETAIL")) {
+        // Leave a library-style reason on the OpenSSL error queue so the
+        // product's message includes the detail branch.
+        ERR_raise(ERR_LIB_RAND, ERR_R_INTERNAL_ERROR);
+    } else {
+        // Guarantee the "no detail available" branch: nothing the library
+        // did earlier in the process may leak into the message.
+        ERR_clear_error();
+    }
+    return 0;
 }
 
 }  // extern "C"
