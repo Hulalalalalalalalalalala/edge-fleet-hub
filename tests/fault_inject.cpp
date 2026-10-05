@@ -20,6 +20,15 @@
 //                           POSIX guarantee that close() releases the fd).
 //   EF_TEST_FAIL_FCHMOD=1   fchmod() on the key file fails with EPERM, so the
 //                           0600 permission guarantee cannot be established.
+//   EF_TEST_FCHMOD_RESULT_MODE=<octal>
+//                           fchmod() on the key file reports success but the
+//                           file is left with the given mode instead of the
+//                           requested 0600, simulating a filesystem that
+//                           silently applies different permissions; the
+//                           product's fstat() verification must catch it.
+//   EF_TEST_FAIL_FSTAT=1    fstat() on the key file fails with EPERM, so the
+//                           permissions reported by fchmod() cannot be
+//                           verified at all.
 //
 // For deterministic coverage of the write loop itself, a per-call script can
 // be supplied:
@@ -112,6 +121,7 @@ extern "C" {
 // Real libc/libcrypto entry points provided by the --wrap linker mechanism.
 int __real_open(const char* path, int flags, ...);
 int __real_fchmod(int fd, mode_t mode);
+int __real_fstat(int fd, struct stat* info);
 ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
@@ -342,11 +352,33 @@ int __wrap_open(const char* path, int flags, ...) {
 }
 
 int __wrap_fchmod(int fd, mode_t mode) {
-    if (isKeyFd(fd) && envFlagSet("EF_TEST_FAIL_FCHMOD")) {
+    if (isKeyFd(fd)) {
+        if (envFlagSet("EF_TEST_FAIL_FCHMOD")) {
+            errno = EPERM;
+            return -1;
+        }
+        const char* substitute = std::getenv("EF_TEST_FCHMOD_RESULT_MODE");
+        if (substitute != nullptr && substitute[0] != '\0') {
+            char* end = nullptr;
+            const long forced = std::strtol(substitute, &end, 8);
+            if (end != substitute && *end == '\0' && forced >= 0 &&
+                forced <= 0777) {
+                // Report success but leave different permissions behind,
+                // simulating a filesystem that silently applies another
+                // mode; the product's fstat() verification must reject it.
+                return __real_fchmod(fd, static_cast<mode_t>(forced));
+            }
+        }
+    }
+    return __real_fchmod(fd, mode);
+}
+
+int __wrap_fstat(int fd, struct stat* info) {
+    if (isKeyFd(fd) && envFlagSet("EF_TEST_FAIL_FSTAT")) {
         errno = EPERM;
         return -1;
     }
-    return __real_fchmod(fd, mode);
+    return __real_fstat(fd, info);
 }
 
 ssize_t __wrap_write(int fd, const void* buffer, size_t count) {

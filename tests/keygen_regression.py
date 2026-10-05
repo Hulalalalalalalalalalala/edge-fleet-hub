@@ -9,7 +9,12 @@ Covers the guarantees around the user-chosen key file location:
 * when the 0600 permission guarantee cannot be established for the new
   file, the run fails with exit 1, names the path and the permission
   problem on stderr, prints no completion message, and removes the file
-  it created;
+  it created — this holds both when forcing the permissions fails and
+  when the follow-up verification cannot confirm exactly 0600 (the
+  permission readback itself fails, or the readback reports a mode that
+  still allows group/other access or drops owner read/write, e.g. 0644
+  or 0400); in every case no key byte is written and the generated key
+  is still wiped from memory;
 * an already-existing target (regular file, empty file, directory, symlink,
   dangling symlink) is rejected with a non-zero status, an explanation on
   stderr, and the pre-existing target left byte-for-byte untouched;
@@ -33,7 +38,8 @@ Covers the guarantees around the user-chosen key file location:
   successful save (the wipe happens only after the save completed, and the
   file holds the generated key itself, not wiped data and not a substitute
   key generated afterwards), an existing-target refusal (the key is never
-  saved yet is still wiped), and an irrecoverable mid-write error (the
+  saved yet is still wiped), a permission verification that fails before
+  any key byte is written, and an irrecoverable mid-write error (the
   incomplete file is removed and the whole 32-byte key is wiped, not just
   the tail that was never written);
 * `--version` and the usage text keep working.
@@ -432,6 +438,118 @@ def test_fchmod_failure_cleans_up(ctx, workdir):
               "key file with unguaranteed permissions left behind")
     ctx.check(read_bytes(bystander) == b"do not touch",
               "unrelated file changed during cleanup")
+
+
+def assert_perm_verification_failure(ctx, rc, out, err, path, explanation):
+    """Common assertions for a run where fchmod() reported success but the
+    0600 guarantee could not be confirmed afterwards. `explanation` is the
+    byte string that identifies this specific failure on stderr."""
+    ctx.check(rc == 1,
+              f"expected exit 1 (not a usage error), got {rc} "
+              f"(stderr: {err!r:.200})")
+    ctx.check(out == b"",
+              f"stdout not empty on permission verification failure: "
+              f"{out!r:.200}")
+    ctx.check(str(path).encode() in err,
+              f"stderr does not name the target path: {err!r:.200}")
+    ctx.check(explanation in err,
+              f"stderr does not explain the verification failure "
+              f"({explanation!r}): {err!r:.200}")
+    # The failure must not be misreported as a different failure class.
+    ctx.check(b"Usage" not in err,
+              f"verification failure misreported as a usage error: {err!r:.200}")
+    ctx.check(RAND_FAILURE_MARKER.encode() not in err,
+              f"verification failure misreported as a random-source failure: "
+              f"{err!r:.200}")
+    ctx.check(b"failed writing" not in err,
+              f"verification failure misreported as a file write failure: "
+              f"{err!r:.200}")
+    ctx.check(b"already exists" not in err,
+              f"verification failure misreported as an existing target: "
+              f"{err!r:.200}")
+
+
+def assert_no_key_bytes_written(ctx, write_log):
+    """The shim records a trace file the moment any write() reaches the key
+    file; no trace file means the failure stopped before any key byte was
+    written — stronger than only observing the target is gone afterwards."""
+    ctx.check(not os.path.exists(write_log),
+              "key bytes were written even though the 0600 guarantee was "
+              "not established")
+
+
+def assert_bystander_untouched(ctx, bystander, content, mode):
+    ctx.check(read_bytes(bystander) == content,
+              "unrelated file content changed during cleanup")
+    actual = stat.S_IMODE(os.stat(bystander).st_mode)
+    ctx.check(actual == mode,
+              f"unrelated file mode changed to {oct(actual)}")
+
+
+def test_fstat_failure_cleans_up(ctx, workdir):
+    # fchmod() reported success, but reading the new file's permissions back
+    # fails: the run cannot confirm 0600, so it must fail with exit 1, name
+    # the path and the verification problem on stderr, write no key bytes,
+    # remove the file it created, and still wipe the generated key.
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    os.chmod(bystander, 0o640)
+    write_log = os.path.join(workdir, "trace.log")
+    key_log = os.path.join(workdir, "key.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_FSTAT="1",
+                             EF_TEST_WRITE_LOG=write_log,
+                             EF_TEST_KEY_LOG=key_log),
+        use_testable=True)
+    assert_perm_verification_failure(ctx, rc, out, err, path,
+                                     b"cannot verify")
+    ctx.check(b"permissions" in err,
+              f"stderr does not explain the permission problem: {err!r:.200}")
+    ctx.check(not os.path.lexists(path),
+              "key file with unverifiable permissions left behind")
+    assert_bystander_untouched(ctx, bystander, b"do not touch", 0o640)
+    assert_no_key_bytes_written(ctx, write_log)
+    events = parse_key_log(ctx, key_log)
+    assert_key_buffer_wiped(ctx, events, "permission readback failure",
+                            expect_writes=0)
+
+
+def test_fchmod_result_mode_mismatch_cleans_up(ctx, workdir):
+    # fchmod() reported success but the file kept different permissions:
+    # 0644 still lets group/other users read the key, 0400 drops the owner's
+    # write access. Neither is exactly 0600, so the run must fail the same
+    # way as any other unverifiable-permission outcome.
+    for forced_mode in ("0644", "0400"):
+        subdir = os.path.join(workdir, f"mode-{forced_mode}")
+        os.mkdir(subdir)
+        path = os.path.join(subdir, "envelope.key")
+        bystander = os.path.join(subdir, "unrelated.txt")
+        with open(bystander, "wb") as handle:
+            handle.write(b"do not touch")
+        os.chmod(bystander, 0o640)
+        write_log = os.path.join(subdir, "trace.log")
+        key_log = os.path.join(subdir, "key.log")
+        rc, out, err = run(
+            ctx, ["keygen", "--output", path],
+            env_extra=_fault_env(EF_TEST_FCHMOD_RESULT_MODE=forced_mode,
+                                 EF_TEST_WRITE_LOG=write_log,
+                                 EF_TEST_KEY_LOG=key_log),
+            use_testable=True)
+        label = f"mode mismatch {forced_mode}"
+        assert_perm_verification_failure(ctx, rc, out, err, path,
+                                         b"cannot guarantee")
+        ctx.check(b"0600" in err,
+                  f"{label}: stderr does not state the 0600 requirement: "
+                  f"{err!r:.200}")
+        ctx.check(not os.path.lexists(path),
+                  f"{label}: key file with wrong permissions left behind")
+        assert_bystander_untouched(ctx, bystander, b"do not touch", 0o640)
+        assert_no_key_bytes_written(ctx, write_log)
+        events = parse_key_log(ctx, key_log)
+        assert_key_buffer_wiped(ctx, events, label, expect_writes=0)
 
 
 def test_partial_write_completes(ctx, workdir):
@@ -870,6 +988,8 @@ ALL_TESTS = [
     test_fsync_failure_cleans_up,
     test_close_failure_cleans_up,
     test_fchmod_failure_cleans_up,
+    test_fstat_failure_cleans_up,
+    test_fchmod_result_mode_mismatch_cleans_up,
     test_partial_write_completes,
     test_interrupted_write_resumes_same_key,
     test_interleaved_short_writes_and_interrupts,
