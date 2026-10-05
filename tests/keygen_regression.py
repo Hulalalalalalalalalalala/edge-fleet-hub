@@ -12,6 +12,12 @@ Covers the guarantees around the user-chosen key file location:
   success, return non-zero, clean up the incomplete key file, and leave
   neighbouring files alone; a partially-written file that is completed by
   later writes still yields a full success;
+* a recoverable write interrupt (EINTR), including several interrupts
+  alternating with short writes after some bytes were already saved, resumes
+  with the original key: no byte is lost or repeated and no second key is
+  generated; an irrecoverable mid-write error and a zero-byte write (whether
+  on the first call or after partial bytes) fail, explain themselves, remove
+  the incomplete file, and do not spin retrying;
 * `--version` and the usage text keep working.
 
 The report printed by this script contains only test names and status —
@@ -19,6 +25,7 @@ key bytes are never written to stdout/stderr by these tests.
 """
 
 import argparse
+import errno
 import os
 import stat
 import subprocess
@@ -240,6 +247,96 @@ def _fault_env(**overrides):
     return env
 
 
+# Error numbers reported by the fault shim, matching <errno.h> on Linux.
+_EINTR = errno.EINTR
+_EIO = errno.EIO
+
+
+def parse_write_log(ctx, log_path):
+    """Parse the shim's write trace.
+
+    Returns (snapshot_hex_or_None, calls) where each call is a tuple
+    (offset, requested, returned, errno_or_None). Fails the test if the shim
+    recorded a continuity violation or no calls at all.
+    """
+    ctx.check(os.path.isfile(log_path),
+              f"write trace {log_path!r} was not produced")
+    snapshot = None
+    calls = []
+    with open(log_path, "r", encoding="ascii") as handle:
+        for raw in handle:
+            fields = raw.split()
+            if not fields:
+                continue
+            kind = fields[0]
+            if kind == "VERIFY":
+                snapshot = fields[1]
+            elif kind == "VERIFY-FAILED":
+                raise Failure(
+                    "shim detected write-contract violation: " + " ".join(fields[1:]))
+            elif kind == "CALL":
+                offset = int(fields[1])
+                requested = int(fields[2])
+                returned = int(fields[3])
+                reported = int(fields[4]) if len(fields) > 4 else None
+                calls.append((offset, requested, returned, reported))
+    ctx.check(snapshot is not None, "write trace has no key snapshot line")
+    ctx.check(calls, "write trace recorded no write() calls")
+    return snapshot, calls
+
+
+def assert_call_offsets_contiguous(ctx, calls):
+    """Successful calls advance exactly by the returned byte count; an
+    EINTR repeats the same offset and request; errors otherwise terminate."""
+    offset = 0
+    for index, (at, requested, returned, reported) in enumerate(calls):
+        ctx.check(at == offset,
+                  f"call {index} resumed at {at}, expected {offset}: "
+                  "bytes were skipped or duplicated")
+        ctx.check(requested == KEY_SIZE - at,
+                  f"call {index} requested {requested} of "
+                  f"{KEY_SIZE - at} pending bytes at offset {at}")
+        if returned < 0:
+            ctx.check(reported is not None,
+                      f"failing call {index} did not record an errno")
+            if reported == _EINTR:
+                # Recoverable interrupt: the same slice must be retried, so
+                # the offset does not advance.
+                continue
+            # Any other error ends the loop; nothing may follow it.
+            ctx.check(index == len(calls) - 1,
+                      f"write loop kept going after hard error at call {index}")
+            return
+        if returned == 0:
+            ctx.check(index == len(calls) - 1,
+                      f"write loop retried after a zero-byte write at call {index}")
+            return
+        ctx.check(returned <= requested,
+                  f"call {index} returned {returned} > requested {requested}")
+        offset += returned
+    ctx.check(offset == KEY_SIZE,
+              f"trace accounts for {offset} bytes, expected {KEY_SIZE}")
+
+
+def assert_not_retrying(ctx, calls, max_calls=128):
+    # The loop either makes forward progress or terminates; it must never
+    # spin. Thirty-two bytes can never legitimately require this many calls.
+    ctx.check(len(calls) <= max_calls,
+              f"{len(calls)} write() calls looks like an unbounded retry loop")
+
+
+def run_scripted(ctx, workdir, script, name):
+    """Run keygen with a write script and trace; return run result + paths."""
+    path = os.path.join(workdir, name)
+    log_path = os.path.join(workdir, name + ".writelog")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_WRITE_SCRIPT=script,
+                             EF_TEST_WRITE_LOG=log_path),
+        use_testable=True)
+    return path, log_path, rc, out, err
+
+
 def test_write_failure_cleans_up(ctx, workdir):
     path = os.path.join(workdir, "envelope.key")
     bystander = os.path.join(workdir, "unrelated.txt")
@@ -287,6 +384,157 @@ def test_partial_write_completes(ctx, workdir):
     assert_no_key_leak(ctx, key, out, err)
 
 
+def test_interrupted_write_resumes_same_key(ctx, workdir):
+    # Some key bytes are already saved, then write() reports a recoverable
+    # EINTR. Generation must continue with the SAME key: no byte lost or
+    # repeated, no regeneration, exit 0, and stderr stays silent about the
+    # recovered interrupt.
+    path, log_path, rc, out, err = run_scripted(
+        ctx, workdir, "7,intr", "envelope.key")
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+
+    snapshot, calls = parse_write_log(ctx, log_path)
+    ctx.check(snapshot == key.hex(),
+              "saved key differs from the key presented to the first write "
+              "(a new key was generated after the interrupt)")
+    # Exactly: short 7-byte write, one EINTR at offset 7, then the remaining
+    # 25 bytes in one call.
+    ctx.check(calls == [(0, 32, 7, None),
+                        (7, 25, -1, _EINTR),
+                        (7, 25, 25, None)],
+              f"unexpected write trace: {calls!r}")
+    assert_call_offsets_contiguous(ctx, calls)
+    assert_not_retrying(ctx, calls)
+
+
+def test_interleaved_short_writes_and_interrupts(ctx, workdir):
+    # Multiple short writes alternating with recoverable interrupts must
+    # still produce the original 32-byte key exactly once.
+    path, log_path, rc, out, err = run_scripted(
+        ctx, workdir, "3,intr,5,1,intr,intr,2", "envelope.key")
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+
+    snapshot, calls = parse_write_log(ctx, log_path)
+    ctx.check(snapshot == key.hex(),
+              "saved key differs from the key originally generated")
+    assert_call_offsets_contiguous(ctx, calls)
+    assert_not_retrying(ctx, calls)
+    interrupts = [c for c in calls if c[2] == -1 and c[3] == _EINTR]
+    ctx.check(len(interrupts) == 3,
+              f"expected 3 recoverable interrupts, saw {len(interrupts)}")
+    # Every interrupted call was retried with the identical offset/length,
+    # and the bytes that eventually landed cover 0..31 without overlap.
+    for at, requested, returned, reported in interrupts:
+        retried = [(o, r) for (o, r, ret, errn) in calls
+                   if (o, r) == (at, requested) and
+                   ret is not None and ret >= 0]
+        ctx.check(retried,
+                  f"interrupt at offset {at} was never retried")
+
+
+def test_interrupt_on_first_write_resumes(ctx, workdir):
+    # An interrupt before any byte landed is likewise transparent.
+    path, log_path, rc, out, err = run_scripted(
+        ctx, workdir, "intr", "envelope.key")
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+    snapshot, calls = parse_write_log(ctx, log_path)
+    ctx.check(snapshot == key.hex(),
+              "saved key differs from the key originally generated")
+    assert_call_offsets_contiguous(ctx, calls)
+
+
+def test_mid_write_error_cleans_up(ctx, workdir):
+    # After part of the key reached a newly created file, an irrecoverable
+    # write error must fail loudly, print no completion message, and remove
+    # the incomplete file. Neighbouring files survive untouched.
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    log_path = os.path.join(workdir, "trace.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_WRITE_SCRIPT="10,eio",
+                             EF_TEST_WRITE_LOG=log_path),
+        use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="failed writing")
+    ctx.check(not os.path.lexists(path),
+              "incomplete key file left behind after mid-write error")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed during cleanup")
+    # The completed first 10 bytes must not appear in either stream.
+    _, calls = parse_write_log(ctx, log_path)
+    ctx.check(calls[-1] == (10, 22, -1, _EIO),
+              f"trace did not end with the injected error: {calls!r}")
+    ctx.check(b"envelopefile: 32-byte key" not in out,
+              "completion message leaked despite failed write")
+
+
+def test_zero_byte_write_fails_without_retry(ctx, workdir):
+    # write() returning 0 while bytes remain pending is a failed write: the
+    # command must stop (never spin retrying), report it, and clean up.
+    for script, label in (("zero", "first write returned 0"),
+                          ("5,zero", "zero after partial bytes")):
+        subdir = os.path.join(workdir, label.replace(" ", "_"))
+        os.mkdir(subdir)
+        path = os.path.join(subdir, "envelope.key")
+        bystander = os.path.join(subdir, "sibling.txt")
+        with open(bystander, "wb") as handle:
+            handle.write(b"keep")
+        log_path = os.path.join(subdir, "trace.log")
+        rc, out, err = run(
+            ctx, ["keygen", "--output", path],
+            env_extra=_fault_env(EF_TEST_WRITE_SCRIPT=script,
+                                 EF_TEST_WRITE_LOG=log_path),
+            use_testable=True)
+        assert_rejected(ctx, rc, out, err, reason="failed writing")
+        ctx.check(b"short write" in err,
+                  f"zero-byte result not explained as a short write: {err!r:.200}")
+        ctx.check(not os.path.lexists(path),
+                  f"incomplete key file left behind ({label})")
+        ctx.check(read_bytes(bystander) == b"keep",
+                  f"unrelated file changed during cleanup ({label})")
+        _, calls = parse_write_log(ctx, log_path)
+        ctx.check(calls[-1][2] == 0,
+                  f"trace did not end with a zero-byte write: {calls!r}")
+        # Exactly one zero-returning call: a retry of the same pending bytes
+        # would show as another entry at the same offset.
+        zeros = [c for c in calls if c[2] == 0]
+        ctx.check(len(zeros) == 1,
+                  f"zero-byte write was retried {len(zeros)} times")
+        ctx.check(SUCCESS_MARKER.encode() not in out,
+                  "completion message printed despite zero-byte write")
+
+
+def test_write_failure_does_not_touch_existing_target(ctx, workdir):
+    # With write injection armed, an existing target is still refused by the
+    # O_EXCL open: its content and permissions remain, and no partial bytes
+    # are written anywhere.
+    path = os.path.join(workdir, "existing.key")
+    original = bytes(range(256))[:40]
+    with open(path, "wb") as handle:
+        handle.write(original)
+    os.chmod(path, 0o600)
+    log_path = os.path.join(workdir, "trace.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_WRITE_SCRIPT="10,eio",
+                             EF_TEST_WRITE_LOG=log_path),
+        use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="already exists")
+    ctx.check(read_bytes(path) == original, "existing target was modified")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    ctx.check(mode == 0o600, f"existing target mode changed to {oct(mode)}")
+    ctx.check(not os.path.exists(log_path),
+              "write shim fired even though open() refused the target")
+
+
 def test_error_messages_distinguishable(ctx, workdir):
     # "Target already exists" and "write failed after creation" must read
     # differently so the user can tell whether to pick another path or to
@@ -326,6 +574,12 @@ ALL_TESTS = [
     test_fsync_failure_cleans_up,
     test_close_failure_cleans_up,
     test_partial_write_completes,
+    test_interrupted_write_resumes_same_key,
+    test_interleaved_short_writes_and_interrupts,
+    test_interrupt_on_first_write_resumes,
+    test_mid_write_error_cleans_up,
+    test_zero_byte_write_fails_without_retry,
+    test_write_failure_does_not_touch_existing_target,
     test_error_messages_distinguishable,
 ]
 
