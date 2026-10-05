@@ -170,6 +170,21 @@ def test_success_permissive_umask(ctx, workdir):
     assert_no_key_leak(ctx, key, out, err)
 
 
+def test_success_restrictive_umask(ctx, workdir):
+    # A strict inherited umask must not strip owner read/write from the new
+    # key file: whatever mask the process was started with, a successful run
+    # leaves exactly 0600 and the owner can use the file without fixing
+    # permissions afterwards.
+    for mask in (0o400, 0o200, 0o600, 0o077, 0o777):
+        subdir = os.path.join(workdir, f"umask-{mask:03o}")
+        os.mkdir(subdir)
+        path = os.path.join(subdir, "envelope.key")
+        rc, out, err = run(ctx, ["keygen", "--output", path], umask=mask)
+        assert_success(ctx, rc, out, err, path)
+        key = assert_key_file(ctx, path)
+        assert_no_key_leak(ctx, key, out, err)
+
+
 def test_success_path_with_spaces(ctx, workdir):
     subdir = os.path.join(workdir, "my keys")
     os.mkdir(subdir)
@@ -813,6 +828,7 @@ ALL_TESTS = [
     test_usage_no_args,
     test_success_new_file,
     test_success_permissive_umask,
+    test_success_restrictive_umask,
     test_success_path_with_spaces,
     test_success_repeatable,
     test_reject_existing_file,

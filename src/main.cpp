@@ -90,8 +90,40 @@ std::string errnoDescription(int errorNumber) {
     return description != nullptr ? description : "unknown error";
 }
 
+// Forces the freshly created key file to exactly 0600 (owner read/write,
+// nothing for group or others) and verifies the result before any key byte
+// is written. The mode passed to open() is only a request: the inherited
+// umask subtracts from it, so a strict umask (0400, 0200, 0600, ...) would
+// otherwise leave a key file the owner cannot read or write. fchmod() on
+// the new descriptor restores exactly 0600; because a umask can only remove
+// bits, the file is never more permissive than 0600 at any point, and the
+// permission is fixed before the key content reaches the file. Only the
+// descriptor of the file this invocation created is touched — pre-existing
+// paths are never chmod'ed.
+bool ensureKeyFilePermissions(int fd, const std::string& path,
+                              std::string& error) {
+    if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        error = "cannot set key file permissions to 0600 on '" + path +
+                "': " + errnoDescription(errno);
+        return false;
+    }
+    struct stat info;
+    if (::fstat(fd, &info) != 0) {
+        error = "cannot verify key file permissions on '" + path +
+                "': " + errnoDescription(errno);
+        return false;
+    }
+    if ((info.st_mode & 0777) != (S_IRUSR | S_IWUSR)) {
+        error = "cannot guarantee key file permissions 0600 for '" + path +
+                "'";
+        return false;
+    }
+    return true;
+}
+
 // Creates a brand new file containing exactly keySize raw bytes. The file is
-// created with mode 0600 from the first syscall; any existing path (file,
+// created with mode 0600 from the first syscall and then forced to exactly
+// 0600 regardless of the inherited umask; any existing path (file,
 // directory, symlink including a dangling one) is rejected. On failure the
 // partially written file is removed and false is returned.
 bool writeKeyFile(const std::string& path,
@@ -112,9 +144,10 @@ bool writeKeyFile(const std::string& path,
         return false;
     }
 
+    const bool permissionsOk = ensureKeyFilePermissions(fd, path, error);
     bool ok = false;
     std::size_t totalWritten = 0;
-    while (totalWritten < keySize) {
+    while (permissionsOk && totalWritten < keySize) {
         ssize_t written =
             ::write(fd, key + totalWritten, keySize - totalWritten);
         if (written < 0) {
@@ -132,7 +165,7 @@ bool writeKeyFile(const std::string& path,
         totalWritten += static_cast<std::size_t>(written);
     }
 
-    if (totalWritten == keySize) {
+    if (permissionsOk && totalWritten == keySize) {
         if (::fsync(fd) != 0) {
             error = "failed syncing key file '" + path + "': " +
                     errnoDescription(errno);
