@@ -23,6 +23,13 @@ Covers the guarantees around the user-chosen key file location:
   with an empty stdout, names the random source failure on stderr, creates
   no output file, leaks no partial key material, leaves pre-existing targets
   and neighbouring files untouched, and still wipes the key buffer;
+* once the secure random source has produced the 32-byte key, that very
+  buffer is verifiably wiped before the process exits on every outcome —
+  a successful save (with the wipe ordered after the save completed, and
+  the file holding the generated key rather than wiped or regenerated
+  bytes), a refusal because the target already exists, and an
+  irrecoverable mid-write error; a skipped wipe, a wipe of only part of
+  the key, or a wipe of an unrelated buffer all fail these checks;
 * `--version` and the usage text keep working.
 
 The report printed by this script contains only test names and status —
@@ -684,6 +691,136 @@ def test_rand_failure_leaves_existing_target(ctx, workdir):
     ctx.check(mode == 0o640, f"existing file mode changed to {oct(mode)}")
 
 
+# ---------------------------------------------------------------------------
+# Key memory wiping once the secure random source has succeeded.
+#
+# The fault shim snapshots the key buffer as RAND_bytes left it, records a
+# KEY-FILE-SAVED event when the save is durably complete, and reports the
+# wipe of the key buffer as CLEANSED-KEY-VERIFIED only when the cleansed
+# pointer is the generated-key buffer, the wipe covers its full length, and
+# the content at wipe time still matches the snapshot. A skipped wipe, a
+# partial wipe, or wiping some unrelated buffer therefore cannot pass. No
+# key bytes appear in the events or in these failure messages.
+# ---------------------------------------------------------------------------
+
+VERIFIED_WIPE_EVENT = f"CLEANSED-KEY-VERIFIED {KEY_SIZE}"
+SAVE_COMPLETE_EVENT = "KEY-FILE-SAVED"
+RAND_OK_EVENT = f"RAND {KEY_SIZE} partial=0 result=ok"
+
+
+def assert_single_generation(ctx, events):
+    """The key was generated exactly once; no substitute key was produced."""
+    generations = [event for event in events if event.startswith("RAND ")]
+    ctx.check(generations == [RAND_OK_EVENT],
+              f"expected exactly one successful key generation, "
+              f"got: {generations!r}")
+
+
+def assert_generated_key_wiped(ctx, events, outcome):
+    """The same 32-byte buffer the CSPRNG filled was wiped in full."""
+    ctx.check(VERIFIED_WIPE_EVENT in events,
+              f"{outcome}: the generated {KEY_SIZE}-byte key was not "
+              "verifiably wiped from memory before exit (wipe skipped, "
+              "shortened, or applied to unrelated data); "
+              f"key-lifecycle events: {events!r}")
+    ctx.check(not any(event.startswith("CLEANSED-KEY-UNVERIFIED")
+                      for event in events),
+              f"{outcome}: the wiped buffer did not hold the generated key "
+              f"at wipe time; key-lifecycle events: {events!r}")
+
+
+def test_key_wiped_after_successful_save(ctx, workdir):
+    # Saving the key to disk does not excuse wiping it from memory, and the
+    # wipe must happen only after the save completed: the file must contain
+    # the very key that was generated — not already-wiped bytes, and not a
+    # substitute key regenerated to satisfy the wipe check.
+    path = os.path.join(workdir, "envelope.key")
+    key_log = os.path.join(workdir, "key.log")
+    write_log = os.path.join(workdir, "write.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_KEY_LOG=key_log,
+                             EF_TEST_WRITE_LOG=write_log),
+        use_testable=True)
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
+
+    # The bytes handed to the write loop are the bytes that landed in the
+    # file; the shim separately aborts if they were not the generated key.
+    snapshot, _calls = parse_write_log(ctx, write_log)
+    ctx.check(snapshot == key.hex(),
+              "saved file content is not the key presented to the write loop")
+
+    events = parse_key_log(ctx, key_log)
+    assert_single_generation(ctx, events)
+    ctx.check(SAVE_COMPLETE_EVENT in events,
+              f"successful save was not recorded; key-lifecycle events: "
+              f"{events!r}")
+    assert_generated_key_wiped(ctx, events, "successful save")
+    ctx.check(events.index(VERIFIED_WIPE_EVENT) >
+              events.index(SAVE_COMPLETE_EVENT),
+              "successful save: the key was wiped before the save completed")
+
+
+def test_key_wiped_when_target_exists(ctx, workdir):
+    # The generated key is never saved because the target already exists —
+    # the refusal keeps its current shape (exit 1, no completion message,
+    # target untouched) — but the in-memory key must still be wiped.
+    path = os.path.join(workdir, "existing.key")
+    original = b"pre-existing content that must survive\x00\x01"
+    with open(path, "wb") as handle:
+        handle.write(original)
+    os.chmod(path, 0o640)
+    key_log = os.path.join(workdir, "key.log")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_fault_env(EF_TEST_KEY_LOG=key_log),
+                       use_testable=True)
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    assert_rejected(ctx, rc, out, err, reason="already exists")
+    ctx.check(read_bytes(path) == original, "existing file content changed")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    ctx.check(mode == 0o640, f"existing file mode changed to {oct(mode)}")
+
+    events = parse_key_log(ctx, key_log)
+    assert_single_generation(ctx, events)
+    ctx.check(SAVE_COMPLETE_EVENT not in events,
+              "existing-target refusal was recorded as a completed save")
+    assert_generated_key_wiped(ctx, events, "existing-target refusal")
+
+
+def test_key_wiped_after_mid_write_error(ctx, workdir):
+    # Part of the key reached a newly created file, then the write failed
+    # irrecoverably: the command exits 1 explaining the write failure,
+    # removes the incomplete file, and still wipes the whole 32-byte key —
+    # not just the tail that was never written.
+    path = os.path.join(workdir, "envelope.key")
+    key_log = os.path.join(workdir, "key.log")
+    write_log = os.path.join(workdir, "write.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_WRITE_SCRIPT="10,eio",
+                             EF_TEST_WRITE_LOG=write_log,
+                             EF_TEST_KEY_LOG=key_log),
+        use_testable=True)
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    assert_rejected(ctx, rc, out, err, reason="failed writing")
+    ctx.check(not os.path.lexists(path),
+              "incomplete key file left behind after mid-write error")
+
+    # The trace proves 10 key bytes had landed before the error, so the wipe
+    # genuinely covers a key that was partially saved.
+    _snapshot, calls = parse_write_log(ctx, write_log)
+    ctx.check(calls == [(0, 32, 10, None), (10, 22, -1, _EIO)],
+              f"unexpected write trace: {calls!r}")
+
+    events = parse_key_log(ctx, key_log)
+    assert_single_generation(ctx, events)
+    ctx.check(SAVE_COMPLETE_EVENT not in events,
+              "failed save was recorded as a completed save")
+    assert_generated_key_wiped(ctx, events, "mid-write error")
+
+
 ALL_TESTS = [
     test_version,
     test_usage_no_args,
@@ -711,6 +848,9 @@ ALL_TESTS = [
     test_rand_failure_with_detail,
     test_rand_failure_after_partial_fill,
     test_rand_failure_leaves_existing_target,
+    test_key_wiped_after_successful_save,
+    test_key_wiped_when_target_exists,
+    test_key_wiped_after_mid_write_error,
 ]
 
 
