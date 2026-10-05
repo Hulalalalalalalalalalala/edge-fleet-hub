@@ -40,7 +40,12 @@
 //                           is checked to advance from the current offset with
 //                           a buffer that is a slice of that same snapshot
 //                           (i.e. the key is neither regenerated, duplicated,
-//                           nor dropped). The file receives one line:
+//                           nor dropped). Every call is also checked to pass a
+//                           pointer INTO the exact buffer RAND_bytes filled
+//                           (at the current offset), so the bytes that reach
+//                           the file are provably the ones the later
+//                           OPENSSL_cleanse wipes — not a copy living
+//                           elsewhere. The file receives one line:
 //                             VERIFY <64 lowercase hex digits>
 //                           followed by one line per write() call:
 //                             CALL <offset> <requested> <returned> [<errno>]
@@ -69,11 +74,18 @@
 //   EF_TEST_KEY_LOG=path      one line per event:
 //                               RAND <requested> partial=<N> result=<ok|fail>
 //                               CLEANSED-KEY <len>
+//                               CLEANSE-STATE writes=<N> keyfd=<open|closed>
 //                             The CLEANSED-KEY line is emitted when the
 //                             buffer previously handed to RAND_bytes is
 //                             wiped via OPENSSL_cleanse, proving the key
 //                             (including any partial bytes) does not survive
-//                             the operation in memory.
+//                             the operation in memory. It is followed by a
+//                             CLEANSE-STATE line capturing how many key bytes
+//                             had been written and whether the key-file
+//                             descriptor was already closed at that moment,
+//                             so the test driver can prove the wipe happened
+//                             only after the save was complete (never before,
+//                             which would save wiped data).
 //
 // Only the file descriptor opened for the key file is instrumented; all
 // other I/O (stdout, stderr, OpenSSL internals, the log file itself) passes
@@ -199,13 +211,20 @@ void logVerifyFailed(const char* reason) {
 
 // On the first key-file write, snapshot the key; afterwards confirm that the
 // caller resumes exactly at the acknowledged offset and presents the matching
-// slice of the same key. Any mismatch is a product-code defect: abort so the
+// slice of the same key. Every call must also pass a pointer into the very
+// buffer RAND_bytes filled (at the current offset): the bytes reaching the
+// file are then provably the ones OPENSSL_cleanse later wipes, not an
+// unwiped copy. Any mismatch is a product-code defect: abort so the
 // regression run can never pass on a silently regenerated/garbled key.
 void verifyIncomingBuffer(const void* buffer, std::size_t count) {
     if (std::getenv("EF_TEST_WRITE_LOG") == nullptr) {
         return;
     }
     const auto* bytes = static_cast<const unsigned char*>(buffer);
+    if (g_randBuf != nullptr && bytes != g_randBuf + g_progress) {
+        logVerifyFailed("write buffer is not the buffer filled by RAND_bytes");
+        std::abort();
+    }
     if (!g_haveSnapshot) {
         if (count != kKeyBytes) {
             logVerifyFailed("first write did not carry the whole 32-byte key");
@@ -455,6 +474,14 @@ void __wrap_OPENSSL_cleanse(void* ptr, size_t len) {
         char line[96];
         std::snprintf(line, sizeof(line), "CLEANSED-KEY %zu", len);
         logKeyLine(line);
+        // Record how far the save had progressed when the wipe happened, so
+        // the test driver can prove a successful save was not preceded by
+        // the wipe (which would have saved wiped data).
+        char state[96];
+        std::snprintf(state, sizeof(state),
+                      "CLEANSE-STATE writes=%zu keyfd=%s",
+                      g_progress, g_keyFd == -1 ? "closed" : "open");
+        logKeyLine(state);
         // The buffer is about to be released; do not match a stale address.
         g_randBuf = nullptr;
         g_randBufSize = 0;
