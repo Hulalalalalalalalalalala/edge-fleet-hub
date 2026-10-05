@@ -18,6 +18,8 @@
 //   EF_TEST_FAIL_CLOSE=1    close() on the key file reports EIO (the
 //                           descriptor is still really closed, matching the
 //                           POSIX guarantee that close() releases the fd).
+//   EF_TEST_FAIL_FCHMOD=1   fchmod() on the key file fails with EPERM, so the
+//                           0600 permission guarantee cannot be established.
 //
 // For deterministic coverage of the write loop itself, a per-call script can
 // be supplied:
@@ -102,12 +104,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 extern "C" {
 
 // Real libc/libcrypto entry points provided by the --wrap linker mechanism.
 int __real_open(const char* path, int flags, ...);
+int __real_fchmod(int fd, mode_t mode);
 ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
@@ -335,6 +339,14 @@ int __wrap_open(const char* path, int flags, ...) {
         resetWriteBookkeeping();
     }
     return fd;
+}
+
+int __wrap_fchmod(int fd, mode_t mode) {
+    if (isKeyFd(fd) && envFlagSet("EF_TEST_FAIL_FCHMOD")) {
+        errno = EPERM;
+        return -1;
+    }
+    return __real_fchmod(fd, mode);
 }
 
 ssize_t __wrap_write(int fd, const void* buffer, size_t count) {

@@ -90,10 +90,41 @@ std::string errnoDescription(int errorNumber) {
     return description != nullptr ? description : "unknown error";
 }
 
-// Creates a brand new file containing exactly keySize raw bytes. The file is
-// created with mode 0600 from the first syscall; any existing path (file,
-// directory, symlink including a dangling one) is rejected. On failure the
-// partially written file is removed and false is returned.
+// Forces the freshly created key file to exactly 0600: owner read/write, no
+// execute bit, no group/other access. The mode given to open() is still
+// reduced by the inherited process umask, which can strip owner read (umask
+// 0400), owner write (umask 0200), or both (umask 0600); fchmod() is not
+// affected by the umask. The result is verified with fstat() so a filesystem
+// that silently keeps different permissions is treated as a failure instead
+// of being reported as a success.
+bool fixKeyFilePermissions(int fd, const std::string& path,
+                           std::string& error) {
+    if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        error = "cannot set key file permissions to 0600 on '" + path +
+                "': " + errnoDescription(errno);
+        return false;
+    }
+    struct stat info;
+    if (::fstat(fd, &info) != 0) {
+        error = "cannot verify key file permissions on '" + path +
+                "': " + errnoDescription(errno);
+        return false;
+    }
+    if ((info.st_mode & 0777) != (S_IRUSR | S_IWUSR)) {
+        error = "cannot guarantee key file permissions 0600 on '" + path +
+                "'";
+        return false;
+    }
+    return true;
+}
+
+// Creates a brand new file containing exactly keySize raw bytes. Any existing
+// path (file, directory, symlink including a dangling one) is rejected. The
+// file is created with mode 0600 and its permissions are then forced to
+// exactly 0600 (the creation mode alone is still subject to the umask) before
+// any key byte is written; at no point is the file accessible to group or
+// other users. On failure the partially written file is removed and false is
+// returned.
 bool writeKeyFile(const std::string& path,
                   const unsigned char* key,
                   std::size_t keySize,
@@ -113,38 +144,44 @@ bool writeKeyFile(const std::string& path,
     }
 
     bool ok = false;
-    std::size_t totalWritten = 0;
-    while (totalWritten < keySize) {
-        ssize_t written =
-            ::write(fd, key + totalWritten, keySize - totalWritten);
-        if (written < 0) {
-            if (errno == EINTR) {
-                continue;
+    // If the permissions cannot be guaranteed, this run must not be reported
+    // as a success even though the key was generated and the file was
+    // created: skip the write and fall through to the cleanup below.
+    if (fixKeyFilePermissions(fd, path, error)) {
+        std::size_t totalWritten = 0;
+        while (totalWritten < keySize) {
+            ssize_t written =
+                ::write(fd, key + totalWritten, keySize - totalWritten);
+            if (written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                error = "failed writing key file '" + path + "': " +
+                        errnoDescription(errno);
+                break;
             }
-            error = "failed writing key file '" + path + "': " +
-                    errnoDescription(errno);
-            break;
+            if (written == 0) {
+                error = "failed writing key file '" + path + "': short write";
+                break;
+            }
+            totalWritten += static_cast<std::size_t>(written);
         }
-        if (written == 0) {
-            error = "failed writing key file '" + path + "': short write";
-            break;
-        }
-        totalWritten += static_cast<std::size_t>(written);
-    }
 
-    if (totalWritten == keySize) {
-        if (::fsync(fd) != 0) {
-            error = "failed syncing key file '" + path + "': " +
-                    errnoDescription(errno);
-        } else if (::close(fd) != 0) {
-            // The descriptor is closed by the kernel even when close fails,
-            // but durability could not be confirmed: do not report success.
-            fd = -1;
-            error = "failed closing key file '" + path + "': " +
-                    errnoDescription(errno);
-        } else {
-            fd = -1;
-            ok = true;
+        if (totalWritten == keySize) {
+            if (::fsync(fd) != 0) {
+                error = "failed syncing key file '" + path + "': " +
+                        errnoDescription(errno);
+            } else if (::close(fd) != 0) {
+                // The descriptor is closed by the kernel even when close
+                // fails, but durability could not be confirmed: do not
+                // report success.
+                fd = -1;
+                error = "failed closing key file '" + path + "': " +
+                        errnoDescription(errno);
+            } else {
+                fd = -1;
+                ok = true;
+            }
         }
     }
 

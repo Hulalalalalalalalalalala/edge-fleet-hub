@@ -25,6 +25,7 @@ if(BUILD_TESTING)
     target_link_libraries(envelopefile_testable PRIVATE OpenSSL::Crypto)
     target_link_options(envelopefile_testable PRIVATE
         "LINKER:--wrap=open"
+        "LINKER:--wrap=fchmod"
         "LINKER:--wrap=write"
         "LINKER:--wrap=fsync"
         "LINKER:--wrap=close"

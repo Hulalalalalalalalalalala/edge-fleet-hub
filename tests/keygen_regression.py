@@ -3,8 +3,13 @@
 
 Covers the guarantees around the user-chosen key file location:
 
-* success leaves exactly 32 raw bytes with owner-only permissions, exit 0,
-  and a completion message that names the path without leaking key material;
+* success leaves exactly 32 raw bytes with owner-only permissions (0600
+  under any inherited umask, permissive or strict), exit 0, and a
+  completion message that names the path without leaking key material;
+* when the 0600 permission guarantee cannot be established for the new
+  file, the run fails with exit 1, names the path and the permission
+  problem on stderr, prints no completion message, and removes the file
+  it created;
 * an already-existing target (regular file, empty file, directory, symlink,
   dangling symlink) is rejected with a non-zero status, an explanation on
   stderr, and the pre-existing target left byte-for-byte untouched;
@@ -168,6 +173,20 @@ def test_success_permissive_umask(ctx, workdir):
     assert_success(ctx, rc, out, err, path)
     key = assert_key_file(ctx, path)
     assert_no_key_leak(ctx, key, out, err)
+
+
+def test_success_strict_umask(ctx, workdir):
+    # A strict inherited umask must not strip owner access from the new key
+    # file either: the 0600 guarantee holds for every mask, so the owner can
+    # use the generated file without fixing permissions afterwards.
+    for mask in (0o400, 0o200, 0o600, 0o077):
+        subdir = os.path.join(workdir, f"umask-{mask:03o}")
+        os.mkdir(subdir)
+        path = os.path.join(subdir, "envelope.key")
+        rc, out, err = run(ctx, ["keygen", "--output", path], umask=mask)
+        assert_success(ctx, rc, out, err, path)
+        key = assert_key_file(ctx, path)
+        assert_no_key_leak(ctx, key, out, err)
 
 
 def test_success_path_with_spaces(ctx, workdir):
@@ -387,6 +406,32 @@ def test_close_failure_cleans_up(ctx, workdir):
     assert_rejected(ctx, rc, out, err, reason="failed closing")
     ctx.check(not os.path.lexists(path),
               "key file left behind after close failure")
+
+
+def test_fchmod_failure_cleans_up(ctx, workdir):
+    # When the new file's permissions cannot be forced to 0600, the run is a
+    # failure (exit 1, not a usage error): stderr names the target path and
+    # the permission problem, no completion message is printed, and the file
+    # created by this run is removed rather than left for the user to fix.
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_fault_env(EF_TEST_FAIL_FCHMOD="1"),
+                       use_testable=True)
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(SUCCESS_MARKER.encode() not in out,
+              f"completion message printed despite permission failure: "
+              f"{out!r:.200}")
+    ctx.check(str(path).encode() in err,
+              f"stderr does not name the target path: {err!r:.200}")
+    ctx.check(b"permissions" in err and b"0600" in err,
+              f"stderr does not explain the permission problem: {err!r:.200}")
+    ctx.check(not os.path.lexists(path),
+              "key file with unguaranteed permissions left behind")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed during cleanup")
 
 
 def test_partial_write_completes(ctx, workdir):
@@ -813,6 +858,7 @@ ALL_TESTS = [
     test_usage_no_args,
     test_success_new_file,
     test_success_permissive_umask,
+    test_success_strict_umask,
     test_success_path_with_spaces,
     test_success_repeatable,
     test_reject_existing_file,
@@ -823,6 +869,7 @@ ALL_TESTS = [
     test_write_failure_cleans_up,
     test_fsync_failure_cleans_up,
     test_close_failure_cleans_up,
+    test_fchmod_failure_cleans_up,
     test_partial_write_completes,
     test_interrupted_write_resumes_same_key,
     test_interleaved_short_writes_and_interrupts,
