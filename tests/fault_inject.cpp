@@ -20,6 +20,11 @@
 //                           POSIX guarantee that close() releases the fd).
 //   EF_TEST_FAIL_FCHMOD=1   fchmod() on the key file fails with EPERM, so the
 //                           0600 permission guarantee cannot be established.
+//   EF_TEST_FAIL_UNLINK=1   unlink() of the key file fails with EIO, so the
+//                           post-failure cleanup cannot remove the file this
+//                           run created: the original save failure must still
+//                           decide the exit status, and a warning naming the
+//                           path and the removal failure must accompany it.
 //   EF_TEST_FAIL_FSTAT=1    fstat() on the key file fails with EIO even though
 //                           fchmod() reported success: the post-set permission
 //                           verification cannot read the file's metadata.
@@ -126,6 +131,7 @@ int __real_fstat(int fd, struct stat* info);
 ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
+int __real_unlink(const char* path);
 int __real_RAND_bytes(unsigned char* buf, int num);
 void __real_OPENSSL_cleanse(void* ptr, size_t len);
 
@@ -135,6 +141,11 @@ constexpr std::size_t kKeyBytes = 32;
 
 // Descriptor currently known to belong to the key file under test, or -1.
 int g_keyFd = -1;
+
+// Path of the key file currently under test, so the unlink() wrapper can tell
+// its cleanup apart from any other removal in the process.
+char g_keyPath[4096] = {};
+bool g_haveKeyPath = false;
 
 // Key buffer most recently handed to RAND_bytes, so the OPENSSL_cleanse
 // wrapper can recognise (and log) its wipe.
@@ -347,6 +358,10 @@ int __wrap_open(const char* path, int flags, ...) {
     if (fd != -1 && (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 &&
         isKeyPath(path)) {
         g_keyFd = fd;
+        g_haveKeyPath = false;
+        std::strncpy(g_keyPath, path, sizeof(g_keyPath) - 1);
+        g_keyPath[sizeof(g_keyPath) - 1] = '\0';
+        g_haveKeyPath = true;
         resetWriteBookkeeping();
     }
     return fd;
@@ -465,6 +480,18 @@ int __wrap_close(int fd) {
         }
     }
     return result;
+}
+
+int __wrap_unlink(const char* path) {
+    // Only the cleanup of the key file under test is injectable; the path was
+    // recorded at its O_EXCL creation, so unlink attempts for any other entry
+    // pass through untouched.
+    if (g_haveKeyPath && std::strcmp(path, g_keyPath) == 0 &&
+        envFlagSet("EF_TEST_FAIL_UNLINK")) {
+        errno = EIO;
+        return -1;
+    }
+    return __real_unlink(path);
 }
 
 int __wrap_RAND_bytes(unsigned char* buf, int num) {

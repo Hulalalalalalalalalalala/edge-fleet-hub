@@ -459,6 +459,124 @@ def test_fchmod_failure_cleans_up(ctx, workdir):
               "unrelated file changed during cleanup")
 
 
+def test_write_failure_then_cleanup_failure_reports_both(ctx, workdir):
+    # The write fails AND the subsequent removal of the newly created file
+    # fails: the run still ends with exit 1 and no completion message. stderr
+    # must keep BOTH the original write failure and a warning naming the path
+    # and the removal failure, so the user knows an incomplete key file may
+    # remain. The original failure must not be masked by the cleanup failure.
+    path = os.path.join(workdir, "envelope.key")
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    key_log = os.path.join(workdir, "key.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_WRITE="1",
+                             EF_TEST_FAIL_UNLINK="1",
+                             EF_TEST_KEY_LOG=key_log),
+        use_testable=True)
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(SUCCESS_MARKER.encode() not in out,
+              f"completion message printed despite the failures: {out!r:.200}")
+    expected = (
+        f"envelopefile: failed writing key file '{path}': "
+        f"{os.strerror(errno.EIO)}\n"
+        f"envelopefile: warning: could not remove partial key file '{path}': "
+        f"{os.strerror(errno.EIO)}\n").encode()
+    ctx.check(err == expected,
+              f"stderr must carry the write failure followed by the removal "
+              f"warning: {err!r:.200}")
+    # The cleanup genuinely failed: the file this run created is still there.
+    ctx.check(os.path.lexists(path),
+              "partial key file is gone even though unlink was injected to "
+              "fail (caller could not distinguish cleanup failure)")
+    ctx.check(read_bytes(bystander) == b"do not touch",
+              "unrelated file changed while the partial key file remained")
+    # The failed cleanup changes neither the wipe guarantee nor its timing:
+    # the descriptor was closed and the full key buffer wiped afterwards.
+    events = parse_key_log(ctx, key_log)
+    assert_key_buffer_wiped(ctx, events, "write + cleanup failure",
+                            expect_writes=0)
+
+
+def test_permission_failure_then_cleanup_failure_reports_both(ctx, workdir):
+    # Permissions cannot be guaranteed (before any key byte is written) and
+    # the removal of the freshly created file then fails too: the permission
+    # cause remains the primary error, the leftover-file warning accompanies
+    # it, and the empty new file stays on disk rather than being silently
+    # abandoned without explanation.
+    path = os.path.join(workdir, "envelope.key")
+    write_log = os.path.join(workdir, "write.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_FCHMOD="1",
+                             EF_TEST_FAIL_UNLINK="1",
+                             EF_TEST_WRITE_LOG=write_log),
+        use_testable=True)
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"", f"stdout not empty: {out!r:.200}")
+    lines = err.splitlines()
+    ctx.check(len(lines) == 2,
+              f"expected primary error plus one cleanup warning, got: "
+              f"{err!r:.200}")
+    ctx.check(b"permissions" in lines[0] and b"0600" in lines[0]
+              and str(path).encode() in lines[0],
+              f"first stderr line must be the permission failure: {err!r:.200}")
+    ctx.check(lines[1].startswith(b"envelopefile: warning: "
+                                  b"could not remove partial key file '")
+              and str(path).encode() in lines[1]
+              and os.strerror(errno.EIO).encode() in lines[1],
+              f"second stderr line must warn about the failed removal: "
+              f"{err!r:.200}")
+    ctx.check(os.path.lexists(path),
+              "new file is gone even though the injected unlink failed")
+    ctx.check(not os.path.exists(write_log),
+              "write() reached the key file despite the permission failure")
+
+
+def test_successful_cleanup_prints_no_warning(ctx, workdir):
+    # When cleanup itself succeeds, only the original save failure is shown:
+    # the warning line is exclusive to kCleanupFailed.
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(ctx, ["keygen", "--output", path],
+                       env_extra=_fault_env(EF_TEST_FAIL_WRITE="1"),
+                       use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="failed writing")
+    # Match the warning line prefix rather than a bare substring: the scratch
+    # directory path itself can legitimately contain "warning".
+    ctx.check(b"envelopefile: warning:" not in err
+              and b"could not remove" not in err,
+              f"cleanup warning printed despite successful removal: "
+              f"{err!r:.200}")
+    ctx.check(not os.path.lexists(path),
+              "incomplete key file left behind")
+
+
+def test_existing_target_never_enters_cleanup(ctx, workdir):
+    # An existing target is refused at open(); the refusal path must never
+    # unlink anything. Arming the unlink failure injection makes any stray
+    # removal attempt observable: the pre-existing file has to survive with
+    # its content and mode, and no cleanup warning may appear.
+    path = os.path.join(workdir, "existing.key")
+    original = b"pre-existing content that must survive\x00\x01"
+    with open(path, "wb") as handle:
+        handle.write(original)
+    os.chmod(path, 0o640)
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_UNLINK="1"),
+        use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="already exists")
+    ctx.check(read_bytes(path) == original,
+              "existing target was removed by the new-file cleanup")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    ctx.check(mode == 0o640, f"existing target mode changed to {oct(mode)}")
+    ctx.check(b"envelopefile: warning:" not in err
+              and b"could not remove" not in err,
+              f"refusal path reported a cleanup warning: {err!r:.200}")
+
+
 # ---------------------------------------------------------------------------
 # Final permission verification: fchmod() reported success, but the follow-up
 # fstat() check cannot confirm exactly 0600. A successful chmod must not be
@@ -1204,6 +1322,10 @@ ALL_TESTS = [
     test_fsync_failure_cleans_up,
     test_close_failure_cleans_up,
     test_fchmod_failure_cleans_up,
+    test_write_failure_then_cleanup_failure_reports_both,
+    test_permission_failure_then_cleanup_failure_reports_both,
+    test_successful_cleanup_prints_no_warning,
+    test_existing_target_never_enters_cleanup,
     test_permission_verify_failure_when_metadata_unreadable,
     test_permission_verify_failure_when_mode_not_0600,
     test_partial_write_completes,
