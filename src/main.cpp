@@ -1,9 +1,11 @@
 #include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/rand.h>
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -12,18 +14,46 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
 constexpr std::size_t kKeyBytes = 32;
+constexpr std::size_t kNonceBytes = 12;
+constexpr std::size_t kTagBytes = 16;
 
 constexpr const char* kVersionString = "envelopefile 0.1.0\n";
 constexpr const char* kUsage =
     "Usage:\n"
     "  envelopefile --version\n"
-    "  envelopefile keygen --output <path>\n";
+    "  envelopefile keygen --output <path>\n"
+    "  envelopefile encrypt --key <path> --input <path> --output <path>\n";
 constexpr const char* kKeygenUsage =
     "Usage: envelopefile keygen --output <path>\n";
+constexpr const char* kEncryptUsage =
+    "Usage: envelopefile encrypt --key <path> --input <path> --output <path>\n";
+
+// Binary envelope identification. The format is interpreted from these bytes,
+// never from the file name/extension.
+//
+//   magic     "ENVFILE1"  7 bytes, fixed identification
+//   version   uint8      1 byte,  format version (1)
+//   algorithm uint8      1 byte,  algorithm identifier (1 = AES-256-GCM)
+//   nonce     12 bytes            fresh per encryption
+//   ciphertext N bytes            raw input bytes encrypted (may be empty)
+//   tag       16 bytes            GCM authentication tag
+//
+// Everything from the first magic byte through the last ciphertext byte is
+// the authenticated data, so the header used to interpret the envelope cannot
+// be tampered with without detection. Multi-byte integer fields are single
+// bytes here, so there is no endianness to decode.
+constexpr unsigned char kEnvelopeMagic[7] = {
+    'E', 'N', 'V', 'F', 'I', 'L', 'E'};
+constexpr std::size_t kEnvelopeMagicBytes = 7;
+constexpr std::size_t kHeaderBytes =
+    kEnvelopeMagicBytes + 1 + 1 + kNonceBytes;  // 21 bytes
+constexpr unsigned char kEnvelopeVersion = 1;
+constexpr unsigned char kAlgAes256Gcm = 1;
 
 // Owns raw key material and wipes it with OPENSSL_cleanse on every exit path.
 class SecureBuffer {
@@ -352,6 +382,418 @@ int runKeygen(int argc, char* argv[]) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// encrypt
+// ---------------------------------------------------------------------------
+
+// Outcome of writing the already-sealed envelope bytes to a brand new file.
+// Mirrors KeySaveResult: the sealing/encryption step is finished before this
+// runs, so the only failures here concern creating and saving the output.
+struct EnvelopeSaveResult {
+    KeySaveStatus status = KeySaveStatus::kNotCreated;
+    std::string error;
+    std::string removalWarning;
+
+    bool saved() const { return status == KeySaveStatus::kSaved; }
+};
+
+// Reads an entire file as raw bytes. The bytes are returned without any
+// newline/NUL conversion; an empty file yields an empty vector. The path is
+// never followed through a terminal symlink for the *output*, but key and
+// input paths are opened normally (a symlink key/input is a legitimate file).
+bool readAllBytes(const std::string& path, std::vector<unsigned char>& out,
+                  std::string& error, const char* what) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd == -1) {
+        error = std::string("cannot read ") + what + " '" + path + "': " +
+                errnoDescription(errno);
+        return false;
+    }
+    FdGuard guard(fd);
+
+    out.clear();
+    unsigned char chunk[4096];
+    for (;;) {
+        ssize_t got = ::read(fd, chunk, sizeof(chunk));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error = std::string("failed reading ") + what + " '" + path +
+                    "': " + errnoDescription(errno);
+            return false;
+        }
+        if (got == 0) {
+            break;  // end of file
+        }
+        out.insert(out.end(), chunk, chunk + static_cast<std::size_t>(got));
+    }
+    return true;
+}
+
+// Reads exactly kKeyBytes (32) raw bytes from the key file: no trailing data,
+// no text decoding, no substitute key. A short or long file is an error.
+bool readKeyFile(const std::string& path, SecureBuffer& key,
+                 std::string& error) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd == -1) {
+        error = "cannot read key file '" + path + "': " +
+                errnoDescription(errno);
+        return false;
+    }
+    FdGuard guard(fd);
+
+    std::size_t total = 0;
+    while (total < kKeyBytes) {
+        ssize_t got = ::read(fd, key.data() + total, kKeyBytes - total);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error = "failed reading key file '" + path + "': " +
+                    errnoDescription(errno);
+            return false;
+        }
+        if (got == 0) {
+            error = "key file '" + path + "' is " +
+                    std::to_string(total) + " bytes, expected exactly " +
+                    std::to_string(kKeyBytes);
+            return false;
+        }
+        total += static_cast<std::size_t>(got);
+    }
+
+    // The file must contain exactly the key, nothing after it.
+    unsigned char extra;
+    ssize_t got;
+    do {
+        got = ::read(fd, &extra, 1);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+        error = "failed reading key file '" + path + "': " +
+                errnoDescription(errno);
+        return false;
+    }
+    if (got > 0) {
+        error = "key file '" + path + "' is longer than " +
+                std::to_string(kKeyBytes) +
+                " bytes; expected exactly 32 raw key bytes";
+        return false;
+    }
+    return true;
+}
+
+// Seals plaintext with AES-256-GCM and builds the complete envelope. The
+// header (magic/version/algorithm/nonce) is supplied as authenticated data so
+// the bytes used to interpret the envelope are covered by the tag. On success
+// envelope holds header || ciphertext || tag; on failure it returns false and
+// sets error, without ever generating a substitute key.
+bool sealEnvelope(const unsigned char* key,
+                  const std::vector<unsigned char>& plaintext,
+                  std::vector<unsigned char>& envelope,
+                  std::string& error) {
+    unsigned char nonce[kNonceBytes];
+    if (RAND_bytes(nonce, static_cast<int>(kNonceBytes)) != 1) {
+        error = "secure random source failed";
+        const std::string detail = opensslErrorString();
+        if (!detail.empty()) {
+            error += ": ";
+            error += detail;
+        }
+        OPENSSL_cleanse(nonce, sizeof(nonce));
+        return false;
+    }
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+        error = "cannot initialize AES-256-GCM";
+        OPENSSL_cleanse(nonce, sizeof(nonce));
+        return false;
+    }
+
+    int outLen = 0;
+    const std::size_t bodySize = plaintext.size();
+    envelope.resize(kHeaderBytes + bodySize + kTagBytes);
+    unsigned char* body = envelope.data() + kHeaderBytes;
+    unsigned char* tag = body + bodySize;
+
+    auto fail = [&](const std::string& message) {
+        error = message;
+        EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(nonce, sizeof(nonce));
+        // Do not leave partial ciphertext in the caller's buffer.
+        if (!envelope.empty()) {
+            OPENSSL_cleanse(envelope.data(), envelope.size());
+        }
+        envelope.clear();
+    };
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr,
+                           nullptr) != 1) {
+        fail("AES-256-GCM initialization failed");
+        return false;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN,
+                            static_cast<int>(kNonceBytes), nullptr) != 1) {
+        fail("cannot set GCM nonce length");
+        return false;
+    }
+    if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, nonce) != 1) {
+        fail("cannot set GCM key and nonce");
+        return false;
+    }
+
+    // Build the header first and authenticate it before any plaintext byte,
+    // so magic/version/algorithm/nonce are all bound to the tag. A null output
+    // marks these bytes as additional authenticated data; OpenSSL reports the
+    // AAD length back, so use a dedicated counter for ciphertext below rather
+    // than reusing this one (it would otherwise spoil the empty-input check).
+    unsigned char* header = envelope.data();
+    std::memcpy(header, kEnvelopeMagic, kEnvelopeMagicBytes);
+    header[kEnvelopeMagicBytes] = kEnvelopeVersion;
+    header[kEnvelopeMagicBytes + 1] = kAlgAes256Gcm;
+    std::memcpy(header + kEnvelopeMagicBytes + 2, nonce, kNonceBytes);
+
+    if (EVP_EncryptUpdate(ctx, nullptr, &outLen, header,
+                          static_cast<int>(kHeaderBytes)) != 1) {
+        fail("cannot authenticate envelope header");
+        return false;
+    }
+
+    int ciphertextLen = 0;
+    if (!plaintext.empty()) {
+        if (EVP_EncryptUpdate(ctx, body, &ciphertextLen, plaintext.data(),
+                              static_cast<int>(plaintext.size())) != 1) {
+            fail("encryption failed");
+            return false;
+        }
+    }
+    int finalLen = 0;
+    if (EVP_EncryptFinal_ex(ctx, body + ciphertextLen, &finalLen) != 1) {
+        fail("encryption finalization failed");
+        return false;
+    }
+    if (static_cast<std::size_t>(ciphertextLen) +
+            static_cast<std::size_t>(finalLen) !=
+        bodySize) {
+        fail("ciphertext length mismatch");
+        return false;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG,
+                            static_cast<int>(kTagBytes), tag) != 1) {
+        fail("cannot obtain authentication tag");
+        return false;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    OPENSSL_cleanse(nonce, sizeof(nonce));
+    return true;
+}
+
+// Writes the sealed envelope to a brand new file, rejecting every kind of
+// existing path (regular file, empty file, directory, symlink including a
+// dangling one) via O_CREAT|O_EXCL|O_NOFOLLOW. The envelope file is created
+// readable by the owner (0600) because it is encrypted output; unlike keygen
+// the 0600 mode is not force-verified here, but group/other never gain access
+// at creation. A failure after creation closes and removes this run's file,
+// reporting kCleanupFailed (with a warning) only if that removal fails.
+EnvelopeSaveResult writeEnvelopeFile(const std::string& path,
+                                     const std::vector<unsigned char>& bytes) {
+    EnvelopeSaveResult result;
+
+    int fd = ::open(path.c_str(),
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                    S_IRUSR | S_IWUSR);
+    if (fd == -1) {
+        const int savedErrno = errno;
+        result.status = KeySaveStatus::kNotCreated;
+        if (savedErrno == EEXIST || savedErrno == ELOOP) {
+            result.error = "refusing to write, path already exists: " + path;
+        } else {
+            result.error = "cannot create envelope file '" + path + "': " +
+                           errnoDescription(savedErrno);
+        }
+        return result;
+    }
+
+    FdGuard guard(fd);
+    result.status = KeySaveStatus::kCleanedUp;
+    std::string error;
+
+    // Envelope output is ciphertext plus a tag; restrict it to owner access.
+    if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        error = "cannot set envelope file permissions to 0600 on '" + path +
+                "': " + errnoDescription(errno);
+    } else {
+        std::size_t total = 0;
+        while (total < bytes.size()) {
+            ssize_t written =
+                ::write(fd, bytes.data() + total, bytes.size() - total);
+            if (written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                error = "failed writing envelope file '" + path + "': " +
+                        errnoDescription(errno);
+                break;
+            }
+            if (written == 0) {
+                error = "failed writing envelope file '" + path +
+                        "': short write";
+                break;
+            }
+            total += static_cast<std::size_t>(written);
+        }
+
+        if (total == bytes.size()) {
+            if (::fsync(fd) != 0) {
+                error = "failed syncing envelope file '" + path + "': " +
+                        errnoDescription(errno);
+            } else if (guard.finish() != 0) {
+                error = "failed closing envelope file '" + path + "': " +
+                        errnoDescription(errno);
+            } else {
+                result.status = KeySaveStatus::kSaved;
+                result.error.clear();
+                return result;
+            }
+        }
+    }
+
+    guard.close();
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+        result.status = KeySaveStatus::kCleanupFailed;
+        result.removalWarning =
+            "could not remove partial envelope file '" + path + "': " +
+            errnoDescription(errno);
+    }
+    result.error = std::move(error);
+    return result;
+}
+
+int runEncrypt(int argc, char* argv[]) {
+    std::string keyPath;
+    std::string inputPath;
+    std::string outputPath;
+    bool haveKey = false;
+    bool haveInput = false;
+    bool haveOutput = false;
+
+    // All-or-nothing parse: validate the whole argument list and reject the
+    // entire operation (exit 2) before any file is read or created.
+    for (int i = 2; i < argc; ++i) {
+        std::string_view arg(argv[i]);
+        std::string_view option;
+        std::string* target = nullptr;
+        bool* seen = nullptr;
+
+        if (arg == "--key") {
+            option = "--key";
+            target = &keyPath;
+            seen = &haveKey;
+        } else if (arg == "--input") {
+            option = "--input";
+            target = &inputPath;
+            seen = &haveInput;
+        } else if (arg == "--output") {
+            option = "--output";
+            target = &outputPath;
+            seen = &haveOutput;
+        } else {
+            std::cerr << "envelopefile: unsupported argument: '" << arg
+                      << "'\n"
+                      << kEncryptUsage;
+            return 2;
+        }
+
+        if (*seen) {
+            std::cerr << "envelopefile: '" << option
+                      << "' specified more than once\n"
+                      << kEncryptUsage;
+            return 2;
+        }
+        if (i + 1 >= argc) {
+            std::cerr << "envelopefile: option '" << option
+                      << "' requires a non-empty path\n"
+                      << kEncryptUsage;
+            return 2;
+        }
+        *target = argv[++i];
+        if (target->empty()) {
+            std::cerr << "envelopefile: option '" << option
+                      << "' requires a non-empty path\n"
+                      << kEncryptUsage;
+            return 2;
+        }
+        *seen = true;
+    }
+
+    if (!haveKey || !haveInput || !haveOutput) {
+        if (!haveKey) {
+            std::cerr << "envelopefile: missing required option '--key'\n"
+                      << kEncryptUsage;
+        } else if (!haveInput) {
+            std::cerr << "envelopefile: missing required option '--input'\n"
+                      << kEncryptUsage;
+        } else {
+            std::cerr << "envelopefile: missing required option '--output'\n"
+                      << kEncryptUsage;
+        }
+        return 2;
+    }
+
+    // Read the exact 32-byte raw key. This buffer is wiped on every exit
+    // path (success or failure), so the key never survives the operation in
+    // memory and never reaches stdout/stderr.
+    SecureBuffer key(kKeyBytes);
+    {
+        std::string error;
+        if (!readKeyFile(keyPath, key, error)) {
+            std::cerr << "envelopefile: " << error << '\n';
+            return 1;
+        }
+    }
+
+    // Read the input as raw bytes (no conversion; empty input is allowed).
+    std::vector<unsigned char> plaintext;
+    {
+        std::string error;
+        if (!readAllBytes(inputPath, plaintext, error, "input file")) {
+            std::cerr << "envelopefile: " << error << '\n';
+            return 1;
+        }
+    }
+
+    // Seal with a fresh random nonce and an authenticated header.
+    std::vector<unsigned char> envelope;
+    {
+        std::string error;
+        if (!sealEnvelope(key.data(), plaintext, envelope, error)) {
+            std::cerr << "envelopefile: " << error << '\n';
+            return 1;
+        }
+    }
+
+    // Save to a brand new path; any existing path, including the input or key
+    // path itself, is rejected before it is touched.
+    const EnvelopeSaveResult save = writeEnvelopeFile(outputPath, envelope);
+    if (!save.saved()) {
+        std::cerr << "envelopefile: " << save.error << '\n';
+        if (save.status == KeySaveStatus::kCleanupFailed) {
+            std::cerr << "envelopefile: warning: " << save.removalWarning
+                      << '\n';
+        }
+        return 1;
+    }
+
+    // The original input and key files are never opened for writing, so
+    // their contents and permissions are unchanged. The key is wiped by the
+    // SecureBuffer destructor as this scope exits.
+    std::cout << "envelopefile: file encrypted and envelope saved to '"
+              << outputPath << "'\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -362,6 +804,10 @@ int main(int argc, char* argv[]) {
 
     if (argc >= 2 && std::string_view(argv[1]) == "keygen") {
         return runKeygen(argc, argv);
+    }
+
+    if (argc >= 2 && std::string_view(argv[1]) == "encrypt") {
+        return runEncrypt(argc, argv);
     }
 
     std::cerr << kUsage;
