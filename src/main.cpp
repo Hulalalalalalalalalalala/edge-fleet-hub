@@ -90,6 +90,69 @@ std::string errnoDescription(int errorNumber) {
     return description != nullptr ? description : "unknown error";
 }
 
+// Why a save attempt ended the way it did. kSaved is the only success; every
+// other status is reported to the user with an explanatory message.
+enum class KeySaveStatus {
+    kSaved,          // all key bytes written, fsynced, and closed; mode 0600
+    kNotCreated,     // open() produced no file, so nothing had to be cleaned
+    kCleanedUp,      // this run created the file, failed, and removed it
+    kCleanupFailed,  // this run created the file, failed, and removal failed
+};
+
+// Complete outcome of one keygen save attempt: whether it succeeded, why it
+// failed when it did, and whether the file this run created was cleaned up.
+// The save logic itself writes nothing to stdout or stderr; the command line
+// reports error, and additionally reports removalWarning only when cleanup
+// failed, so a failed removal can never mask the original save failure and a
+// caller can tell "removed" apart from "could not remove" instead of inferring
+// deletion from failure alone. Neither string ever contains key material.
+struct KeySaveResult {
+    KeySaveStatus status = KeySaveStatus::kNotCreated;
+    std::string error;           // why the save did not succeed; empty on success
+    std::string removalWarning;  // populated only for kCleanupFailed
+
+    bool saved() const { return status == KeySaveStatus::kSaved; }
+};
+
+// Owns the descriptor opened for the newly created key file for the duration
+// of one save attempt and closes it exactly once. Closing is centralized here
+// rather than spread across the failure branches: a branch only records its
+// reason, and the descriptor is still released on every path out of scope.
+class FdGuard {
+public:
+    FdGuard() = default;
+    explicit FdGuard(int fd) : fd_(fd) {}
+    ~FdGuard() { close(); }
+
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    FdGuard(FdGuard&&) = delete;
+    FdGuard& operator=(FdGuard&&) = delete;
+
+    // Closes and disarms the guard, reporting close(2)'s status. Used after
+    // fsync(), where a reported failure means durability could not be
+    // confirmed and success must not be reported. Must be called while armed.
+    int finish() {
+        const int fd = fd_;
+        fd_ = -1;
+        return ::close(fd);
+    }
+
+    // Best-effort close for failure paths: the save has already failed, and
+    // close(2) releases the descriptor even when it reports an error, so the
+    // result is intentionally discarded here. Idempotent via disarming.
+    void close() {
+        if (fd_ != -1) {
+            const int fd = fd_;
+            fd_ = -1;
+            ::close(fd);
+        }
+    }
+
+private:
+    int fd_ = -1;
+};
+
 // Forces the freshly created key file to exactly 0600: owner read/write, no
 // execute bit, no group/other access. The mode given to open() is still
 // reduced by the inherited process umask, which can strip owner read (umask
@@ -123,30 +186,45 @@ bool fixKeyFilePermissions(int fd, const std::string& path,
 // file is created with mode 0600 and its permissions are then forced to
 // exactly 0600 (the creation mode alone is still subject to the umask) before
 // any key byte is written; at no point is the file accessible to group or
-// other users. On failure the partially written file is removed and false is
-// returned.
-bool writeKeyFile(const std::string& path,
-                  const unsigned char* key,
-                  std::size_t keySize,
-                  std::string& error) {
+// other users.
+//
+// The outcome is reported entirely through KeySaveResult: an open() failure
+// creates nothing (kNotCreated); a failure after creation closes the
+// descriptor via the FdGuard and removes this run's file, reporting either
+// kCleanedUp or, if the removal itself failed, kCleanupFailed with the
+// removal reason in removalWarning so the caller can warn that an incomplete
+// key file may remain. This function never writes to stdout or stderr.
+KeySaveResult writeKeyFile(const std::string& path,
+                           const unsigned char* key,
+                           std::size_t keySize) {
+    KeySaveResult result;
+
     int fd = ::open(path.c_str(),
                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
                     S_IRUSR | S_IWUSR);
     if (fd == -1) {
         const int savedErrno = errno;
+        // Pre-creation failure: nothing was created, so this must not enter
+        // the "remove the new file" handling and an existing target's
+        // content, permissions, and links are never touched.
+        result.status = KeySaveStatus::kNotCreated;
         if (savedErrno == EEXIST || savedErrno == ELOOP) {
-            error = "refusing to write, path already exists: " + path;
+            result.error = "refusing to write, path already exists: " + path;
         } else {
-            error = "cannot create key file '" + path + "': " +
-                    errnoDescription(savedErrno);
+            result.error = "cannot create key file '" + path + "': " +
+                           errnoDescription(savedErrno);
         }
-        return false;
+        return result;
     }
 
-    bool ok = false;
+    FdGuard guard(fd);
+    result.status = KeySaveStatus::kCleanedUp;  // assumed until the save completes
+    std::string error;
+
     // If the permissions cannot be guaranteed, this run must not be reported
     // as a success even though the key was generated and the file was
-    // created: skip the write and fall through to the cleanup below.
+    // created: skip the write and fall through to the cleanup below, before
+    // any key byte reaches the file.
     if (fixKeyFilePermissions(fd, path, error)) {
         std::size_t totalWritten = 0;
         while (totalWritten < keySize) {
@@ -171,33 +249,37 @@ bool writeKeyFile(const std::string& path,
             if (::fsync(fd) != 0) {
                 error = "failed syncing key file '" + path + "': " +
                         errnoDescription(errno);
-            } else if (::close(fd) != 0) {
+            } else if (guard.finish() != 0) {
                 // The descriptor is closed by the kernel even when close
                 // fails, but durability could not be confirmed: do not
                 // report success.
-                fd = -1;
                 error = "failed closing key file '" + path + "': " +
                         errnoDescription(errno);
             } else {
-                fd = -1;
-                ok = true;
+                // The complete original key is written, synced, and closed;
+                // 0600 was verified before the first byte.
+                result.status = KeySaveStatus::kSaved;
+                result.error.clear();
+                return result;
             }
         }
     }
 
-    if (!ok) {
-        if (fd != -1) {
-            ::close(fd);
-        }
-        // The file was created by this invocation (O_EXCL guaranteed it did
-        // not exist before open), so removing it cannot touch prior content.
-        if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
-            std::cerr << "envelopefile: warning: could not remove partial key "
-                         "file '"
-                      << path << "': " << errnoDescription(errno) << '\n';
-        }
+    // Failure after creation. The descriptor opened by this run is closed
+    // exactly once (guard.finish() above already disarmed it on the
+    // close-failure path); removing the path cannot touch prior content
+    // because O_EXCL guaranteed the file did not exist before open().
+    guard.close();
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+        // The original save failure remains the reported cause; this only
+        // adds that the incomplete file could not be removed.
+        result.status = KeySaveStatus::kCleanupFailed;
+        result.removalWarning =
+            "could not remove partial key file '" + path + "': " +
+            errnoDescription(errno);
     }
-    return ok;
+    result.error = std::move(error);
+    return result;
 }
 
 int runKeygen(int argc, char* argv[]) {
@@ -248,8 +330,18 @@ int runKeygen(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!writeKeyFile(outputPath, key.data(), key.size(), error)) {
-        std::cerr << "envelopefile: " << error << '\n';
+    const KeySaveResult save = writeKeyFile(outputPath, key.data(), key.size());
+    if (!save.saved()) {
+        // The save logic reports outcomes as data; the command line owns all
+        // user-facing messages. The original failure is always the primary
+        // cause; a failed cleanup is reported only as an additional warning,
+        // never as a replacement, so the exit code stays 1 and the user can
+        // tell that an incomplete key file may remain.
+        std::cerr << "envelopefile: " << save.error << '\n';
+        if (save.status == KeySaveStatus::kCleanupFailed) {
+            std::cerr << "envelopefile: warning: " << save.removalWarning
+                      << '\n';
+        }
         return 1;
     }
 

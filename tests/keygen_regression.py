@@ -25,7 +25,13 @@ Covers the guarantees around the user-chosen key file location:
 * failures after the new file was created (write/fsync/close) never report
   success, return non-zero, clean up the incomplete key file, and leave
   neighbouring files alone; a partially-written file that is completed by
-  later writes still yields a full success;
+  later writes still yields a full success. When the cleanup itself cannot
+  remove the newly created file, that removal failure never masks the
+  original save failure: the run still exits 1 with no completion message,
+  stderr keeps both the original cause and a follow-up warning naming the
+  path and the removal reason, the incomplete file remains on disk, and the
+  outcome is distinguishable from a completed cleanup — a pre-creation
+  refusal neither enters the removal path nor carries such a warning;
 * a recoverable write interrupt (EINTR), including several interrupts
   alternating with short writes after some bytes were already saved, resumes
   with the original key: no byte is lost or repeated and no second key is
@@ -457,6 +463,171 @@ def test_fchmod_failure_cleans_up(ctx, workdir):
               "key file with unguaranteed permissions left behind")
     ctx.check(read_bytes(bystander) == b"do not touch",
               "unrelated file changed during cleanup")
+
+
+# ---------------------------------------------------------------------------
+# Cleanup failure: the save fails after creating the file, and the subsequent
+# unlink() of that file fails too. The failed removal must not mask the
+# original save failure: exit code stays 1, no completion message is printed,
+# and stderr carries BOTH the original cause (first line) and a warning naming
+# the target path and the removal reason (second line), so the user knows an
+# incomplete key file may remain. The caller can distinguish this from a
+# completed cleanup (which reports only the original cause) and from a
+# pre-creation refusal (which never enters the removal path).
+# ---------------------------------------------------------------------------
+
+CLEANUP_WARNING_MARKER = "could not remove partial key file"
+
+
+def test_write_failure_with_failed_cleanup_reports_both(ctx, workdir):
+    # The very first write fails and the cleanup unlink fails as well.
+    path = os.path.join(workdir, "envelope.key")
+    bystander, bystander_content, bystander_mode = make_bystander(ctx, workdir)
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_WRITE="1",
+                             EF_TEST_FAIL_UNLINK="1"),
+        use_testable=True)
+
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(SUCCESS_MARKER.encode() not in out,
+              f"completion message printed despite failed save: {out!r:.200}")
+
+    # Exactly two lines, in a fixed order: original cause, then the cleanup
+    # warning. The removal failure is not allowed to replace the write error.
+    write_message = (f"envelopefile: failed writing key file '{path}': "
+                     f"{os.strerror(errno.EIO)}")
+    warning_message = (f"envelopefile: warning: {CLEANUP_WARNING_MARKER} "
+                       f"'{path}': {os.strerror(errno.EIO)}")
+    ctx.check(err == (write_message + "\n" + warning_message + "\n").encode(),
+              f"stderr must keep the write failure and the removal warning: "
+              f"{err!r:.200}")
+
+    # The cleanup genuinely did not happen: the empty (no byte was ever
+    # written), mode-0600 file this run created is still there.
+    ctx.check(os.path.lexists(path),
+              "new file disappeared even though unlink reported failure")
+    ctx.check(read_bytes(path) == b"",
+              "leftover file contains bytes although the first write failed")
+    leftover_mode = stat.S_IMODE(os.stat(path).st_mode)
+    ctx.check(leftover_mode == KEY_MODE,
+              f"leftover file mode is {oct(leftover_mode)}")
+    assert_bystander_untouched(ctx, bystander, bystander_content, bystander_mode)
+
+
+def test_partial_write_with_failed_cleanup_leaves_incomplete(ctx, workdir):
+    # Ten key bytes reach the file, then an irrecoverable write error and a
+    # failing removal: the 10-byte partial file stays and is named by the
+    # warning, while none of its bytes appear on either stream.
+    path = os.path.join(workdir, "envelope.key")
+    bystander, bystander_content, bystander_mode = make_bystander(ctx, workdir)
+    log_path = os.path.join(workdir, "trace.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_WRITE_SCRIPT="10,eio",
+                             EF_TEST_WRITE_LOG=log_path,
+                             EF_TEST_FAIL_UNLINK="1"),
+        use_testable=True)
+
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(b"failed writing" in err,
+              f"stderr lost the original write failure: {err!r:.200}")
+    ctx.check(CLEANUP_WARNING_MARKER.encode() in err and
+              str(path).encode() in err,
+              f"stderr does not warn about the leftover path: {err!r:.200}")
+    ctx.check(SUCCESS_MARKER.encode() not in out,
+              "completion message printed despite failed save")
+
+    ctx.check(os.path.lexists(path), "partial file removed despite unlink fault")
+    leftover = read_bytes(path)
+    ctx.check(len(leftover) == 10,
+              f"leftover partial file is {len(leftover)} bytes, expected 10")
+    ctx.check(leftover not in out and leftover not in err,
+              "partial key bytes leaked onto stdout/stderr")
+    assert_bystander_untouched(ctx, bystander, bystander_content, bystander_mode)
+
+    snapshot, calls = parse_write_log(ctx, log_path)
+    ctx.check(calls[-1] == (10, 22, -1, _EIO),
+              f"trace did not end with the injected error: {calls!r}")
+    ctx.check(bytes.fromhex(snapshot)[:10] == leftover,
+              "leftover bytes are not the prefix of the generated key")
+
+
+def test_permission_failure_with_failed_cleanup_writes_nothing(ctx, workdir):
+    # Permissions cannot be forced to 0600 and the removal also fails: the
+    # run stops before any key byte (the write trace is never created), the
+    # empty file remains, both messages are reported, and the key is still
+    # wiped with the descriptor closed.
+    path = os.path.join(workdir, "envelope.key")
+    bystander, bystander_content, bystander_mode = make_bystander(ctx, workdir)
+    write_log = os.path.join(workdir, "write.log")
+    key_log = os.path.join(workdir, "key.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_FCHMOD="1",
+                             EF_TEST_FAIL_UNLINK="1",
+                             EF_TEST_WRITE_LOG=write_log,
+                             EF_TEST_KEY_LOG=key_log),
+        use_testable=True)
+
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"", f"stdout not empty: {out!r:.200}")
+    lines = err.splitlines()
+    ctx.check(len(lines) == 2,
+              f"expected the permission failure and the removal warning, "
+              f"got: {err!r:.200}")
+    ctx.check(b"permissions" in lines[0] and b"0600" in lines[0] and
+              str(path).encode() in lines[0],
+              f"first stderr line is not the permission cause: {err!r:.200}")
+    ctx.check(CLEANUP_WARNING_MARKER.encode() in lines[1] and
+              str(path).encode() in lines[1],
+              f"second stderr line is not the removal warning: {err!r:.200}")
+
+    ctx.check(os.path.lexists(path), "file removed despite failing cleanup")
+    ctx.check(read_bytes(path) == b"", "key bytes written before permission stop")
+    ctx.check(not os.path.exists(write_log),
+              "write() reached the key file even though permissions failed")
+    assert_bystander_untouched(ctx, bystander, bystander_content, bystander_mode)
+    events = parse_key_log(ctx, key_log)
+    assert_key_buffer_wiped(ctx, events,
+                            "permission failure with failed cleanup",
+                            expect_writes=0)
+
+
+def test_existing_target_refusal_skips_cleanup(ctx, workdir):
+    # A pre-creation refusal must not enter the new-file removal path at all:
+    # with the unlink fault armed the existing target is still simply
+    # refused, its content/permissions/links are untouched, and no cleanup
+    # warning is reported (this is kNotCreated, not kCleanupFailed).
+    path = os.path.join(workdir, "existing.key")
+    original = b"pre-existing content that must survive\x00\x01"
+    with open(path, "wb") as handle:
+        handle.write(original)
+    os.chmod(path, 0o640)
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_UNLINK="1"),
+        use_testable=True)
+    assert_rejected(ctx, rc, out, err, reason="already exists")
+    ctx.check(rc == 1, f"expected exit 1, got {rc}")
+    ctx.check(CLEANUP_WARNING_MARKER.encode() not in err,
+              f"a pre-creation refusal carried a cleanup warning: {err!r:.200}")
+    ctx.check(read_bytes(path) == original, "existing file content changed")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    ctx.check(mode == 0o640, f"existing file mode changed to {oct(mode)}")
+
+
+def test_successful_save_unaffected_by_unlink_fault(ctx, workdir):
+    # The unlink fault only applies to cleanup of a failed save: a normal
+    # successful run never unlinks anything and reports no warning.
+    path = os.path.join(workdir, "envelope.key")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_UNLINK="1"),
+        use_testable=True)
+    assert_success(ctx, rc, out, err, path)
+    key = assert_key_file(ctx, path)
+    assert_no_key_leak(ctx, key, out, err)
 
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1375,11 @@ ALL_TESTS = [
     test_fsync_failure_cleans_up,
     test_close_failure_cleans_up,
     test_fchmod_failure_cleans_up,
+    test_write_failure_with_failed_cleanup_reports_both,
+    test_partial_write_with_failed_cleanup_leaves_incomplete,
+    test_permission_failure_with_failed_cleanup_writes_nothing,
+    test_existing_target_refusal_skips_cleanup,
+    test_successful_save_unaffected_by_unlink_fault,
     test_permission_verify_failure_when_metadata_unreadable,
     test_permission_verify_failure_when_mode_not_0600,
     test_partial_write_completes,

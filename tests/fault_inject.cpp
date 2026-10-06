@@ -2,8 +2,9 @@
 //
 // This file is linked together with src/main.cpp into the separate
 // `envelopefile_testable` binary using the linker's --wrap option, so every
-// open/write/fsync/close call made by the product code is routed through the
-// __wrap_* functions below. The production binary is completely unaffected.
+// open/write/fsync/close/unlink call made by the product code is routed
+// through the __wrap_* functions below. The production binary is completely
+// unaffected.
 //
 // Injection is controlled entirely through environment variables so the test
 // driver can select a scenario per process run:
@@ -18,6 +19,12 @@
 //   EF_TEST_FAIL_CLOSE=1    close() on the key file reports EIO (the
 //                           descriptor is still really closed, matching the
 //                           POSIX guarantee that close() releases the fd).
+//   EF_TEST_FAIL_UNLINK=1   unlink() of the key file fails with EIO after a
+//                           save failure, simulating cleanup that cannot
+//                           remove the incomplete file the run just created.
+//                           The key file is really left on disk. Only the
+//                           path created by this run is affected: unlinks of
+//                           any other path pass through untouched.
 //   EF_TEST_FAIL_FCHMOD=1   fchmod() on the key file fails with EPERM, so the
 //                           0600 permission guarantee cannot be established.
 //   EF_TEST_FAIL_FSTAT=1    fstat() on the key file fails with EIO even though
@@ -126,6 +133,7 @@ int __real_fstat(int fd, struct stat* info);
 ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
+int __real_unlink(const char* path);
 int __real_RAND_bytes(unsigned char* buf, int num);
 void __real_OPENSSL_cleanse(void* ptr, size_t len);
 
@@ -135,6 +143,20 @@ constexpr std::size_t kKeyBytes = 32;
 
 // Descriptor currently known to belong to the key file under test, or -1.
 int g_keyFd = -1;
+
+// Path the current key-file descriptor was created at, so unlink() cleanup
+// can be faulted for exactly that path. Bounded storage is enough: the test
+// driver only uses short scratch paths; a longer path simply is not tracked
+// and its unlink passes through untouched.
+char g_keyPath[4096] = {};
+
+void setKeyPath(const char* path) {
+    g_keyPath[0] = '\0';
+    if (path != nullptr) {
+        std::strncpy(g_keyPath, path, sizeof(g_keyPath) - 1);
+        g_keyPath[sizeof(g_keyPath) - 1] = '\0';
+    }
+}
 
 // Key buffer most recently handed to RAND_bytes, so the OPENSSL_cleanse
 // wrapper can recognise (and log) its wipe.
@@ -347,6 +369,7 @@ int __wrap_open(const char* path, int flags, ...) {
     if (fd != -1 && (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 &&
         isKeyPath(path)) {
         g_keyFd = fd;
+        setKeyPath(path);
         resetWriteBookkeeping();
     }
     return fd;
@@ -465,6 +488,20 @@ int __wrap_close(int fd) {
         }
     }
     return result;
+}
+
+int __wrap_unlink(const char* path) {
+    // Only the cleanup of the file this run created can be faulted, so a
+    // simulated failure never blocks removal of (or any operation on) an
+    // unrelated path — the product code only ever unlinks the O_EXCL-created
+    // key path, and this matches the injection to exactly that name.
+    if (path != nullptr && g_keyPath[0] != '\0' &&
+        std::strcmp(path, g_keyPath) == 0 &&
+        envFlagSet("EF_TEST_FAIL_UNLINK")) {
+        errno = EIO;
+        return -1;
+    }
+    return __real_unlink(path);
 }
 
 int __wrap_RAND_bytes(unsigned char* buf, int num) {

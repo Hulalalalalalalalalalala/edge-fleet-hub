@@ -28,7 +28,7 @@ if(BUILD_TESTING)
     include(CheckLinkerFlag)
 
     set(_fault_inject_wrap_options
-        "LINKER:--wrap=open,--wrap=fchmod,--wrap=fstat,--wrap=write,--wrap=fsync,--wrap=close,--wrap=RAND_bytes,--wrap=OPENSSL_cleanse")
+        "LINKER:--wrap=open,--wrap=fchmod,--wrap=fstat,--wrap=write,--wrap=fsync,--wrap=close,--wrap=unlink,--wrap=RAND_bytes,--wrap=OPENSSL_cleanse")
     check_linker_flag(CXX "${_fault_inject_wrap_options}"
                       EF_LINKER_SUPPORTS_WRAP)
 
@@ -48,6 +48,7 @@ if(BUILD_TESTING)
             "LINKER:--wrap=write"
             "LINKER:--wrap=fsync"
             "LINKER:--wrap=close"
+            "LINKER:--wrap=unlink"
             "LINKER:--wrap=RAND_bytes"
             "LINKER:--wrap=OPENSSL_cleanse")
 
