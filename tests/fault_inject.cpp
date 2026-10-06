@@ -103,6 +103,16 @@
 //                             detail text; when unset the queue is cleared
 //                             instead, exercising the no-detail message.
 //
+//   EF_TEST_CLEANSE_LOG=path  one line per OPENSSL_cleanse call:
+//                               CLEANSE <len>
+//                             Unlike EF_TEST_KEY_LOG (which only tracks the
+//                             buffer handed to RAND_bytes), this records
+//                             every cleanse, so the encrypt tests can prove
+//                             the key buffer read from the key file — which
+//                             never passes through RAND_bytes — is wiped
+//                             before the process exits, on success and on
+//                             every failure path.
+//
 // Key-buffer lifecycle events are recorded when requested:
 //
 //   EF_TEST_KEY_LOG=path      one line per event:
@@ -593,6 +603,11 @@ int __wrap_RAND_bytes(unsigned char* buf, int num) {
 }
 
 void __wrap_OPENSSL_cleanse(void* ptr, size_t len) {
+    if (std::getenv("EF_TEST_CLEANSE_LOG") != nullptr) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "CLEANSE %zu", len);
+        logLine("EF_TEST_CLEANSE_LOG", "a", line);
+    }
     if (ptr != nullptr && ptr == g_randBuf) {
         char line[96];
         std::snprintf(line, sizeof(line), "CLEANSED-KEY %zu", len);
