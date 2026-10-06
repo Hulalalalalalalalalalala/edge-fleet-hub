@@ -25,6 +25,21 @@
 //                           The key file is really left on disk. Only the
 //                           path created by this run is affected: unlinks of
 //                           any other path pass through untouched.
+//   EF_TEST_FAIL_OPEN=1     the key file's open(O_CREAT|O_EXCL) fails BEFORE
+//                           any file is created — the real syscall is never
+//                           reached — simulating a save location that refuses
+//                           to accept the new file at creation time. The errno
+//                           defaults to EACCES (a parent directory that denies
+//                           creation) and can be overridden with the decimal
+//                           value in EF_TEST_OPEN_ERRNO. Because the refusal
+//                           is injected, the scenario is real even when the
+//                           test process runs with effective permission in the
+//                           directory (e.g. as root), and nothing is left on
+//                           disk, so the product's pre-creation ("not created")
+//                           path is exercised rather than its post-creation
+//                           cleanup. Only the O_CREAT|O_EXCL key-file open is
+//                           matched, so log files and every other open pass
+//                           through untouched.
 //   EF_TEST_FAIL_FCHMOD=1   fchmod() on the key file fails with EPERM, so the
 //                           0600 permission guarantee cannot be established.
 //   EF_TEST_FAIL_FSTAT=1    fstat() on the key file fails with EIO even though
@@ -364,6 +379,26 @@ int __wrap_open(const char* path, int flags, ...) {
         va_start(args, flags);
         mode = static_cast<mode_t>(va_arg(args, int));
         va_end(args);
+    }
+    // Pre-creation refusal: fail WITHOUT calling the real open(), so the file
+    // is provably never created (there is no descriptor and nothing on disk),
+    // exercising the product's "open() produced no file" branch rather than
+    // its post-creation cleanup. Matching only the O_CREAT|O_EXCL key open
+    // keeps every other open (logs, stdio) untouched.
+    if ((flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 &&
+        path != nullptr && isKeyPath(path) &&
+        envFlagSet("EF_TEST_FAIL_OPEN")) {
+        int injectedErrno = EACCES;
+        const char* raw = std::getenv("EF_TEST_OPEN_ERRNO");
+        if (raw != nullptr && raw[0] != '\0') {
+            char* end = nullptr;
+            const long requested = std::strtol(raw, &end, 10);
+            if (end != raw && *end == '\0' && requested > 0) {
+                injectedErrno = static_cast<int>(requested);
+            }
+        }
+        errno = injectedErrno;
+        return -1;
     }
     int fd = __real_open(path, flags, mode);
     if (fd != -1 && (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 &&

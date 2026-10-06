@@ -22,6 +22,29 @@ Covers the guarantees around the user-chosen key file location:
 * an already-existing target (regular file, empty file, directory, symlink,
   dangling symlink) is rejected with a non-zero status, an explanation on
   stderr, and the pre-existing target left byte-for-byte untouched;
+* a legal --output path whose save location cannot accept the new file fails
+  at open() BEFORE anything is created. Both causes are covered and kept
+  distinguishable by the reported reason: a parent directory that does not
+  exist (ENOENT, exercised through the real filesystem against the production
+  binary — the program never creates the missing directories itself) and the
+  operating system denying creation inside an existing directory (EACCES,
+  injected deterministically: real directory modes cannot be trusted to deny
+  the test account, since the suite may run as root, but a control run into
+  the same directory proves it really does accept new files, and an
+  unexpectedly-created target fails the case). The run exits 1 with empty
+  stdout and exactly one stderr line, "cannot create key file
+  '<path>': <reason>", naming the user-specified path verbatim (spaces
+  preserved, never trimmed or split) and the platform's description of the
+  actual errno — never collapsed into "already exists" and never misreported
+  as a usage error (exit 2), random-source failure, write/sync/close
+  failure, or the new-file permission set/verification failure. Because no
+  file was created there is no cleanup path: no "could not remove partial
+  key file" warning, the missing parent stays absent, and an existing
+  parent directory keeps its mode while sibling files keep content and
+  permissions. The full 32-byte key RAND_bytes already produced is still
+  wiped in full before exit (proven through the lifecycle log, with no
+  write trace ever created), and no key material reaches either stream;
+
 * failures after the new file was created (write/fsync/close) never report
   success, return non-zero, clean up the incomplete key file, and leave
   neighbouring files alone; a partially-written file that is completed by
@@ -933,6 +956,207 @@ def test_error_messages_distinguishable(ctx, workdir):
 
 
 # ---------------------------------------------------------------------------
+# Save locations that refuse the new file at open() time. The --output
+# argument is legal, but open() fails before it ever produces a descriptor:
+# either the parent directory does not exist (ENOENT), or the operating
+# system refuses to create the file inside an existing directory (EACCES).
+# This is the "not created" class: the diagnostic must be a creation failure
+# that names the actual errno reason — never collapsed into an
+# already-existing refusal and never misreported as a usage, random-source,
+# write/sync/close, or new-file permission set/verification failure — and the
+# post-creation cleanup path must not run (nothing to remove, so no
+# partial-file warning). The 32-byte key was nevertheless generated in full
+# before open() and is wiped in full afterwards.
+# ---------------------------------------------------------------------------
+
+CREATE_FAILURE_MARKER = "cannot create key file"
+
+# Phrases belonging to every other failure class, reused to prove a
+# pre-creation refusal is reported as its own class.
+_NON_CREATION_PHRASES = (
+    b"already exists",
+    RAND_FAILURE_MARKER.encode(),
+    b"failed writing",
+    b"short write",
+    b"failed syncing",
+    b"failed closing",
+    b"cannot set key file permissions",
+    b"cannot verify key file permissions",
+    b"cannot guarantee key file permissions",
+)
+
+
+def assert_creation_failure(ctx, rc, out, err, path, error_number):
+    """Contract for an open()-time refusal on a legal --output path.
+
+    The stderr line is pinned exactly: the fixed prefix, the user-specified
+    path verbatim, and the platform's own strerror text for the observed
+    errno. That equality simultaneously guarantees the path (including
+    spaces) is preserved and that no key-derived fragment can be present,
+    since every byte of the line is accounted for by those three parts."""
+    expected = (f"envelopefile: {CREATE_FAILURE_MARKER} '{path}': "
+                f"{os.strerror(error_number)}\n").encode()
+    ctx.check(rc == 1,
+              f"expected exit 1 for a creation failure, got {rc} "
+              f"(stderr: {err!r:.200})")
+    ctx.check(out == b"",
+              f"stdout not empty on a creation failure: {out!r:.200}")
+    ctx.check(err == expected,
+              f"creation failure must be exactly one line naming the path "
+              f"and the errno {error_number} reason: {err!r:.200}")
+    ctx.check(str(path).encode() in err,
+              "diagnostic lost the user-specified target path")
+    ctx.check(b"Usage:" not in err,
+              "creation failure misreported as a usage error")
+    for phrase in _NON_CREATION_PHRASES:
+        ctx.check(phrase not in err,
+                  f"pre-creation failure misreported as {phrase.decode()!r}: "
+                  f"{err!r:.200}")
+    ctx.check(CLEANUP_WARNING_MARKER.encode() not in err,
+              "nothing was created, yet a partial-file cleanup warning appeared")
+
+
+def test_missing_parent_directory_is_not_created(ctx, workdir):
+    # A legal path whose parent directory does not exist: open() fails with
+    # ENOENT against the REAL filesystem on the production binary (no shim),
+    # the missing directories are never created on the user's behalf, and the
+    # refusal names the space-bearing path verbatim with the real reason.
+    bystander, bystander_content, bystander_mode = make_bystander(ctx, workdir)
+    parent_mode_before = stat.S_IMODE(os.stat(workdir).st_mode)
+    missing_parent = os.path.join(workdir, "missing key dir")
+    path = os.path.join(missing_parent, "nested", "envelope key.key")
+    ctx.check(not os.path.lexists(missing_parent),
+              "fixture error: the parent directory unexpectedly exists")
+    rc, out, err = run(ctx, ["keygen", "--output", path])
+    assert_creation_failure(ctx, rc, out, err, path, errno.ENOENT)
+
+    ctx.check(not os.path.lexists(path),
+              "target appeared despite the missing parent directory")
+    ctx.check(not os.path.lexists(missing_parent),
+              "the program created the missing parent directory itself")
+    parent_mode_after = stat.S_IMODE(os.stat(workdir).st_mode)
+    ctx.check(parent_mode_after == parent_mode_before,
+              f"existing parent directory mode changed from "
+              f"{oct(parent_mode_before)} to {oct(parent_mode_after)}")
+    assert_bystander_untouched(ctx, bystander, bystander_content, bystander_mode)
+
+
+def test_missing_parent_directory_wipes_generated_key(ctx, workdir):
+    # The same ENOENT refusal on the instrumented build proves the wipe
+    # obligation: RAND_bytes filled the complete 32-byte key before open() was
+    # attempted, and the file never existing does not waive cleansing — the
+    # whole buffer is wiped once, after the failed open, with no write ever
+    # attempted (the write trace must not even be created).
+    missing_parent = os.path.join(workdir, "missing dir")
+    path = os.path.join(missing_parent, "envelope key.key")
+    key_log = os.path.join(workdir, "key.log")
+    write_log = os.path.join(workdir, "write.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_KEY_LOG=key_log,
+                             EF_TEST_WRITE_LOG=write_log),
+        use_testable=True)
+    assert_creation_failure(ctx, rc, out, err, path, errno.ENOENT)
+    ctx.check(not os.path.lexists(missing_parent),
+              "missing parent directory was created")
+    ctx.check(not os.path.exists(write_log),
+              "write() was attempted even though open() never made a file")
+    events = parse_key_log(ctx, key_log)
+    assert_key_buffer_wiped(ctx, events,
+                            "missing-parent-directory refusal",
+                            expect_writes=0)
+
+
+def test_create_permission_denied_is_not_created(ctx, workdir):
+    # The parent exists but the OS refuses to create the new file in it
+    # (EACCES). Real directory modes cannot be trusted to deny the test
+    # account — the suite may run as root, where a chmod-restricted directory
+    # still accepts creates — so the refusal is injected at open() before the
+    # real syscall, deterministically, without creating anything.
+    #
+    # A control run into the SAME directory first proves that it really does
+    # accept new files, so this case cannot pass merely because the directory
+    # was unwritable for some unrelated reason; and if the fault ever failed
+    # to fire, the target would exist with rc 0 and this case fails instead of
+    # silently counting the wrong scenario as covered.
+    bystander, bystander_content, bystander_mode = make_bystander(
+        ctx, workdir, name="sibling file.bin",
+        content=b"keep these bytes", mode=0o640)
+    parent_mode_before = stat.S_IMODE(os.stat(workdir).st_mode)
+
+    control = os.path.join(workdir, "control key.key")
+    rc, out, err = run(ctx, ["keygen", "--output", control],
+                       env_extra=_fault_env(), use_testable=True)
+    assert_success(ctx, rc, out, err, control)
+    assert_key_file(ctx, control)
+    os.remove(control)
+
+    path = os.path.join(workdir, "denied envelope key.key")
+    key_log = os.path.join(workdir, "key.log")
+    write_log = os.path.join(workdir, "write.log")
+    ctx.check(not os.path.lexists(path),
+              "fixture error: target already exists")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_OPEN="1",
+                             EF_TEST_OPEN_ERRNO=str(errno.EACCES),
+                             EF_TEST_KEY_LOG=key_log,
+                             EF_TEST_WRITE_LOG=write_log),
+        use_testable=True)
+    assert_creation_failure(ctx, rc, out, err, path, errno.EACCES)
+
+    # open() refused before creation: no target, no write trace, and the
+    # existing directory plus its other files are byte- and mode-identical.
+    ctx.check(not os.path.lexists(path),
+              "target was created despite the injected EACCES refusal")
+    ctx.check(not os.path.exists(write_log),
+              "write() ran even though open() refused the new file")
+    parent_mode_after = stat.S_IMODE(os.stat(workdir).st_mode)
+    ctx.check(parent_mode_after == parent_mode_before,
+              f"parent directory mode changed from "
+              f"{oct(parent_mode_before)} to {oct(parent_mode_after)}")
+    assert_bystander_untouched(ctx, bystander, bystander_content, bystander_mode)
+
+    events = parse_key_log(ctx, key_log)
+    assert_key_buffer_wiped(ctx, events,
+                            "create-permission-denied refusal",
+                            expect_writes=0)
+
+
+def test_creation_failure_reasons_distinguishable(ctx, workdir):
+    # "The parent directory is missing" and "you are not allowed to create
+    # in it" need different fixes: their reasons must stay distinct rather
+    # than collapsing into one generic creation string.
+    missing = os.path.join(workdir, "absent dir", "envelope key.key")
+    rc, out, err_missing = run(ctx, ["keygen", "--output", missing])
+    ctx.check(rc == 1 and out == b"",
+              f"missing-parent run broke the creation-failure contract: "
+              f"rc={rc}, {err_missing!r:.200}")
+
+    denied = os.path.join(workdir, "envelope key.key")
+    rc, out, err_denied = run(
+        ctx, ["keygen", "--output", denied],
+        env_extra=_fault_env(EF_TEST_FAIL_OPEN="1",
+                             EF_TEST_OPEN_ERRNO=str(errno.EACCES)),
+        use_testable=True)
+    ctx.check(rc == 1 and out == b"",
+              f"permission-denied run broke the creation-failure contract: "
+              f"rc={rc}, {err_denied!r:.200}")
+
+    enoent_text = os.strerror(errno.ENOENT).encode()
+    eacces_text = os.strerror(errno.EACCES).encode()
+    ctx.check(enoent_text in err_missing and eacces_text in err_denied,
+              f"each diagnostic must carry its own errno reason: "
+              f"{err_missing!r:.200} / {err_denied!r:.200}")
+    ctx.check(eacces_text not in err_missing,
+              "missing-parent case carried the permission-denied reason")
+    ctx.check(enoent_text not in err_denied,
+              "permission-denied case carried the missing-parent reason")
+    ctx.check(err_missing != err_denied,
+              "the two creation-failure reasons are indistinguishable")
+
+
+# ---------------------------------------------------------------------------
 # Argument validation: the whole argument list must be valid before any key
 # is generated or saved. A usage error exits 2 with an empty stdout and a
 # stderr message naming the argument problem plus the keygen usage — never
@@ -1390,6 +1614,10 @@ ALL_TESTS = [
     test_zero_byte_write_fails_without_retry,
     test_write_failure_does_not_touch_existing_target,
     test_error_messages_distinguishable,
+    test_missing_parent_directory_is_not_created,
+    test_missing_parent_directory_wipes_generated_key,
+    test_create_permission_denied_is_not_created,
+    test_creation_failure_reasons_distinguishable,
     test_usage_missing_output_option,
     test_usage_output_option_without_value,
     test_usage_output_empty_path,
