@@ -22,6 +22,23 @@ Covers the guarantees around the user-chosen key file location:
 * an already-existing target (regular file, empty file, directory, symlink,
   dangling symlink) is rejected with a non-zero status, an explanation on
   stderr, and the pre-existing target left byte-for-byte untouched;
+* a legal --output whose location cannot receive a new file at all — the
+  parent directory does not exist (ENOENT, including nested and space-bearing
+  paths) or the operating system refuses creation in the existing parent
+  (EACCES) — fails with exit 1, empty stdout, and a single stderr line that
+  says the key file could not be created, quotes the exact user-specified
+  path with its spaces intact, and gives the OS reason; ENOENT and EACCES stay
+  distinguishable through that reason, and neither is reported as an
+  existing-target refusal, a usage error, a random-source failure, or a
+  write/sync/close/permission-verification failure. The target stays absent,
+  missing directories are not auto-created, the existing directory's mode and
+  neighbouring files are untouched, no "could not remove partial key file"
+  warning appears (the removal path is never entered), and the fully
+  generated 32-byte key is still wiped despite never having been saved. The
+  EACCES scenario is exercised both against a real read-only directory whose
+  denial a direct probe syscall first confirms (skipped, never falsely
+  passed, where the account — e.g. root — bypasses directory permission
+  bits) and against a deterministic open()-refusal fault shim;
 * failures after the new file was created (write/fsync/close) never report
   success, return non-zero, clean up the incomplete key file, and leave
   neighbouring files alone; a partially-written file that is completed by
@@ -90,6 +107,14 @@ PARTIAL_FILL_BYTE = 0xA5
 
 
 class Failure(Exception):
+    pass
+
+
+class Skip(Exception):
+    """A scenario that cannot be exercised in this environment (e.g. the
+    account bypasses the permission bits the test relies on). Skipping is
+    never used to mask a failed assertion, and every skipped scenario has a
+    deterministic fault-shim counterpart that still covers its contract."""
     pass
 
 
@@ -909,6 +934,275 @@ def test_write_failure_does_not_touch_existing_target(ctx, workdir):
               "write shim fired even though open() refused the target")
 
 
+# ---------------------------------------------------------------------------
+# Pre-creation failures: --output names a legal path, but open() with
+# O_CREAT|O_EXCL cannot create the file at all — the parent directory does not
+# exist (ENOENT) or the operating system refuses creation there (EACCES).
+# Nothing is created, so this is kNotCreated: exit 1, empty stdout, a single
+# stderr line "cannot create key file '<path>': <reason>", no cleanup path and
+# therefore no removal warning. It must not be conflated with an
+# already-existing target, a usage error, a random-source failure, or any
+# post-creation failure (permissions verification / write / sync / close) — and
+# the successfully generated 32-byte key is still wiped in full. The two
+# pre-creation reasons stay distinguishable through the OS-provided reason
+# text, whose exact wording the assertions do not depend on beyond errno.
+# ---------------------------------------------------------------------------
+
+CREATE_FAIL_MARKER = "cannot create key file"
+
+# Phrases that belong to every OTHER failure class; a pre-creation refusal
+# must never carry one of them.
+_NON_CREATE_FAILURE_PHRASES = (
+    b"Usage:",
+    b"already exists",
+    RAND_FAILURE_MARKER.encode(),
+    b"permissions",      # fchmod/verify/guarantee messages are post-creation
+    b"failed writing",
+    b"short write",
+    b"failed syncing",
+    b"failed closing",
+)
+
+
+def assert_precreation_failure(ctx, rc, out, err, path, expected_errno, kind,
+                               exact=False):
+    """Contract for a run whose target file was never created.
+
+    When `exact` is set the whole stderr must equal the single expected line
+    (used for the deterministic shim run); otherwise the marker, the exact
+    user-specified path, and the OS reason for `expected_errno` are checked as
+    substrings (the OS may append locale-dependent wording elsewhere)."""
+    ctx.check(rc == 1,
+              f"{kind}: expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(rc != 2, f"{kind}: legal arguments reported as a usage error")
+    ctx.check(out == b"", f"{kind}: stdout not empty: {out!r:.200}")
+    ctx.check(CREATE_FAIL_MARKER.encode() in err,
+              f"{kind}: stderr does not say the key file could not be created: "
+              f"{err!r:.200}")
+    # The exact path the user typed, spaces kept and never split/trimmed.
+    ctx.check(("'" + str(path) + "'").encode() in err,
+              f"{kind}: stderr does not quote the user-specified path "
+              f"{str(path)!r} intact: {err!r:.200}")
+    ctx.check(os.strerror(expected_errno).encode() in err,
+              f"{kind}: stderr does not give the reason for errno "
+              f"{expected_errno} ({os.strerror(expected_errno)!r}): "
+              f"{err!r:.200}")
+    if exact:
+        expected = (f"envelopefile: {CREATE_FAIL_MARKER} '{path}': "
+                    f"{os.strerror(expected_errno)}\n").encode()
+        ctx.check(err == expected,
+                  f"{kind}: unexpected stderr: {err!r:.200}")
+    # Exactly one line: a pre-creation failure must not enter the
+    # remove-the-new-file path, so no "could not remove partial key file"
+    # warning may follow.
+    ctx.check(len(err.splitlines()) == 1,
+              f"{kind}: expected a single stderr line without a cleanup "
+              f"warning: {err!r:.200}")
+    ctx.check(CLEANUP_WARNING_MARKER.encode() not in err,
+              f"{kind}: nothing was created, yet a cleanup warning was "
+              f"reported: {err!r:.200}")
+    for phrase in _NON_CREATE_FAILURE_PHRASES:
+        ctx.check(phrase not in err,
+                  f"{kind}: pre-creation failure misreported as "
+                  f"{phrase.decode()!r}: {err!r:.200}")
+
+
+def assert_target_and_bystander_absent_untouched(
+        ctx, kind, target, missing_dirs=(), bystander=None,
+        bystander_content=None, bystander_mode=None, directory=None,
+        directory_mode=None):
+    """Filesystem aftermath of a refused creation: target still absent, no
+    directory auto-created, existing directory and neighbours untouched."""
+    ctx.check(not os.path.lexists(target),
+              f"{kind}: target exists although creation failed")
+    for directory_path in missing_dirs:
+        ctx.check(not os.path.exists(directory_path),
+                  f"{kind}: the program created the missing directory "
+                  f"{directory_path!r} itself")
+    if directory is not None:
+        actual = stat.S_IMODE(os.stat(directory).st_mode)
+        ctx.check(actual == directory_mode,
+                  f"{kind}: existing directory mode changed from "
+                  f"{oct(directory_mode)} to {oct(actual)}")
+    if bystander is not None:
+        assert_bystander_untouched(ctx, bystander, bystander_content,
+                                   bystander_mode)
+
+
+def probe_create_denied(directory):
+    """Determine from a DIRECT syscall (the harness is never fault-wrapped)
+    whether this account really cannot create a file in `directory`.
+
+    Returns (denied, probe_name). When creation is allowed, the probe file is
+    removed and the caller must SKIP rather than treat that as coverage: only
+    an actually observed denial proves the EACCES path. Root in particular
+    bypasses a read-only directory's permission bits."""
+    probe_name = os.path.join(directory, ".ef-create-probe")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(probe_name, flags, 0o600)
+    except OSError as exc:
+        return exc.errno == errno.EACCES, probe_name
+    os.close(fd)
+    os.unlink(probe_name)
+    return False, probe_name
+
+
+def test_create_fails_missing_parent_directory(ctx, workdir):
+    # A legal --output whose parent directory does not exist: the program must
+    # not create directories itself, must fail with ENOENT before any file
+    # exists, and must keep the exact (space-bearing) path in the message.
+    bystander, bystander_content, bystander_mode = make_bystander(ctx, workdir)
+    missing_parent = os.path.join(workdir, "missing parent dir")
+    path = os.path.join(missing_parent, "envelope key.key")
+    rc, out, err = run(ctx, ["keygen", "--output", path])
+    assert_precreation_failure(ctx, rc, out, err, path, errno.ENOENT,
+                               "missing parent directory")
+    assert_target_and_bystander_absent_untouched(
+        ctx, "missing parent directory", path,
+        missing_dirs=(missing_parent,), bystander=bystander,
+        bystander_content=bystander_content,
+        bystander_mode=bystander_mode)
+
+
+def test_create_fails_missing_nested_parent(ctx, workdir):
+    # Several levels missing at once: still one pre-creation ENOENT, still no
+    # directory created at any level, still no cleanup warning.
+    missing_chain = [os.path.join(workdir, "no such"),
+                     os.path.join(workdir, "no such", "deeper level")]
+    path = os.path.join(missing_chain[-1], "envelope.key")
+    rc, out, err = run(ctx, ["keygen", "--output", path])
+    assert_precreation_failure(ctx, rc, out, err, path, errno.ENOENT,
+                               "missing nested parent")
+    assert_target_and_bystander_absent_untouched(
+        ctx, "missing nested parent", path, missing_dirs=tuple(missing_chain))
+
+
+def test_create_fails_unwritable_directory(ctx, workdir):
+    # The parent exists but this account genuinely cannot create files in it
+    # (mode 0550: no write bit). The denial must be OBSERVED first: a direct
+    # probe syscall from the harness proves EACCES. If creation unexpectedly
+    # succeeds (e.g. running as root, which bypasses directory permission
+    # bits), this real-filesystem case is skipped — the deterministic
+    # open-fault shim case below covers the identical contract there, and an
+    # unexpected success is never accepted as proof of the denial scenario.
+    directory = os.path.join(workdir, "read only dir")
+    os.mkdir(directory)
+    bystander, bystander_content, bystander_mode = make_bystander(
+        ctx, directory, name="unrelated.txt", content=b"do not touch",
+        mode=0o644)
+    os.chmod(directory, 0o550)
+    try:
+        denied, _ = probe_create_denied(directory)
+        if not denied:
+            raise Skip(
+                "account bypasses the directory write permission (e.g. root); "
+                "the EACCES contract is covered by the open-fault shim case")
+        path = os.path.join(directory, "envelope key.key")
+        rc, out, err = run(ctx, ["keygen", "--output", path])
+        assert_precreation_failure(ctx, rc, out, err, path, errno.EACCES,
+                                   "unwritable directory")
+        assert_target_and_bystander_absent_untouched(
+            ctx, "unwritable directory", path, directory=directory,
+            directory_mode=0o550, bystander=bystander,
+            bystander_content=bystander_content,
+            bystander_mode=bystander_mode)
+    finally:
+        # Restore writability so scratch cleanup is never blocked.
+        os.chmod(directory, 0o755)
+
+
+def test_create_fails_open_refused_by_shim(ctx, workdir):
+    # Deterministic creation refusal at the open() syscall boundary (EACCES
+    # without the real syscall running): covers the exact contract even under
+    # an account that bypasses directory permissions. Nothing is created, the
+    # unlink-fault knob being armed does not produce a cleanup warning (the
+    # removal path is never entered), no write reaches the file, and the full
+    # generated 32-byte key is still wiped after the outcome.
+    directory = os.path.join(workdir, "shim refused dir")
+    os.mkdir(directory)
+    directory_mode = stat.S_IMODE(os.stat(directory).st_mode)
+    bystander, bystander_content, bystander_mode = make_bystander(
+        ctx, directory, content=b"do not touch")
+    path = os.path.join(directory, "envelope key.key")
+    write_log = os.path.join(workdir, "write.log")
+    key_log = os.path.join(workdir, "key.log")
+    rc, out, err = run(
+        ctx, ["keygen", "--output", path],
+        env_extra=_fault_env(EF_TEST_FAIL_OPEN="1",
+                             EF_TEST_FAIL_UNLINK="1",
+                             EF_TEST_WRITE_LOG=write_log,
+                             EF_TEST_KEY_LOG=key_log),
+        use_testable=True)
+    assert_precreation_failure(ctx, rc, out, err, path, errno.EACCES,
+                               "shim open refusal", exact=True)
+    assert_target_and_bystander_absent_untouched(
+        ctx, "shim open refusal", path, directory=directory,
+        directory_mode=directory_mode, bystander=bystander,
+        bystander_content=bystander_content, bystander_mode=bystander_mode)
+    # The refusal happened at open(): the write shim's trace is created on the
+    # first key-file write, so it must not exist at all.
+    ctx.check(not os.path.exists(write_log),
+              "shim open refusal: write() was reached despite the failed open")
+    # A complete 32-byte key was generated, never written (writes=0), and the
+    # key-file descriptor was never open when the buffer was wiped.
+    events = parse_key_log(ctx, key_log)
+    assert_key_buffer_wiped(ctx, events, "shim open refusal", expect_writes=0)
+
+
+def test_precreation_failure_reasons_distinguishable(ctx, workdir):
+    # The two unavailable-location cases must report different OS reasons
+    # (ENOENT vs EACCES), and both must differ from an existing-target
+    # refusal. The assertions anchor on strerror(errno), tolerating any other
+    # wording differences the platform provides.
+    missing = os.path.join(workdir, "missing parent", "envelope.key")
+    _, _, err_enoent = run(ctx, ["keygen", "--output", missing])
+    ctx.check(CREATE_FAIL_MARKER.encode() in err_enoent,
+              f"ENOENT case not reported as a creation failure: "
+              f"{err_enoent!r:.200}")
+    ctx.check(os.strerror(errno.ENOENT).encode() in err_enoent,
+              f"ENOENT reason missing: {err_enoent!r:.200}")
+    ctx.check(os.strerror(errno.EACCES).encode() not in err_enoent,
+              f"missing-parent case reported the permission reason: "
+              f"{err_enoent!r:.200}")
+
+    refused_dir = os.path.join(workdir, "refused")
+    os.mkdir(refused_dir)
+    refused_path = os.path.join(refused_dir, "envelope.key")
+    _, _, err_eacces = run(
+        ctx, ["keygen", "--output", refused_path],
+        env_extra=_fault_env(EF_TEST_FAIL_OPEN="1"),
+        use_testable=True)
+    ctx.check(CREATE_FAIL_MARKER.encode() in err_eacces,
+              f"EACCES case not reported as a creation failure: "
+              f"{err_eacces!r:.200}")
+    ctx.check(os.strerror(errno.EACCES).encode() in err_eacces,
+              f"EACCES reason missing: {err_eacces!r:.200}")
+    ctx.check(os.strerror(errno.ENOENT).encode() not in err_eacces,
+              f"refused-creation case reported the missing-directory reason: "
+              f"{err_eacces!r:.200}")
+
+    ctx.check(err_enoent != err_eacces,
+              "missing-parent and permission-denied failures are reported "
+              "identically: the two causes cannot be distinguished")
+    for message in (err_enoent, err_eacces):
+        ctx.check(b"already exists" not in message,
+                  f"pre-creation failure misreported as existing target: "
+                  f"{message!r:.200}")
+
+    existing = os.path.join(workdir, "taken.key")
+    with open(existing, "wb") as handle:
+        handle.write(b"occupied")
+    _, _, err_exists = run(ctx, ["keygen", "--output", existing])
+    ctx.check(b"already exists" in err_exists,
+              f"existing-target case lost its refusal: {err_exists!r:.200}")
+    ctx.check(CREATE_FAIL_MARKER.encode() not in err_exists,
+              f"existing-target refusal misreported as a creation failure: "
+              f"{err_exists!r:.200}")
+
+
 def test_error_messages_distinguishable(ctx, workdir):
     # "Target already exists" and "write failed after creation" must read
     # differently so the user can tell whether to pick another path or to
@@ -1389,6 +1683,11 @@ ALL_TESTS = [
     test_mid_write_error_cleans_up,
     test_zero_byte_write_fails_without_retry,
     test_write_failure_does_not_touch_existing_target,
+    test_create_fails_missing_parent_directory,
+    test_create_fails_missing_nested_parent,
+    test_create_fails_unwritable_directory,
+    test_create_fails_open_refused_by_shim,
+    test_precreation_failure_reasons_distinguishable,
     test_error_messages_distinguishable,
     test_usage_missing_output_option,
     test_usage_output_option_without_value,
@@ -1424,6 +1723,7 @@ def main():
     ctx = Context(os.path.abspath(args.binary),
                   os.path.abspath(args.testable_binary))
 
+    skipped = []
     for test in ALL_TESTS:
         ctx.total += 1
         workdir = tempfile.mkdtemp(prefix=f"ef-{test.__name__}-",
@@ -1433,14 +1733,21 @@ def main():
         except Failure as exc:
             ctx.failures.append((test.__name__, str(exc)))
             print(f"FAIL {test.__name__}: {exc}")
+        except Skip as exc:
+            # Environment cannot exercise this one scenario; its contract is
+            # still covered by a deterministic shim case. A skip is reported,
+            # never silently counted as a pass.
+            skipped.append((test.__name__, str(exc)))
+            print(f"SKIP {test.__name__}: {exc}")
         except Exception as exc:  # unexpected harness error
             ctx.failures.append((test.__name__, f"harness error: {exc}"))
             print(f"ERROR {test.__name__}: {exc}")
         else:
             print(f"PASS {test.__name__}")
 
-    passed = ctx.total - len(ctx.failures)
-    print(f"\n{passed}/{ctx.total} tests passed")
+    passed = ctx.total - len(ctx.failures) - len(skipped)
+    print(f"\n{passed}/{ctx.total} tests passed"
+          + (f", {len(skipped)} skipped" if skipped else ""))
     return 1 if ctx.failures else 0
 
 

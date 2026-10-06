@@ -12,6 +12,17 @@
 //   EF_TEST_TARGET          Only inject faults for this exact path. When
 //                           unset, any file created with O_CREAT|O_EXCL is
 //                           considered the key file under test.
+//   EF_TEST_FAIL_OPEN=1     The key file's O_CREAT|O_EXCL open() fails with
+//                           EACCES without the real syscall ever running, so
+//                           no file is created. This deterministically
+//                           simulates the operating system refusing to create
+//                           a file in the save directory even where the test
+//                           account would itself bypass directory permissions
+//                           (in particular root, for which a read-only
+//                           directory does not enforce EACCES). Exercises the
+//                           pre-creation kNotCreated path: nothing is created,
+//                           nothing is unlinked, and the generated key is
+//                           still wiped.
 //   EF_TEST_FAIL_WRITE=1    write() on the key file fails with EIO.
 //   EF_TEST_PARTIAL_WRITE=N write() on the key file returns at most N bytes
 //                           per call (the caller must loop to complete).
@@ -364,6 +375,15 @@ int __wrap_open(const char* path, int flags, ...) {
         va_start(args, flags);
         mode = static_cast<mode_t>(va_arg(args, int));
         va_end(args);
+    }
+    // A refused creation is a pre-creation failure: the real syscall must not
+    // run (so nothing is created, even under an account such as root that
+    // ignores the directory's permission bits), no key descriptor is tracked,
+    // and the cleanup unlink path therefore has nothing this run made.
+    if ((flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 &&
+        isKeyPath(path) && envFlagSet("EF_TEST_FAIL_OPEN")) {
+        errno = EACCES;
+        return -1;
     }
     int fd = __real_open(path, flags, mode);
     if (fd != -1 && (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 &&
