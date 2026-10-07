@@ -121,33 +121,37 @@ std::string errnoDescription(int errorNumber) {
 }
 
 // Why a save attempt ended the way it did. kSaved is the only success; every
-// other status is reported to the user with an explanatory message.
-enum class KeySaveStatus {
-    kSaved,          // all key bytes written, fsynced, and closed; mode 0600
+// other status is reported to the user with an explanatory message. Shared by
+// keygen's key file and encrypt's envelope file: apart from their permission
+// policy their save pipeline is the same.
+enum class SaveStatus {
+    kSaved,          // all bytes written, fsynced, and closed; mode 0600
     kNotCreated,     // open() produced no file, so nothing had to be cleaned
     kCleanedUp,      // this run created the file, failed, and removed it
     kCleanupFailed,  // this run created the file, failed, and removal failed
 };
 
-// Complete outcome of one keygen save attempt: whether it succeeded, why it
+// Complete outcome of one output save attempt: whether it succeeded, why it
 // failed when it did, and whether the file this run created was cleaned up.
 // The save logic itself writes nothing to stdout or stderr; the command line
 // reports error, and additionally reports removalWarning only when cleanup
 // failed, so a failed removal can never mask the original save failure and a
 // caller can tell "removed" apart from "could not remove" instead of inferring
-// deletion from failure alone. Neither string ever contains key material.
-struct KeySaveResult {
-    KeySaveStatus status = KeySaveStatus::kNotCreated;
+// deletion from failure alone. Neither string ever contains key or plaintext
+// material.
+struct SaveResult {
+    SaveStatus status = SaveStatus::kNotCreated;
     std::string error;           // why the save did not succeed; empty on success
     std::string removalWarning;  // populated only for kCleanupFailed
 
-    bool saved() const { return status == KeySaveStatus::kSaved; }
+    bool saved() const { return status == SaveStatus::kSaved; }
 };
 
-// Owns the descriptor opened for the newly created key file for the duration
-// of one save attempt and closes it exactly once. Closing is centralized here
-// rather than spread across the failure branches: a branch only records its
-// reason, and the descriptor is still released on every path out of scope.
+// Owns the descriptor opened for the newly created output file for the
+// duration of one save attempt and closes it exactly once. Closing is
+// centralized here rather than spread across the failure branches: a branch
+// only records its reason, and the descriptor is still released on every
+// path out of scope.
 class FdGuard {
 public:
     FdGuard() = default;
@@ -183,51 +187,73 @@ private:
     int fd_ = -1;
 };
 
-// Forces the freshly created key file to exactly 0600: owner read/write, no
+// Forces the freshly created file to exactly 0600: owner read/write, no
 // execute bit, no group/other access. The mode given to open() is still
 // reduced by the inherited process umask, which can strip owner read (umask
 // 0400), owner write (umask 0200), or both (umask 0600); fchmod() is not
-// affected by the umask. The result is verified with fstat() so a filesystem
-// that silently keeps different permissions is treated as a failure instead
-// of being reported as a success.
-bool fixKeyFilePermissions(int fd, const std::string& path,
-                           std::string& error) {
+// affected by the umask.
+//
+// What happens next is the one permission difference the two outputs keep:
+//
+//   key files   - fchmod() is followed by an fstat() verification, and both
+//                 must succeed with exactly 0600 before any key byte is
+//                 written. A filesystem that silently keeps different
+//                 permissions is a failure, not a success.
+//   envelopes   - fchmod() alone must succeed; group/other never gain access
+//                 at creation and the result is not re-verified.
+//
+// The distinction is the verifyPermissions parameter so the save pipeline
+// stays shared.
+bool forceOwnerOnlyPermissions(int fd, const std::string& path,
+                               bool verifyPermissions,
+                               const char* fileKind, std::string& error) {
     if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
-        error = "cannot set key file permissions to 0600 on '" + path +
-                "': " + errnoDescription(errno);
+        error = std::string("cannot set ") + fileKind +
+                " file permissions to 0600 on '" + path + "': " +
+                errnoDescription(errno);
         return false;
+    }
+    if (!verifyPermissions) {
+        return true;
     }
     struct stat info;
     if (::fstat(fd, &info) != 0) {
-        error = "cannot verify key file permissions on '" + path +
-                "': " + errnoDescription(errno);
+        error = std::string("cannot verify ") + fileKind +
+                " file permissions on '" + path + "': " +
+                errnoDescription(errno);
         return false;
     }
     if ((info.st_mode & 0777) != (S_IRUSR | S_IWUSR)) {
-        error = "cannot guarantee key file permissions 0600 on '" + path +
-                "'";
+        error = std::string("cannot guarantee ") + fileKind +
+                " file permissions 0600 on '" + path + "'";
         return false;
     }
     return true;
 }
 
-// Creates a brand new file containing exactly keySize raw bytes. Any existing
-// path (file, directory, symlink including a dangling one) is rejected. The
-// file is created with mode 0600 and its permissions are then forced to
-// exactly 0600 (the creation mode alone is still subject to the umask) before
-// any key byte is written; at no point is the file accessible to group or
-// other users.
+// Saves one freshly produced output blob to a brand new file. This is the
+// single save pipeline shared by keygen (the 32 raw key bytes) and encrypt
+// (the sealed envelope bytes); the only business difference between the two
+// is the permission policy, selected by verifyPermissions (see above). The
+// fileKind strings ("key"/"envelope") only build the existing diagnostic
+// messages, and never contain file contents.
 //
-// The outcome is reported entirely through KeySaveResult: an open() failure
+// Any existing path (file, empty file, directory, symlink including a
+// dangling one) is rejected through O_CREAT|O_EXCL|O_NOFOLLOW before the
+// target or its link is touched; the inherited umask cannot widen or narrow
+// the mode away from 0600 because fchmod() sets it explicitly.
+//
+// The outcome is reported entirely through SaveResult: an open() failure
 // creates nothing (kNotCreated); a failure after creation closes the
 // descriptor via the FdGuard and removes this run's file, reporting either
 // kCleanedUp or, if the removal itself failed, kCleanupFailed with the
 // removal reason in removalWarning so the caller can warn that an incomplete
-// key file may remain. This function never writes to stdout or stderr.
-KeySaveResult writeKeyFile(const std::string& path,
-                           const unsigned char* key,
-                           std::size_t keySize) {
-    KeySaveResult result;
+// file may remain. This function never writes to stdout or stderr.
+SaveResult writeOutputFile(const std::string& path,
+                           const unsigned char* bytes,
+                           std::size_t byteCount, const char* fileKind,
+                           bool verifyPermissions) {
+    SaveResult result;
 
     int fd = ::open(path.c_str(),
                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
@@ -237,58 +263,66 @@ KeySaveResult writeKeyFile(const std::string& path,
         // Pre-creation failure: nothing was created, so this must not enter
         // the "remove the new file" handling and an existing target's
         // content, permissions, and links are never touched.
-        result.status = KeySaveStatus::kNotCreated;
+        result.status = SaveStatus::kNotCreated;
         if (savedErrno == EEXIST || savedErrno == ELOOP) {
             result.error = "refusing to write, path already exists: " + path;
         } else {
-            result.error = "cannot create key file '" + path + "': " +
+            result.error = std::string("cannot create ") + fileKind +
+                           " file '" + path + "': " +
                            errnoDescription(savedErrno);
         }
         return result;
     }
 
     FdGuard guard(fd);
-    result.status = KeySaveStatus::kCleanedUp;  // assumed until the save completes
+    result.status = SaveStatus::kCleanedUp;  // assumed until the save completes
     std::string error;
 
     // If the permissions cannot be guaranteed, this run must not be reported
-    // as a success even though the key was generated and the file was
-    // created: skip the write and fall through to the cleanup below, before
-    // any key byte reaches the file.
-    if (fixKeyFilePermissions(fd, path, error)) {
+    // as a success even though the output was produced and the file was
+    // created: skip the write and fall through to the cleanup below. For key
+    // files this is strictly before the first key byte reaches the file.
+    if (forceOwnerOnlyPermissions(fd, path, verifyPermissions, fileKind,
+                                  error)) {
         std::size_t totalWritten = 0;
-        while (totalWritten < keySize) {
+        while (totalWritten < byteCount) {
             ssize_t written =
-                ::write(fd, key + totalWritten, keySize - totalWritten);
+                ::write(fd, bytes + totalWritten, byteCount - totalWritten);
             if (written < 0) {
                 if (errno == EINTR) {
+                    // Recoverable interrupt with no byte acknowledged: retry
+                    // the same slice, so the content is neither lost nor
+                    // duplicated.
                     continue;
                 }
-                error = "failed writing key file '" + path + "': " +
-                        errnoDescription(errno);
+                error = std::string("failed writing ") + fileKind +
+                        " file '" + path + "': " + errnoDescription(errno);
                 break;
             }
             if (written == 0) {
-                error = "failed writing key file '" + path + "': short write";
+                // Bytes were still pending but nothing was written: a save
+                // failure, never an endless retry.
+                error = std::string("failed writing ") + fileKind +
+                        " file '" + path + "': short write";
                 break;
             }
             totalWritten += static_cast<std::size_t>(written);
         }
 
-        if (totalWritten == keySize) {
+        if (totalWritten == byteCount) {
             if (::fsync(fd) != 0) {
-                error = "failed syncing key file '" + path + "': " +
-                        errnoDescription(errno);
+                error = std::string("failed syncing ") + fileKind +
+                        " file '" + path + "': " + errnoDescription(errno);
             } else if (guard.finish() != 0) {
                 // The descriptor is closed by the kernel even when close
                 // fails, but durability could not be confirmed: do not
                 // report success.
-                error = "failed closing key file '" + path + "': " +
-                        errnoDescription(errno);
+                error = std::string("failed closing ") + fileKind +
+                        " file '" + path + "': " + errnoDescription(errno);
             } else {
-                // The complete original key is written, synced, and closed;
-                // 0600 was verified before the first byte.
-                result.status = KeySaveStatus::kSaved;
+                // The complete original output is written, synced, and
+                // closed; key files verified 0600 before the first byte.
+                result.status = SaveStatus::kSaved;
                 result.error.clear();
                 return result;
             }
@@ -303,10 +337,10 @@ KeySaveResult writeKeyFile(const std::string& path,
     if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
         // The original save failure remains the reported cause; this only
         // adds that the incomplete file could not be removed.
-        result.status = KeySaveStatus::kCleanupFailed;
+        result.status = SaveStatus::kCleanupFailed;
         result.removalWarning =
-            "could not remove partial key file '" + path + "': " +
-            errnoDescription(errno);
+            std::string("could not remove partial ") + fileKind +
+            " file '" + path + "': " + errnoDescription(errno);
     }
     result.error = std::move(error);
     return result;
@@ -360,7 +394,10 @@ int runKeygen(int argc, char* argv[]) {
         return 1;
     }
 
-    const KeySaveResult save = writeKeyFile(outputPath, key.data(), key.size());
+    // Key files get the strict policy: fchmod() plus an fstat() check that
+    // the mode is exactly 0600, all before the first key byte is written.
+    const SaveResult save = writeOutputFile(outputPath, key.data(), key.size(),
+                                            "key", /*verifyPermissions=*/true);
     if (!save.saved()) {
         // The save logic reports outcomes as data; the command line owns all
         // user-facing messages. The original failure is always the primary
@@ -368,7 +405,7 @@ int runKeygen(int argc, char* argv[]) {
         // never as a replacement, so the exit code stays 1 and the user can
         // tell that an incomplete key file may remain.
         std::cerr << "envelopefile: " << save.error << '\n';
-        if (save.status == KeySaveStatus::kCleanupFailed) {
+        if (save.status == SaveStatus::kCleanupFailed) {
             std::cerr << "envelopefile: warning: " << save.removalWarning
                       << '\n';
         }
@@ -385,17 +422,6 @@ int runKeygen(int argc, char* argv[]) {
 // ---------------------------------------------------------------------------
 // encrypt
 // ---------------------------------------------------------------------------
-
-// Outcome of writing the already-sealed envelope bytes to a brand new file.
-// Mirrors KeySaveResult: the sealing/encryption step is finished before this
-// runs, so the only failures here concern creating and saving the output.
-struct EnvelopeSaveResult {
-    KeySaveStatus status = KeySaveStatus::kNotCreated;
-    std::string error;
-    std::string removalWarning;
-
-    bool saved() const { return status == KeySaveStatus::kSaved; }
-};
 
 // Reads an entire file as raw bytes. The bytes are returned without any
 // newline/NUL conversion; an empty file yields an empty vector. The path is
@@ -590,87 +616,6 @@ bool sealEnvelope(const unsigned char* key,
     return true;
 }
 
-// Writes the sealed envelope to a brand new file, rejecting every kind of
-// existing path (regular file, empty file, directory, symlink including a
-// dangling one) via O_CREAT|O_EXCL|O_NOFOLLOW. The envelope file is created
-// readable by the owner (0600) because it is encrypted output; unlike keygen
-// the 0600 mode is not force-verified here, but group/other never gain access
-// at creation. A failure after creation closes and removes this run's file,
-// reporting kCleanupFailed (with a warning) only if that removal fails.
-EnvelopeSaveResult writeEnvelopeFile(const std::string& path,
-                                     const std::vector<unsigned char>& bytes) {
-    EnvelopeSaveResult result;
-
-    int fd = ::open(path.c_str(),
-                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-                    S_IRUSR | S_IWUSR);
-    if (fd == -1) {
-        const int savedErrno = errno;
-        result.status = KeySaveStatus::kNotCreated;
-        if (savedErrno == EEXIST || savedErrno == ELOOP) {
-            result.error = "refusing to write, path already exists: " + path;
-        } else {
-            result.error = "cannot create envelope file '" + path + "': " +
-                           errnoDescription(savedErrno);
-        }
-        return result;
-    }
-
-    FdGuard guard(fd);
-    result.status = KeySaveStatus::kCleanedUp;
-    std::string error;
-
-    // Envelope output is ciphertext plus a tag; restrict it to owner access.
-    if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
-        error = "cannot set envelope file permissions to 0600 on '" + path +
-                "': " + errnoDescription(errno);
-    } else {
-        std::size_t total = 0;
-        while (total < bytes.size()) {
-            ssize_t written =
-                ::write(fd, bytes.data() + total, bytes.size() - total);
-            if (written < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                error = "failed writing envelope file '" + path + "': " +
-                        errnoDescription(errno);
-                break;
-            }
-            if (written == 0) {
-                error = "failed writing envelope file '" + path +
-                        "': short write";
-                break;
-            }
-            total += static_cast<std::size_t>(written);
-        }
-
-        if (total == bytes.size()) {
-            if (::fsync(fd) != 0) {
-                error = "failed syncing envelope file '" + path + "': " +
-                        errnoDescription(errno);
-            } else if (guard.finish() != 0) {
-                error = "failed closing envelope file '" + path + "': " +
-                        errnoDescription(errno);
-            } else {
-                result.status = KeySaveStatus::kSaved;
-                result.error.clear();
-                return result;
-            }
-        }
-    }
-
-    guard.close();
-    if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
-        result.status = KeySaveStatus::kCleanupFailed;
-        result.removalWarning =
-            "could not remove partial envelope file '" + path + "': " +
-            errnoDescription(errno);
-    }
-    result.error = std::move(error);
-    return result;
-}
-
 int runEncrypt(int argc, char* argv[]) {
     std::string keyPath;
     std::string inputPath;
@@ -774,12 +719,16 @@ int runEncrypt(int argc, char* argv[]) {
         }
     }
 
-    // Save to a brand new path; any existing path, including the input or key
-    // path itself, is rejected before it is touched.
-    const EnvelopeSaveResult save = writeEnvelopeFile(outputPath, envelope);
+    // Save to a brand new path with the shared pipeline; any existing path,
+    // including the input or key path itself, is rejected before it is
+    // touched. The envelope keeps the lighter permission policy: fchmod()
+    // must succeed, but the key file's fstat() verification is not performed.
+    const SaveResult save = writeOutputFile(
+        outputPath, envelope.data(), envelope.size(), "envelope",
+        /*verifyPermissions=*/false);
     if (!save.saved()) {
         std::cerr << "envelopefile: " << save.error << '\n';
-        if (save.status == KeySaveStatus::kCleanupFailed) {
+        if (save.status == SaveStatus::kCleanupFailed) {
             std::cerr << "envelopefile: warning: " << save.removalWarning
                       << '\n';
         }
