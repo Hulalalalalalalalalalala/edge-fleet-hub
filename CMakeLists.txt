@@ -12,10 +12,11 @@ target_compile_features(envelopefile PRIVATE cxx_std_20)
 set_target_properties(envelopefile PROPERTIES CXX_EXTENSIONS OFF)
 target_link_libraries(envelopefile PRIVATE OpenSSL::Crypto)
 
-# Regression tests for `keygen`: the same product source is linked a second
-# time with syscall-wrapping shims (see tests/fault_inject.cpp) so the test
-# driver can simulate write/fsync/close failures, partial writes, and secure
-# random source failures without touching the production binary.
+# Regression tests: the `encrypt` round-trip/tamper suite runs against the
+# production binary, and for `keygen` the same product source is linked a
+# second time with syscall-wrapping shims (see tests/fault_inject.cpp) so the
+# test driver can simulate write/fsync/close failures, partial writes, and
+# secure random source failures without touching the production binary.
 #
 # The shims rely on the linker's --wrap option, which not every platform's
 # default linker provides (notably the system linker shipped with macOS/Xcode,
@@ -59,21 +60,33 @@ if(BUILD_TESTING)
                 --binary $<TARGET_FILE:envelopefile>
                 --testable-binary $<TARGET_FILE:envelopefile_testable>
                 --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
+
+        # Round-trip and tamper-detection regression for `encrypt`: driven
+        # against the production binary only (no fault injection needed).
+        add_test(
+            NAME encrypt_regression
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/encrypt_regression.py
+                --binary $<TARGET_FILE:envelopefile>
+                --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
 
         message(STATUS
-            "envelopefile: keygen fault-injection regression tests enabled "
+            "envelopefile: keygen fault-injection and encrypt round-trip "
+            "regression tests enabled "
             "(linker supports --wrap, Python ${Python3_VERSION} found)")
     else()
         message(NOTICE
-            "envelopefile: the keygen fault-injection regression tests are "
-            "NOT built on this toolchain. Building them requires a C++ linker "
+            "envelopefile: the regression tests (keygen fault-injection and "
+            "encrypt round-trip) are NOT built on this toolchain. Building "
+            "them requires a C++ linker "
             "that supports the --wrap option (such as GNU ld or LLVM lld), "
             "but the linker selected by this configuration does not accept "
             "those options (the macOS/Xcode system linker 'ld64' does not). "
             "The production 'envelopefile' binary is still built and fully "
-            "usable: --version and 'keygen' (32-byte key files with the 0600 "
-            "permission guarantee) are unaffected, and no test-only "
+            "usable: --version, 'keygen' (32-byte key files with the 0600 "
+            "permission guarantee) and 'encrypt' are unaffected, and no "
+            "test-only "
             "dependency such as Python 3 is required. This notice means the "
             "regression suite is UNAVAILABLE here, not that it ran or passed. "
             "To build and run it, reconfigure with a --wrap-capable linker "
