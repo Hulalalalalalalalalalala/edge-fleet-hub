@@ -27,6 +27,49 @@ include(CTest)
 if(BUILD_TESTING)
     include(CheckLinkerFlag)
 
+    # Regression tests for `encrypt`: these drive only the production binary
+    # (no fault injection, so no --wrap requirement), but the driver verifies
+    # envelopes by decrypting them independently with Python's `cryptography`
+    # module, exactly as the README's format section demonstrates. Probe for
+    # both; where either is missing the suite is skipped with an explicit
+    # notice (unavailable, not passed).
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} -c "import cryptography"
+            RESULT_VARIABLE EF_PYTHON_CRYPTOGRAPHY_RESULT
+            OUTPUT_QUIET ERROR_QUIET)
+        if(EF_PYTHON_CRYPTOGRAPHY_RESULT EQUAL 0)
+            add_test(
+                NAME encrypt_regression
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/encrypt_regression.py
+                    --binary $<TARGET_FILE:envelopefile>
+                    --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
+            file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
+            message(STATUS
+                "envelopefile: encrypt round-trip regression tests enabled "
+                "(Python ${Python3_VERSION} with the 'cryptography' module "
+                "found)")
+        else()
+            message(NOTICE
+                "envelopefile: the encrypt round-trip regression tests are "
+                "NOT enabled: Python ${Python3_VERSION} was found but its "
+                "'cryptography' module is missing (the driver decrypts "
+                "envelopes independently to verify them). Install it (e.g. "
+                "'pip install cryptography') and reconfigure to run the "
+                "suite. This notice means the tests were SKIPPED, not that "
+                "they ran or passed; the production binary is unaffected.")
+        endif()
+    else()
+        message(NOTICE
+            "envelopefile: the encrypt round-trip regression tests are NOT "
+            "enabled: no Python 3 interpreter was found. Install Python 3 "
+            "(with the 'cryptography' module) and reconfigure to run the "
+            "suite. This notice means the tests were SKIPPED, not that they "
+            "ran or passed; the production binary is unaffected.")
+    endif()
+
     set(_fault_inject_wrap_options
         "LINKER:--wrap=open,--wrap=fchmod,--wrap=fstat,--wrap=write,--wrap=fsync,--wrap=close,--wrap=unlink,--wrap=RAND_bytes,--wrap=OPENSSL_cleanse")
     check_linker_flag(CXX "${_fault_inject_wrap_options}"
