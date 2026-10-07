@@ -124,6 +124,15 @@
 // Only the file descriptor opened for the key file is instrumented; all
 // other I/O (stdout, stderr, OpenSSL internals, the log file itself) passes
 // through untouched.
+//
+// The same instrumentation covers `encrypt`: the envelope output file is
+// the only path the product opens with O_CREAT|O_EXCL during an encryption
+// run (key and input are read-only opens), so the "key file" knobs below —
+// write/fsync/close/unlink faults and the write script — apply to exactly
+// the envelope being saved. The keygen-specific verifiers (the 32-byte
+// write-log continuity check and the key-buffer lifecycle log) are only
+// meaningful for `keygen` runs and are simply not enabled by the encrypt
+// regression driver.
 
 #include <openssl/err.h>
 #include <openssl/opensslv.h>

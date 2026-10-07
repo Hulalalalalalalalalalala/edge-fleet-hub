@@ -24,7 +24,27 @@ Covers the guarantees the README makes about the encryption envelope:
 * command-line behaviour: a normal encryption exits 0 and prints the
   completion message naming the save path; the input and key files keep
   their content and permissions; neither the message nor the envelope
-  leaks plaintext or key bytes.
+  leaks plaintext or key bytes;
+* output saving (run against the fault-injecting test build): once the
+  envelope bytes are sealed, a save failure after the new output file was
+  created — write, fsync, or close failing, including an unrecoverable
+  error after part of the envelope is already on disk — exits 1 with an
+  empty stdout and a stderr line naming the failed save stage and the
+  output path; the envelope this run created is removed, and the key,
+  input, and neighbouring files keep their content and permissions. A
+  close failure counts as a save failure even though every envelope byte
+  was already written and synced. If removing the incomplete file itself
+  fails, the original save failure stays the primary error (exit 1, no
+  completion message) and a second stderr line warns with the output path
+  and the removal reason while the incomplete file genuinely remains —
+  the suite checks both "removed" and "still there" outcomes instead of
+  treating any non-zero exit as cleaned up. An output path that already
+  exists (regular file, symlink, dangling symlink) or that names the
+  input or key file is refused before creation with an "already exists"
+  reason — never a cleanup warning — leaving the existing content,
+  permissions, and link relations untouched and never creating a dangling
+  link's target. With no save fault armed the run exits 0 and the
+  envelope authenticates as usual.
 
 Decryption is performed by an independent pure-Python AES-256-GCM
 implementation embedded below (no OpenSSL, no third-party packages), so
@@ -37,6 +57,7 @@ key and plaintext bytes are never written to stdout/stderr by these tests.
 """
 
 import argparse
+import errno
 import hmac
 import os
 import random
@@ -278,8 +299,9 @@ class Failure(Exception):
 
 
 class Context:
-    def __init__(self, binary):
+    def __init__(self, binary, testable_binary):
         self.binary = binary
+        self.testable_binary = testable_binary
         self.failures = []
         self.total = 0
 
@@ -288,12 +310,17 @@ class Context:
             raise Failure(message)
 
 
-def run(ctx, args, cwd=None):
-    """Run the production binary and capture exit code/stdout/stderr."""
+def run(ctx, args, env_extra=None, use_testable=False, cwd=None):
+    """Run the binary and capture exit code/stdout/stderr as bytes."""
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    binary = ctx.testable_binary if use_testable else ctx.binary
     proc = subprocess.run(
-        [ctx.binary, *args],
+        [binary, *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
         cwd=cwd,
     )
     return proc.returncode, proc.stdout, proc.stderr
@@ -603,6 +630,347 @@ def test_completion_message_and_preservation(ctx, workdir):
               "envelope did not restore the original input")
 
 
+# ---------------------------------------------------------------------------
+# Output-save behaviour.
+#
+# The save-failure cases run against the fault-injecting test build: the
+# envelope file is the only path opened O_CREAT|O_EXCL, so the shim's
+# write/fsync/close/unlink faults apply to exactly the output being saved.
+# Every case starts from a valid 32-byte raw key and a readable input file
+# and targets a path that does not exist yet.
+# ---------------------------------------------------------------------------
+
+CLEANUP_WARNING_MARKER = "could not remove partial envelope file"
+REFUSAL_MARKER = "refusing to write, path already exists"
+PLAINTEXT_MARKER = b"-- confidential payload 0xDEADBEEF --"
+
+
+def fault_env(**overrides):
+    """Environment for the fault-injecting build; every knob defaults off."""
+    env = {
+        "EF_TEST_FAIL_WRITE": "0",
+        "EF_TEST_FAIL_FSYNC": "0",
+        "EF_TEST_FAIL_CLOSE": "0",
+    }
+    env.update({key: value for key, value in overrides.items()
+                if value is not None})
+    return env
+
+
+def make_save_fixture(ctx, workdir):
+    """A valid 32-byte key, a readable input file, and a bystander file —
+    everything a save run must leave untouched, with content and
+    permissions recorded for the post-run comparison."""
+    key_path, key = make_key(ctx, workdir)
+    plaintext = PLAINTEXT_MARKER + b"\n" + PLAINTEXT_MARKER * 40 + \
+        bytes(range(256))
+    input_path = os.path.join(workdir, "document.bin")
+    with open(input_path, "wb") as handle:
+        handle.write(plaintext)
+    os.chmod(input_path, 0o640)
+    bystander = os.path.join(workdir, "unrelated.txt")
+    with open(bystander, "wb") as handle:
+        handle.write(b"do not touch")
+    os.chmod(bystander, 0o644)
+    return {
+        "key_path": key_path,
+        "key": key,
+        "key_mode": stat.S_IMODE(os.stat(key_path).st_mode),
+        "input_path": input_path,
+        "plaintext": plaintext,
+        "input_mode": 0o640,
+        "bystander": bystander,
+        "bystander_content": b"do not touch",
+        "bystander_mode": 0o644,
+        "output_path": os.path.join(workdir, "document.bin.env"),
+    }
+
+
+def encrypt_args(fix):
+    return ["encrypt", "--key", fix["key_path"],
+            "--input", fix["input_path"], "--output", fix["output_path"]]
+
+
+def assert_fixture_untouched(ctx, fix):
+    """Key, input, and neighbouring files keep content and permissions."""
+    ctx.check(read_bytes(fix["key_path"]) == fix["key"],
+              "key file content changed")
+    ctx.check(stat.S_IMODE(os.stat(fix["key_path"]).st_mode) ==
+              fix["key_mode"], "key file permissions changed")
+    ctx.check(read_bytes(fix["input_path"]) == fix["plaintext"],
+              "input file content changed")
+    ctx.check(stat.S_IMODE(os.stat(fix["input_path"]).st_mode) ==
+              fix["input_mode"], "input file permissions changed")
+    ctx.check(read_bytes(fix["bystander"]) == fix["bystander_content"],
+              "neighbouring file content changed")
+    ctx.check(stat.S_IMODE(os.stat(fix["bystander"]).st_mode) ==
+              fix["bystander_mode"], "neighbouring file permissions changed")
+
+
+def assert_no_secret_leak(ctx, fix, out, err):
+    ctx.check(fix["key"] not in out, "key material leaked into stdout")
+    ctx.check(fix["key"] not in err, "key material leaked into stderr")
+    ctx.check(PLAINTEXT_MARKER not in out, "plaintext leaked into stdout")
+    ctx.check(PLAINTEXT_MARKER not in err, "plaintext leaked into stderr")
+
+
+def assert_save_failed_and_cleaned(ctx, fix, rc, out, err, stage):
+    """Contract for a save failure after the output file was created:
+    exit 1, empty stdout, exactly one stderr line naming the failed save
+    stage and the output path, and the envelope this run created removed
+    again (the path must not exist afterwards)."""
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"", f"stdout not empty on save failure: {out!r:.200}")
+    expected = (f"envelopefile: failed {stage} envelope file "
+                f"'{fix['output_path']}': "
+                f"{os.strerror(errno.EIO)}\n").encode()
+    ctx.check(err == expected,
+              f"stderr must name the failed save stage and the output "
+              f"path: {err!r:.200}")
+    ctx.check(SUCCESS_MARKER.encode() not in out + err,
+              "completion message reported despite the failed save")
+    ctx.check(CLEANUP_WARNING_MARKER.encode() not in err,
+              f"cleanup warning without a cleanup failure: {err!r:.200}")
+    ctx.check(not os.path.lexists(fix["output_path"]),
+              "the envelope this run created was left behind")
+    assert_fixture_untouched(ctx, fix)
+    assert_no_secret_leak(ctx, fix, out, err)
+
+
+def test_save_write_failure_cleans_up(ctx, workdir):
+    # The very first write of the sealed envelope fails: the run is a
+    # failure and the file it created is removed again.
+    fix = make_save_fixture(ctx, workdir)
+    rc, out, err = run(ctx, encrypt_args(fix),
+                       env_extra=fault_env(EF_TEST_FAIL_WRITE="1"),
+                       use_testable=True)
+    assert_save_failed_and_cleaned(ctx, fix, rc, out, err, "writing")
+
+
+def test_save_partial_write_then_error_cleans_up(ctx, workdir):
+    # Part of the envelope is already on disk when an unrecoverable write
+    # error hits: still a failure, and the partial envelope is removed.
+    fix = make_save_fixture(ctx, workdir)
+    rc, out, err = run(ctx, encrypt_args(fix),
+                       env_extra=fault_env(EF_TEST_WRITE_SCRIPT="10,eio"),
+                       use_testable=True)
+    assert_save_failed_and_cleaned(ctx, fix, rc, out, err, "writing")
+
+
+def test_save_fsync_failure_cleans_up(ctx, workdir):
+    # All bytes written, then fsync fails: durability is unconfirmed.
+    fix = make_save_fixture(ctx, workdir)
+    rc, out, err = run(ctx, encrypt_args(fix),
+                       env_extra=fault_env(EF_TEST_FAIL_FSYNC="1"),
+                       use_testable=True)
+    assert_save_failed_and_cleaned(ctx, fix, rc, out, err, "syncing")
+
+
+def test_save_close_failure_cleans_up(ctx, workdir):
+    # close() reports failure after every envelope byte was written and
+    # synced: durability could not be confirmed, so this is a save
+    # failure — no success report, and the fully written envelope is
+    # removed anyway.
+    fix = make_save_fixture(ctx, workdir)
+    rc, out, err = run(ctx, encrypt_args(fix),
+                       env_extra=fault_env(EF_TEST_FAIL_CLOSE="1"),
+                       use_testable=True)
+    assert_save_failed_and_cleaned(ctx, fix, rc, out, err, "closing")
+
+
+def assert_cleanup_failed_run(ctx, fix, rc, out, err, primary_line):
+    """The original save failure stays the primary cause; the failed
+    removal only adds a warning naming the output path and the removal
+    reason, and the file this run created genuinely remains on disk."""
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"", f"stdout not empty: {out!r:.200}")
+    warning = (f"envelopefile: warning: {CLEANUP_WARNING_MARKER} "
+               f"'{fix['output_path']}': "
+               f"{os.strerror(errno.EIO)}\n").encode()
+    ctx.check(err == primary_line + warning,
+              f"stderr must keep the original save failure first and the "
+              f"removal warning second: {err!r:.200}")
+    ctx.check(SUCCESS_MARKER.encode() not in out + err,
+              "completion message reported despite the failed save")
+    # The cleanup genuinely did not happen: the path this run created is
+    # still there — the exact opposite of the cleaned-up cases, where the
+    # path must not exist. A non-zero exit alone proves neither.
+    ctx.check(os.path.lexists(fix["output_path"]),
+              "new envelope disappeared even though its removal failed")
+    assert_fixture_untouched(ctx, fix)
+    assert_no_secret_leak(ctx, fix, out, err)
+
+
+def test_save_failure_with_failed_cleanup_leaves_partial_file(ctx, workdir):
+    # Ten envelope bytes reached disk, then an unrecoverable write error,
+    # then the cleanup unlink fails too: the partial file remains and the
+    # warning says an incomplete file may have been left behind.
+    fix = make_save_fixture(ctx, workdir)
+    rc, out, err = run(ctx, encrypt_args(fix),
+                       env_extra=fault_env(EF_TEST_WRITE_SCRIPT="10,eio",
+                                           EF_TEST_FAIL_UNLINK="1"),
+                       use_testable=True)
+    primary = (f"envelopefile: failed writing envelope file "
+               f"'{fix['output_path']}': "
+               f"{os.strerror(errno.EIO)}\n").encode()
+    assert_cleanup_failed_run(ctx, fix, rc, out, err, primary)
+    leftover = read_bytes(fix["output_path"])
+    ctx.check(len(leftover) == 10,
+              f"leftover partial envelope is {len(leftover)} bytes, "
+              "expected the 10 written before the error")
+    mode = stat.S_IMODE(os.stat(fix["output_path"]).st_mode)
+    ctx.check(mode == ENVELOPE_MODE,
+              f"leftover file mode is {oct(mode)}, expected "
+              f"{oct(ENVELOPE_MODE)}")
+    ctx.check(leftover not in out and leftover not in err,
+              "partial envelope bytes leaked onto stdout/stderr")
+
+
+def test_close_failure_with_failed_cleanup_leaves_full_file(ctx, workdir):
+    # Every envelope byte was written and synced, close() failed, and the
+    # removal failed as well: the run is still a save failure (exit 1, no
+    # completion message) and the complete-but-unconfirmed file remains.
+    fix = make_save_fixture(ctx, workdir)
+    rc, out, err = run(ctx, encrypt_args(fix),
+                       env_extra=fault_env(EF_TEST_FAIL_CLOSE="1",
+                                           EF_TEST_FAIL_UNLINK="1"),
+                       use_testable=True)
+    primary = (f"envelopefile: failed closing envelope file "
+               f"'{fix['output_path']}': "
+               f"{os.strerror(errno.EIO)}\n").encode()
+    assert_cleanup_failed_run(ctx, fix, rc, out, err, primary)
+    leftover = read_bytes(fix["output_path"])
+    ctx.check(len(leftover) == len(fix["plaintext"]) + ENVELOPE_OVERHEAD,
+              f"leftover is {len(leftover)} bytes, expected the complete "
+              f"{len(fix['plaintext']) + ENVELOPE_OVERHEAD}-byte envelope")
+
+
+def test_save_success_unaffected_by_unlink_fault(ctx, workdir):
+    # The unlink fault only applies to the cleanup of a failed save: a
+    # normal run never unlinks anything, exits 0 with the completion
+    # message naming the save path, and its envelope authenticates.
+    fix = make_save_fixture(ctx, workdir)
+    rc, out, err = run(ctx, encrypt_args(fix),
+                       env_extra=fault_env(EF_TEST_FAIL_UNLINK="1"),
+                       use_testable=True)
+    ctx.check(rc == 0, f"encrypt exited {rc} (stderr: {err!r:.200})")
+    ctx.check(err == b"", f"stderr not empty on success: {err!r:.200}")
+    expected = (f"envelopefile: {SUCCESS_MARKER} "
+                f"'{fix['output_path']}'\n").encode()
+    ctx.check(out == expected,
+              f"unexpected completion message: {out!r:.200}")
+    blob = read_bytes(fix["output_path"])
+    assert_envelope_format(ctx, blob, len(fix["plaintext"]))
+    ctx.check(decrypt_envelope(fix["key"], blob) == fix["plaintext"],
+              "envelope did not restore the original input")
+    assert_fixture_untouched(ctx, fix)
+    assert_no_secret_leak(ctx, fix, out, err)
+
+
+# ---------------------------------------------------------------------------
+# Pre-creation protection: an output path that already exists — or that
+# names the input or key file — is refused before anything is created, and
+# the refusal never enters the new-file removal path.
+# ---------------------------------------------------------------------------
+
+def assert_existing_path_refused(ctx, fix, rc, out, err, output_path):
+    """Contract for refusing an already-existing output path: exit 1,
+    empty stdout, exactly the "already exists" line naming the path —
+    never a deletion-failure warning."""
+    ctx.check(rc == 1, f"expected exit 1, got {rc} (stderr: {err!r:.200})")
+    ctx.check(out == b"", f"stdout not empty on refusal: {out!r:.200}")
+    expected = (f"envelopefile: {REFUSAL_MARKER}: {output_path}\n").encode()
+    ctx.check(err == expected,
+              f"refusal must report the existing path, got: {err!r:.200}")
+    ctx.check(CLEANUP_WARNING_MARKER.encode() not in err,
+              "a pre-creation refusal carried a cleanup warning")
+    ctx.check(SUCCESS_MARKER.encode() not in out + err,
+              "completion message reported for a refused run")
+    assert_no_secret_leak(ctx, fix, out, err)
+
+
+def test_output_existing_file_refused(ctx, workdir):
+    fix = make_save_fixture(ctx, workdir)
+    existing_content = b"pre-existing content that must survive\x00\x01"
+    with open(fix["output_path"], "wb") as handle:
+        handle.write(existing_content)
+    os.chmod(fix["output_path"], 0o640)
+    rc, out, err = run(ctx, encrypt_args(fix))
+    assert_existing_path_refused(ctx, fix, rc, out, err, fix["output_path"])
+    ctx.check(read_bytes(fix["output_path"]) == existing_content,
+              "existing output file content changed")
+    mode = stat.S_IMODE(os.stat(fix["output_path"]).st_mode)
+    ctx.check(mode == 0o640, f"existing output file mode changed to "
+              f"{oct(mode)}")
+    assert_fixture_untouched(ctx, fix)
+
+
+def test_output_symlink_refused(ctx, workdir):
+    fix = make_save_fixture(ctx, workdir)
+    target = os.path.join(workdir, "target.bin")
+    target_content = b"link target content must survive"
+    with open(target, "wb") as handle:
+        handle.write(target_content)
+    os.chmod(target, 0o600)
+    os.symlink(target, fix["output_path"])
+    rc, out, err = run(ctx, encrypt_args(fix))
+    assert_existing_path_refused(ctx, fix, rc, out, err, fix["output_path"])
+    ctx.check(os.path.islink(fix["output_path"]), "symlink was replaced")
+    ctx.check(os.readlink(fix["output_path"]) == target,
+              "symlink target changed")
+    ctx.check(read_bytes(target) == target_content,
+              "symlink target was modified")
+    mode = stat.S_IMODE(os.stat(target).st_mode)
+    ctx.check(mode == 0o600, f"symlink target mode changed to {oct(mode)}")
+    assert_fixture_untouched(ctx, fix)
+
+
+def test_output_dangling_symlink_refused(ctx, workdir):
+    fix = make_save_fixture(ctx, workdir)
+    target = os.path.join(workdir, "nowhere.bin")
+    os.symlink(target, fix["output_path"])
+    rc, out, err = run(ctx, encrypt_args(fix))
+    assert_existing_path_refused(ctx, fix, rc, out, err, fix["output_path"])
+    ctx.check(os.path.islink(fix["output_path"]),
+              "dangling symlink was replaced")
+    ctx.check(os.readlink(fix["output_path"]) == target,
+              "dangling symlink target changed")
+    ctx.check(not os.path.exists(target),
+              "dangling symlink target was created")
+    assert_fixture_untouched(ctx, fix)
+
+
+def test_output_equal_to_input_refused(ctx, workdir):
+    # --output naming the input file itself: the path exists, so the run
+    # is refused with "already exists" before anything is written — the
+    # input is neither overwritten nor removed. The cleanup fault is armed
+    # on the testable build: if the refusal wrongly entered the new-file
+    # removal path, the deletion-failure warning would appear here.
+    fix = make_save_fixture(ctx, workdir)
+    args = ["encrypt", "--key", fix["key_path"],
+            "--input", fix["input_path"],
+            "--output", fix["input_path"]]
+    rc, out, err = run(ctx, args,
+                       env_extra=fault_env(EF_TEST_FAIL_UNLINK="1"),
+                       use_testable=True)
+    assert_existing_path_refused(ctx, fix, rc, out, err, fix["input_path"])
+    assert_fixture_untouched(ctx, fix)
+
+
+def test_output_equal_to_key_refused(ctx, workdir):
+    # --output naming the key file itself: same rule, same "already
+    # exists" reason, and the key file is left byte-for-byte untouched.
+    fix = make_save_fixture(ctx, workdir)
+    args = ["encrypt", "--key", fix["key_path"],
+            "--input", fix["input_path"],
+            "--output", fix["key_path"]]
+    rc, out, err = run(ctx, args,
+                       env_extra=fault_env(EF_TEST_FAIL_UNLINK="1"),
+                       use_testable=True)
+    assert_existing_path_refused(ctx, fix, rc, out, err, fix["key_path"])
+    assert_fixture_untouched(ctx, fix)
+
+
 ALL_TESTS = [
     test_decryptor_known_answers,
     test_roundtrip_text_with_newlines,
@@ -617,6 +985,18 @@ ALL_TESTS = [
     test_wrong_key_detected,
     test_truncated_tag_rejected,
     test_completion_message_and_preservation,
+    test_save_write_failure_cleans_up,
+    test_save_partial_write_then_error_cleans_up,
+    test_save_fsync_failure_cleans_up,
+    test_save_close_failure_cleans_up,
+    test_save_failure_with_failed_cleanup_leaves_partial_file,
+    test_close_failure_with_failed_cleanup_leaves_full_file,
+    test_save_success_unaffected_by_unlink_fault,
+    test_output_existing_file_refused,
+    test_output_symlink_refused,
+    test_output_dangling_symlink_refused,
+    test_output_equal_to_input_refused,
+    test_output_equal_to_key_refused,
 ]
 
 
@@ -624,11 +1004,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True,
                         help="path to the production envelopefile binary")
+    parser.add_argument("--testable-binary", required=True,
+                        help="path to the fault-injecting test build")
     parser.add_argument("--work-root", default=None,
                         help="directory under which scratch dirs are created")
     args = parser.parse_args()
 
-    ctx = Context(os.path.abspath(args.binary))
+    ctx = Context(os.path.abspath(args.binary),
+                  os.path.abspath(args.testable_binary))
 
     for test in ALL_TESTS:
         ctx.total += 1
