@@ -13,10 +13,12 @@ set_target_properties(envelopefile PROPERTIES CXX_EXTENSIONS OFF)
 target_link_libraries(envelopefile PRIVATE OpenSSL::Crypto)
 
 # Regression tests: the `encrypt` round-trip/tamper suite runs against the
-# production binary, while the `encrypt` save-failure suite and the `keygen`
-# suite link the same product source a second time with syscall-wrapping
+# production binary, while the `encrypt` save-failure suite, the `encrypt`
+# key-file reading suite, and the `keygen` suite link the same product
+# source a second time with syscall-wrapping
 # shims (see tests/fault_inject.cpp) so the test drivers can simulate
-# write/fsync/close/unlink failures, partial writes, and secure random
+# read/write/fsync/close/unlink failures, partial reads and writes, and
+# secure random
 # source failures without touching the production binary.
 #
 # The shims rely on the linker's --wrap option, which not every platform's
@@ -30,7 +32,7 @@ if(BUILD_TESTING)
     include(CheckLinkerFlag)
 
     set(_fault_inject_wrap_options
-        "LINKER:--wrap=open,--wrap=fchmod,--wrap=fstat,--wrap=write,--wrap=fsync,--wrap=close,--wrap=unlink,--wrap=RAND_bytes,--wrap=OPENSSL_cleanse")
+        "LINKER:--wrap=open,--wrap=fchmod,--wrap=fstat,--wrap=read,--wrap=write,--wrap=fsync,--wrap=close,--wrap=unlink,--wrap=RAND_bytes,--wrap=OPENSSL_cleanse")
     check_linker_flag(CXX "${_fault_inject_wrap_options}"
                       EF_LINKER_SUPPORTS_WRAP)
 
@@ -47,6 +49,7 @@ if(BUILD_TESTING)
             "LINKER:--wrap=open"
             "LINKER:--wrap=fchmod"
             "LINKER:--wrap=fstat"
+            "LINKER:--wrap=read"
             "LINKER:--wrap=write"
             "LINKER:--wrap=fsync"
             "LINKER:--wrap=close"
@@ -82,16 +85,30 @@ if(BUILD_TESTING)
                 --binary $<TARGET_FILE:envelopefile>
                 --testable-binary $<TARGET_FILE:envelopefile_testable>
                 --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
+
+        # Key-file regression for `encrypt --key`: exactly-32-raw-bytes
+        # acceptance (binary and printable keys used verbatim), length and
+        # read-failure rejection, and split-read/EINTR recovery, using the
+        # fault-injecting build for the scripted read() scenarios.
+        add_test(
+            NAME encrypt_key_regression
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/encrypt_key_regression.py
+                --binary $<TARGET_FILE:envelopefile>
+                --testable-binary $<TARGET_FILE:envelopefile_testable>
+                --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
 
         message(STATUS
-            "envelopefile: keygen fault-injection, encrypt round-trip, and "
-            "encrypt save-failure regression tests enabled "
+            "envelopefile: keygen fault-injection, encrypt round-trip, "
+            "encrypt save-failure, and encrypt key-file regression tests "
+            "enabled "
             "(linker supports --wrap, Python ${Python3_VERSION} found)")
     else()
         message(NOTICE
             "envelopefile: the regression tests (keygen fault-injection, "
-            "encrypt round-trip, and encrypt save-failure) are NOT built "
+            "encrypt round-trip, encrypt save-failure, and encrypt "
+            "key-file) are NOT built "
             "on this toolchain. Building "
             "them requires a C++ linker "
             "that supports the --wrap option (such as GNU ld or LLVM lld), "

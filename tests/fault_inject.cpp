@@ -121,9 +121,42 @@
 //                             only after the save was complete (never before,
 //                             which would save wiped data).
 //
-// Only the file descriptor opened for the key file is instrumented; all
-// other I/O (stdout, stderr, OpenSSL internals, the log file itself) passes
-// through untouched.
+// Reading of the `encrypt --key` file can be scripted and logged the same
+// way the envelope/key writes are. When EF_TEST_TARGET names the key path,
+// its read-only open() is tracked (separately from the O_CREAT|O_EXCL
+// output descriptor above) and every read() on it goes through the script:
+//
+//   EF_TEST_READ_SCRIPT=t1,t2,...
+//                           Each token describes the outcome of one read()
+//                           call on the key file, consumed in order; once the
+//                           list is exhausted every further call behaves
+//                           normally. Tokens:
+//                             ok    - read as much as requested
+//                             N     - short read: at most N (decimal) bytes
+//                             intr  - fail with EINTR, no bytes delivered
+//                             eio   - fail irrecoverably with EIO
+//                             zero  - report end-of-file (return 0)
+//                           This simulates a key that arrives in several
+//                           fragments, recoverable interrupts (including on
+//                           the end-of-file confirmation read), and read
+//                           errors before or after the full 32 bytes.
+//
+//   EF_TEST_READ_LOG=path   Record what the read loop actually did, so the
+//                           test driver can prove the delivered key bytes are
+//                           exactly the file's bytes — none lost, duplicated,
+//                           or replaced across short reads and retries. One
+//                           line per read() call:
+//                             CALL <offset> <requested> <returned> [<errno>]
+//                           (the errno field is only present when returned is
+//                           -1) plus, for every call that delivered bytes:
+//                             CHUNK <offset> <hex of the delivered bytes>
+//                           Reassembling the CHUNK lines by offset must
+//                           reproduce the key file byte for byte.
+//
+// Only the file descriptors opened for the file named by EF_TEST_TARGET
+// (the created output, and the read-only encrypt --key file) are
+// instrumented; all other I/O (stdout, stderr, OpenSSL internals, the log
+// file itself) passes through untouched.
 
 #include <openssl/err.h>
 #include <openssl/opensslv.h>
@@ -136,6 +169,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <string>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -145,6 +179,7 @@ extern "C" {
 int __real_open(const char* path, int flags, ...);
 int __real_fchmod(int fd, mode_t mode);
 int __real_fstat(int fd, struct stat* info);
+ssize_t __real_read(int fd, void* buffer, size_t count);
 ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
@@ -183,6 +218,13 @@ unsigned char g_keySnapshot[kKeyBytes];
 bool g_haveSnapshot = false;     // the snapshot below is valid
 std::size_t g_progress = 0;      // bytes acknowledged so far (pre-call offset)
 
+// Descriptor currently known to belong to the `encrypt --key` file opened
+// read-only, or -1. Tracked separately from g_keyFd (the O_CREAT|O_EXCL
+// output descriptor): the key-read scenarios never create their target, and
+// the save scenarios never read it.
+int g_readFd = -1;
+std::size_t g_readProgress = 0;  // key bytes delivered so far (pre-call offset)
+
 bool envFlagSet(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
@@ -191,6 +233,16 @@ bool envFlagSet(const char* name) {
 bool isKeyPath(const char* path) {
     const char* target = std::getenv("EF_TEST_TARGET");
     return target == nullptr || std::strcmp(path, target) == 0;
+}
+
+// The read-side instrumentation only ever applies to an explicitly named
+// target (unlike isKeyPath, an unset EF_TEST_TARGET must not make every
+// read-only open a candidate — the encrypt input file is opened the same
+// way and must pass through untouched).
+bool isReadTarget(const char* path) {
+    const char* target = std::getenv("EF_TEST_TARGET");
+    return target != nullptr && path != nullptr &&
+           std::strcmp(path, target) == 0;
 }
 
 bool isKeyFd(int fd) {
@@ -370,6 +422,87 @@ bool nextScriptedCall(ScriptedCall& call) {
     return true;
 }
 
+// Parse the next EF_TEST_READ_SCRIPT token. Same token language as the
+// write script; "zero" here means the key file reports end-of-file. Returns
+// false once the script is exhausted (the caller should then behave
+// normally).
+bool nextScriptedReadCall(ScriptedCall& call) {
+    static char script[512];
+    static bool initialized = false;
+    static char* saveptr = nullptr;
+
+    if (!initialized) {
+        const char* raw = std::getenv("EF_TEST_READ_SCRIPT");
+        if (raw == nullptr) {
+            script[0] = '\0';
+        } else {
+            std::strncpy(script, raw, sizeof(script) - 1);
+            script[sizeof(script) - 1] = '\0';
+        }
+        saveptr = script;
+        initialized = true;
+    }
+
+    char* token = ::strtok_r(nullptr, ",", &saveptr);
+    if (token == nullptr) {
+        return false;
+    }
+    if (std::strcmp(token, "ok") == 0) {
+        call.outcome = WriteOutcome::kPass;
+    } else if (std::strcmp(token, "intr") == 0) {
+        call.outcome = WriteOutcome::kEintr;
+    } else if (std::strcmp(token, "eio") == 0) {
+        call.outcome = WriteOutcome::kEio;
+    } else if (std::strcmp(token, "zero") == 0) {
+        call.outcome = WriteOutcome::kZero;
+    } else {
+        char* end = nullptr;
+        long limit = std::strtol(token, &end, 10);
+        if (end != token && *end == '\0' && limit > 0) {
+            call.outcome = WriteOutcome::kShort;
+            call.limit = limit;
+        } else {
+            // An unknown token is a test-script bug: fail loudly rather than
+            // silently behave as a normal read.
+            std::fprintf(stderr,
+                         "envelopefile_testable: invalid read script token "
+                         "'%s'\n", token);
+            call.outcome = WriteOutcome::kEio;
+        }
+    }
+    return true;
+}
+
+void logReadCall(std::size_t offset, std::size_t requested,
+                 ssize_t returned, int reportedErrno) {
+    char line[128];
+    if (returned < 0) {
+        std::snprintf(line, sizeof(line), "CALL %zu %zu %zd %d",
+                      offset, requested, returned, reportedErrno);
+    } else {
+        std::snprintf(line, sizeof(line), "CALL %zu %zu %zd",
+                      offset, requested, returned);
+    }
+    logLine("EF_TEST_READ_LOG", "a", line);
+}
+
+// CHUNK <offset> <hex>: the exact bytes this read() call delivered, so the
+// test driver can reassemble what the product received and compare it
+// against the key file byte for byte.
+void logReadChunk(std::size_t offset, const unsigned char* bytes,
+                  std::size_t count) {
+    if (std::getenv("EF_TEST_READ_LOG") == nullptr) {
+        return;
+    }
+    std::string line = "CHUNK " + std::to_string(offset) + " ";
+    static const char hex[] = "0123456789abcdef";
+    for (std::size_t i = 0; i < count; ++i) {
+        line += hex[bytes[i] >> 4];
+        line += hex[bytes[i] & 0x0f];
+    }
+    logLine("EF_TEST_READ_LOG", "a", line.c_str());
+}
+
 }  // namespace
 
 int __wrap_open(const char* path, int flags, ...) {
@@ -406,6 +539,14 @@ int __wrap_open(const char* path, int flags, ...) {
         g_keyFd = fd;
         setKeyPath(path);
         resetWriteBookkeeping();
+    }
+    // The encrypt --key file is opened read-only; when it is the named
+    // target, track its descriptor so read() can be scripted and logged.
+    // This is deliberately separate from g_keyFd above, which belongs to
+    // the O_CREAT|O_EXCL output file.
+    if (fd != -1 && (flags & O_CREAT) == 0 && isReadTarget(path)) {
+        g_readFd = fd;
+        g_readProgress = 0;
     }
     return fd;
 }
@@ -510,8 +651,53 @@ int __wrap_fsync(int fd) {
     return __real_fsync(fd);
 }
 
+ssize_t __wrap_read(int fd, void* buffer, size_t count) {
+    if (fd == -1 || fd != g_readFd) {
+        return __real_read(fd, buffer, count);
+    }
+
+    const size_t requested = count;  // caller's original length for the log
+    ScriptedCall call;
+    if (nextScriptedReadCall(call)) {
+        switch (call.outcome) {
+            case WriteOutcome::kEintr:
+                logReadCall(g_readProgress, requested, -1, EINTR);
+                errno = EINTR;
+                return -1;
+            case WriteOutcome::kEio:
+                logReadCall(g_readProgress, requested, -1, EIO);
+                errno = EIO;
+                return -1;
+            case WriteOutcome::kZero:
+                // End-of-file reported on demand, with no bytes delivered.
+                logReadCall(g_readProgress, requested, 0, 0);
+                return 0;
+            case WriteOutcome::kShort:
+                if (count > static_cast<size_t>(call.limit)) {
+                    count = static_cast<size_t>(call.limit);
+                }
+                break;
+            case WriteOutcome::kPass:
+                break;
+        }
+    }
+
+    ssize_t result = __real_read(fd, buffer, count);
+    logReadCall(g_readProgress, requested, result, errno);
+    if (result > 0) {
+        logReadChunk(g_readProgress,
+                     static_cast<const unsigned char*>(buffer),
+                     static_cast<std::size_t>(result));
+        g_readProgress += static_cast<std::size_t>(result);
+    }
+    return result;
+}
+
 int __wrap_close(int fd) {
     const bool wasKeyFd = isKeyFd(fd);
+    if (fd != -1 && fd == g_readFd) {
+        g_readFd = -1;
+    }
     const int result = __real_close(fd);
     if (wasKeyFd) {
         g_keyFd = -1;
