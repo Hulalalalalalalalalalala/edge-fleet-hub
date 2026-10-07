@@ -121,8 +121,53 @@
 //                             only after the save was complete (never before,
 //                             which would save wiped data).
 //
-// Only the file descriptor opened for the key file is instrumented; all
-// other I/O (stdout, stderr, OpenSSL internals, the log file itself) passes
+// Read-only opens (the `encrypt --key` key file, and in principle the input
+// file) are tracked separately from the O_CREAT|O_EXCL output descriptor.
+// When EF_TEST_TARGET names a path opened O_RDONLY (without O_CREAT), that
+// descriptor is the read target and its read() calls can be scripted:
+//
+//   EF_TEST_READ_SCRIPT=t1,t2,...
+//                           Each token describes the outcome of one read()
+//                           call on the tracked read-only descriptor,
+//                           consumed in order; once the list is exhausted
+//                           every further call performs the real read
+//                           normally. Tokens:
+//                             ok    - perform the whole requested read
+//                             N     - short read: cap the request at N
+//                                     (decimal) bytes, so a 32-byte key has
+//                                     to be assembled over several calls
+//                             intr  - fail with EINTR, no bytes read (the
+//                                     caller must retry the same slice)
+//                             eio   - fail irrecoverably with EIO
+//
+//                           The script spans BOTH phases of the product's key
+//                           read: the calls that fill the 32 key bytes and
+//                           the final one-byte end-of-file probe, so an
+//                           interrupt or EIO can be injected at either point.
+//
+//   EF_TEST_READ_LOG=path   Record the key read for a continuity proof. The
+//                           file receives one line per read() call:
+//                             CALL <offset> <requested> <returned> [<errno>]
+//                           (the errno field is only present when returned is
+//                           -1), followed once, at the moment the 32nd key
+//                           byte arrives, by:
+//                             VERIFY <64 lowercase hex digits>
+//                           VERIFY is a snapshot of the exact 32 bytes the
+//                           product accepted into its own key buffer; the
+//                           test driver compares it byte for byte against the
+//                           key file on disk. Every filling call is checked
+//                           to resume at the acknowledged offset with the
+//                           matching remaining length, so an interrupted or
+//                           short read can neither drop nor duplicate nor
+//                           substitute a byte. A violation is recorded as a
+//                             VERIFY-FAILED <reason>
+//                           line and aborts the process, since it means the
+//                           product code violated its own read contract.
+//
+// Two descriptors are instrumented, each on its own match: the O_EXCL-created
+// output file (write-side knobs above) and the O_RDONLY open of EF_TEST_TARGET
+// (read-side knobs). All other I/O (the input file when the key is the
+// target, stdio, OpenSSL's own reads, the log files themselves) passes
 // through untouched.
 
 #include <openssl/err.h>
@@ -145,6 +190,7 @@ extern "C" {
 int __real_open(const char* path, int flags, ...);
 int __real_fchmod(int fd, mode_t mode);
 int __real_fstat(int fd, struct stat* info);
+ssize_t __real_read(int fd, void* buffer, size_t count);
 ssize_t __real_write(int fd, const void* buffer, size_t count);
 int __real_fsync(int fd);
 int __real_close(int fd);
@@ -182,6 +228,27 @@ int g_randBufSize = 0;
 unsigned char g_keySnapshot[kKeyBytes];
 bool g_haveSnapshot = false;     // the snapshot below is valid
 std::size_t g_progress = 0;      // bytes acknowledged so far (pre-call offset)
+
+// Read-side counterpart: the descriptor opened O_RDONLY for EF_TEST_TARGET
+// (the encrypt --key file) is tracked independently of the O_EXCL output
+// descriptor. g_readProgress counts key bytes acknowledged while the 32-byte
+// key is being filled; g_readBufBase is the product's own key buffer, seen on
+// the first filling call, so later calls can be proven to resume inside that
+// exact buffer (and the accepted 32 bytes snapshotted for EF_TEST_READ_LOG).
+int g_readFd = -1;
+unsigned char* g_readBufBase = nullptr;
+std::size_t g_readProgress = 0;
+bool g_readVerified = false;     // the VERIFY line was already emitted
+
+bool isReadFd(int fd) {
+    return fd != -1 && fd == g_readFd;
+}
+
+void resetReadBookkeeping() {
+    g_readBufBase = nullptr;
+    g_readProgress = 0;
+    g_readVerified = false;
+}
 
 bool envFlagSet(const char* name) {
     const char* value = std::getenv(name);
@@ -307,6 +374,45 @@ void resetWriteBookkeeping() {
     g_progress = 0;
 }
 
+// Read-side logging, mirroring the write-side CALL/VERIFY lines so the test
+// driver can prove byte continuity across short/interrupted key reads.
+void logReadCall(std::size_t offset, std::size_t requested,
+                 ssize_t returned, int reportedErrno) {
+    if (std::getenv("EF_TEST_READ_LOG") == nullptr) {
+        return;
+    }
+    char line[128];
+    if (returned < 0) {
+        std::snprintf(line, sizeof(line), "CALL %zu %zu %zd %d",
+                      offset, requested, returned, reportedErrno);
+    } else {
+        std::snprintf(line, sizeof(line), "CALL %zu %zu %zd",
+                      offset, requested, returned);
+    }
+    logLine("EF_TEST_READ_LOG", "a", line);
+}
+
+void logReadVerify(const unsigned char* buffer) {
+    constexpr std::size_t kPrefix = 7;  // strlen("VERIFY ")
+    char line[kPrefix + 2 * kKeyBytes + 1];
+    char* out = line;
+    std::strcpy(out, "VERIFY ");
+    out += 7;
+    static const char hex[] = "0123456789abcdef";
+    for (std::size_t i = 0; i < kKeyBytes; ++i) {
+        *out++ = hex[buffer[i] >> 4];
+        *out++ = hex[buffer[i] & 0x0f];
+    }
+    *out = '\0';
+    logLine("EF_TEST_READ_LOG", "a", line);
+}
+
+void logReadVerifyFailed(const char* reason) {
+    char line[160];
+    std::snprintf(line, sizeof(line), "VERIFY-FAILED %s", reason);
+    logLine("EF_TEST_READ_LOG", "a", line);
+}
+
 // Outcome of one scripted write() call.
 enum class WriteOutcome {
     kPass,       // behave as the real syscall with the given count
@@ -370,6 +476,69 @@ bool nextScriptedCall(ScriptedCall& call) {
     return true;
 }
 
+// Outcome of one scripted read() call. EOF (return 0) is deliberately not
+// scriptable here: it is the normal end-of-file indicator the product must
+// observe on its final probe, and a zero return while key bytes are still
+// expected is the "short file" path exercised with genuinely short files.
+enum class ReadOutcome {
+    kPass,       // behave as the real read with the given count
+    kShort,      // behave as the real read but cap the count
+    kEintr,      // report a recoverable interrupt, nothing read
+    kEio,        // report an irrecoverable I/O error
+};
+
+struct ScriptedReadCall {
+    ReadOutcome outcome;
+    long limit;  // valid for kShort
+};
+
+// Parse the next EF_TEST_READ_SCRIPT token. Returns false once the script is
+// exhausted (the caller should then perform the real read normally).
+bool nextScriptedReadCall(ScriptedReadCall& call) {
+    static char script[512];
+    static bool initialized = false;
+    static char* saveptr = nullptr;
+
+    if (!initialized) {
+        const char* raw = std::getenv("EF_TEST_READ_SCRIPT");
+        if (raw == nullptr) {
+            script[0] = '\0';
+        } else {
+            std::strncpy(script, raw, sizeof(script) - 1);
+            script[sizeof(script) - 1] = '\0';
+        }
+        saveptr = script;
+        initialized = true;
+    }
+
+    char* token = ::strtok_r(nullptr, ",", &saveptr);
+    if (token == nullptr) {
+        return false;
+    }
+    if (std::strcmp(token, "ok") == 0) {
+        call.outcome = ReadOutcome::kPass;
+    } else if (std::strcmp(token, "intr") == 0) {
+        call.outcome = ReadOutcome::kEintr;
+    } else if (std::strcmp(token, "eio") == 0) {
+        call.outcome = ReadOutcome::kEio;
+    } else {
+        char* end = nullptr;
+        long limit = std::strtol(token, &end, 10);
+        if (end != token && *end == '\0' && limit > 0) {
+            call.outcome = ReadOutcome::kShort;
+            call.limit = limit;
+        } else {
+            // An unknown token is a test-script bug: fail loudly rather than
+            // silently behave as a normal read.
+            std::fprintf(stderr,
+                         "envelopefile_testable: invalid read script token "
+                         "'%s'\n", token);
+            call.outcome = ReadOutcome::kEio;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int __wrap_open(const char* path, int flags, ...) {
@@ -406,6 +575,21 @@ int __wrap_open(const char* path, int flags, ...) {
         g_keyFd = fd;
         setKeyPath(path);
         resetWriteBookkeeping();
+    }
+    // Track a read-only open of the test target as the read-instrumented
+    // descriptor. This is deliberately the OPPOSITE case from above: the
+    // product opens the encrypt --key (and --input) file with O_RDONLY and
+    // no O_CREAT, while the envelope output is the O_EXCL creation. The
+    // write-side and read-side knobs therefore land on different
+    // descriptors and cannot interfere. Only an exact target match is
+    // tracked, so when the key is targeted the input file (and vice versa)
+    // still passes every read through untouched.
+    if (fd != -1 && (flags & O_CREAT) == 0 && (flags & O_WRONLY) == 0 &&
+        path != nullptr && isKeyPath(path) &&
+        (std::getenv("EF_TEST_READ_SCRIPT") != nullptr ||
+         std::getenv("EF_TEST_READ_LOG") != nullptr)) {
+        g_readFd = fd;
+        resetReadBookkeeping();
     }
     return fd;
 }
@@ -502,6 +686,82 @@ ssize_t __wrap_write(int fd, const void* buffer, size_t count) {
     return result;
 }
 
+ssize_t __wrap_read(int fd, void* buffer, size_t count) {
+    if (!isReadFd(fd)) {
+        return __real_read(fd, buffer, count);
+    }
+
+    auto* bytes = static_cast<unsigned char*>(buffer);
+    const bool filling = g_readProgress < kKeyBytes;
+    const std::size_t phaseOffset =
+        filling ? g_readProgress : kKeyBytes;  // EOF-probe phase pins at 32
+
+    // While the 32 key bytes are being filled the product must always read
+    // into its own key buffer at the acknowledged offset, with exactly the
+    // number of bytes still missing. The end-of-file probe is a one-byte
+    // read into a scratch byte and is not part of the key buffer.
+    if (std::getenv("EF_TEST_READ_LOG") != nullptr && filling) {
+        if (g_readBufBase == nullptr) {
+            g_readBufBase = bytes;
+        } else if (bytes != g_readBufBase + g_readProgress) {
+            logReadVerifyFailed("read buffer is not the product key buffer "
+                                "at the resumed offset");
+            std::abort();
+        }
+        if (count != kKeyBytes - g_readProgress) {
+            logReadVerifyFailed("read length does not match the key bytes "
+                                "still missing");
+            std::abort();
+        }
+    }
+
+    ScriptedReadCall call;
+    if (nextScriptedReadCall(call)) {
+        switch (call.outcome) {
+            case ReadOutcome::kEintr:
+                logReadCall(phaseOffset, count, -1, EINTR);
+                errno = EINTR;
+                return -1;
+            case ReadOutcome::kEio:
+                logReadCall(phaseOffset, count, -1, EIO);
+                errno = EIO;
+                return -1;
+            case ReadOutcome::kShort:
+                if (count > static_cast<size_t>(call.limit)) {
+                    count = static_cast<size_t>(call.limit);
+                }
+                break;
+            case ReadOutcome::kPass:
+                break;
+        }
+    }
+
+    ssize_t result = __real_read(fd, buffer, count);
+    logReadCall(phaseOffset, count, result, errno);
+    if (result > 0 && filling) {
+        const std::size_t acknowledged =
+            g_readProgress + static_cast<std::size_t>(result);
+        // A single read must not cross the 32-byte boundary: the product's
+        // fill loop stops requesting once it has 32 bytes, so overshoot
+        // would mean reads and the product loop disagree on where the key
+        // ends.
+        if (acknowledged > kKeyBytes) {
+            logReadVerifyFailed("read returned bytes past the 32-byte key");
+            std::abort();
+        }
+        g_readProgress = acknowledged;
+        if (acknowledged == kKeyBytes && !g_readVerified &&
+            std::getenv("EF_TEST_READ_LOG") != nullptr) {
+            // Snapshot exactly the 32 bytes the product accepted, from its
+            // own key buffer, so the driver can match them against the key
+            // file on disk.
+            logReadVerify(g_readBufBase);
+            g_readVerified = true;
+        }
+    }
+    return result;
+}
+
 int __wrap_fsync(int fd) {
     if (isKeyFd(fd) && envFlagSet("EF_TEST_FAIL_FSYNC")) {
         errno = EIO;
@@ -512,6 +772,7 @@ int __wrap_fsync(int fd) {
 
 int __wrap_close(int fd) {
     const bool wasKeyFd = isKeyFd(fd);
+    const bool wasReadFd = isReadFd(fd);
     const int result = __real_close(fd);
     if (wasKeyFd) {
         g_keyFd = -1;
@@ -521,6 +782,12 @@ int __wrap_close(int fd) {
             errno = EIO;
             return -1;
         }
+    }
+    if (wasReadFd) {
+        // Disarm on close so the fd number the kernel may immediately reuse
+        // for a later open (e.g. the input file) is not mistaken for the
+        // instrumented key descriptor.
+        g_readFd = -1;
     }
     return result;
 }

@@ -30,7 +30,7 @@ if(BUILD_TESTING)
     include(CheckLinkerFlag)
 
     set(_fault_inject_wrap_options
-        "LINKER:--wrap=open,--wrap=fchmod,--wrap=fstat,--wrap=write,--wrap=fsync,--wrap=close,--wrap=unlink,--wrap=RAND_bytes,--wrap=OPENSSL_cleanse")
+        "LINKER:--wrap=open,--wrap=fchmod,--wrap=fstat,--wrap=read,--wrap=write,--wrap=fsync,--wrap=close,--wrap=unlink,--wrap=RAND_bytes,--wrap=OPENSSL_cleanse")
     check_linker_flag(CXX "${_fault_inject_wrap_options}"
                       EF_LINKER_SUPPORTS_WRAP)
 
@@ -47,6 +47,7 @@ if(BUILD_TESTING)
             "LINKER:--wrap=open"
             "LINKER:--wrap=fchmod"
             "LINKER:--wrap=fstat"
+            "LINKER:--wrap=read"
             "LINKER:--wrap=write"
             "LINKER:--wrap=fsync"
             "LINKER:--wrap=close"
@@ -82,18 +83,33 @@ if(BUILD_TESTING)
                 --binary $<TARGET_FILE:envelopefile>
                 --testable-binary $<TARGET_FILE:envelopefile_testable>
                 --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
+
+        # Key-file reading regression for `encrypt --key`: exactly-32-byte
+        # raw keys are used verbatim (binary or printable), wrong lengths,
+        # unreadable files, and irrecoverable mid-read errors are rejected,
+        # and short/interrupted reads that later complete still seal with
+        # the exact file bytes — via read()-fault injection in the
+        # testable build and plain refusals against the production binary.
+        add_test(
+            NAME encrypt_key_read_regression
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/encrypt_key_read_regression.py
+                --binary $<TARGET_FILE:envelopefile>
+                --testable-binary $<TARGET_FILE:envelopefile_testable>
+                --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
 
         message(STATUS
-            "envelopefile: keygen fault-injection, encrypt round-trip, and "
-            "encrypt save-failure regression tests enabled "
-            "(linker supports --wrap, Python ${Python3_VERSION} found)")
+            "envelopefile: keygen fault-injection, encrypt round-trip, "
+            "encrypt save-failure, and encrypt key-read regression tests "
+            "enabled (linker supports --wrap, Python ${Python3_VERSION} "
+            "found)")
     else()
         message(NOTICE
             "envelopefile: the regression tests (keygen fault-injection, "
-            "encrypt round-trip, and encrypt save-failure) are NOT built "
-            "on this toolchain. Building "
-            "them requires a C++ linker "
+            "encrypt round-trip, encrypt save-failure, and encrypt "
+            "key-read) are NOT built on this toolchain. Building them "
+            "requires a C++ linker "
             "that supports the --wrap option (such as GNU ld or LLVM lld), "
             "but the linker selected by this configuration does not accept "
             "those options (the macOS/Xcode system linker 'ld64' does not). "
