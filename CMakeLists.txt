@@ -13,10 +13,11 @@ set_target_properties(envelopefile PROPERTIES CXX_EXTENSIONS OFF)
 target_link_libraries(envelopefile PRIVATE OpenSSL::Crypto)
 
 # Regression tests: the `encrypt` round-trip/tamper suite runs against the
-# production binary, and for `keygen` the same product source is linked a
-# second time with syscall-wrapping shims (see tests/fault_inject.cpp) so the
-# test driver can simulate write/fsync/close failures, partial writes, and
-# secure random source failures without touching the production binary.
+# production binary, while the `encrypt` save-failure suite and the `keygen`
+# suite link the same product source a second time with syscall-wrapping
+# shims (see tests/fault_inject.cpp) so the test drivers can simulate
+# write/fsync/close/unlink failures, partial writes, and secure random
+# source failures without touching the production binary.
 #
 # The shims rely on the linker's --wrap option, which not every platform's
 # default linker provides (notably the system linker shipped with macOS/Xcode,
@@ -69,16 +70,29 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/encrypt_regression.py
                 --binary $<TARGET_FILE:envelopefile>
                 --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
+
+        # Envelope-save regression for `encrypt`: post-creation save
+        # failures (write/sync/close), cleanup failure, and pre-creation
+        # refusals, using the fault-injecting build for the injected
+        # faults and the production binary for the plain refusals.
+        add_test(
+            NAME encrypt_save_regression
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/encrypt_save_regression.py
+                --binary $<TARGET_FILE:envelopefile>
+                --testable-binary $<TARGET_FILE:envelopefile_testable>
+                --work-root ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test-tmp)
 
         message(STATUS
-            "envelopefile: keygen fault-injection and encrypt round-trip "
-            "regression tests enabled "
+            "envelopefile: keygen fault-injection, encrypt round-trip, and "
+            "encrypt save-failure regression tests enabled "
             "(linker supports --wrap, Python ${Python3_VERSION} found)")
     else()
         message(NOTICE
-            "envelopefile: the regression tests (keygen fault-injection and "
-            "encrypt round-trip) are NOT built on this toolchain. Building "
+            "envelopefile: the regression tests (keygen fault-injection, "
+            "encrypt round-trip, and encrypt save-failure) are NOT built "
+            "on this toolchain. Building "
             "them requires a C++ linker "
             "that supports the --wrap option (such as GNU ld or LLVM lld), "
             "but the linker selected by this configuration does not accept "
